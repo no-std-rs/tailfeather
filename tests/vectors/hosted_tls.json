@@ -1,0 +1,53 @@
+{
+  "_comment": "Measured against controlplane.tailscale.com, read-only. Recorded because the repository previously documented this endpoint as RSA-PSS-only, which is wrong and had become a roadmap blocker. Re-measure before relying on it: Let's Encrypt can reissue, and the check that consumes this must assert what it observed rather than assume ECDSA forever.",
+  "measured_on": "2026-08-01",
+  "host": "controlplane.tailscale.com",
+  "client_offered_sigalgs": "ECDSA+SHA256 only",
+  "negotiated": {
+    "protocol": "TLSv1.3",
+    "cipher": "TLS_AES_128_GCM_SHA256",
+    "peer_signature_type": "ecdsa_secp256r1_sha256",
+    "runs_agreeing": "3/3"
+  },
+  "key_exchange": {
+    "_comment": "The IPv4 and IPv6 frontends differ. Measured against four fixed IPv4 backends, X25519-only was refused 8/8 while P-256-only succeeded 8/8; over IPv6 X25519-only succeeded 3/3. embedded-tls offers Secp256r1 (P-256), so the IPv4 route works \u2014 but a client that offered only X25519 would fail on IPv4 and succeed on IPv6, which is exactly the kind of difference that reads as an intermittent bug.",
+    "ipv4_x25519_only": "refused (handshake_failure)",
+    "ipv4_p256_only": "accepted",
+    "ipv6_x25519_only": "accepted",
+    "default_negotiated": "X25519MLKEM768"
+  },
+  "chain": [
+    {
+      "index": 0,
+      "subject": "CN=controlplane.tailscale.com",
+      "issuer": "C=US, O=Let's Encrypt, CN=YE1",
+      "signature_algorithm": "ecdsa-with-SHA384",
+      "public_key": "256-bit P-256",
+      "der_bytes": 934
+    },
+    {
+      "index": 1,
+      "subject": "C=US, O=Let's Encrypt, CN=YE1",
+      "issuer": "C=US, O=ISRG, CN=Root YE",
+      "signature_algorithm": "ecdsa-with-SHA384",
+      "public_key": "384-bit P-384",
+      "der_bytes": 655
+    },
+    {
+      "index": 2,
+      "subject": "C=US, O=ISRG, CN=Root YE",
+      "issuer": "C=US, O=Internet Security Research Group, CN=ISRG Root X2",
+      "signature_algorithm": "ecdsa-with-SHA384",
+      "public_key": "384-bit P-384",
+      "der_bytes": 682
+    },
+    {
+      "index": 3,
+      "subject": "C=US, O=Internet Security Research Group, CN=ISRG Root X2",
+      "issuer": "C=US, O=Internet Security Research Group, CN=ISRG Root X1",
+      "signature_algorithm": "sha256WithRSAEncryption",
+      "public_key": "384-bit P-384",
+      "der_bytes": 1140
+    }
+  ]
+}

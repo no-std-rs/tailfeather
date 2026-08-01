@@ -13,10 +13,17 @@
 //!
 //! # And what is not being claimed
 //!
-//! `controlplane.tailscale.com` serves an RSA-PSS-only chain, and
-//! `embedded-tls`'s RSA support requires `alloc`. So the hosted service is out
-//! of reach until there is an allocation-free RSA verifier, and this check says
-//! so rather than letting a local success imply a remote one.
+//! A pass here is against the lab's TLS front, and says nothing about the hosted
+//! service. It used to say something stronger and false — that
+//! `controlplane.tailscale.com` serves an RSA-PSS-only chain and is therefore
+//! unreachable without an allocation-free RSA verifier. Measured, it is
+//! dual-chain and serves ECDSA to a client offering ECDSA sigalgs; see
+//! `tests/vectors/hosted_tls.json` and the module comment in
+//! `harness/src/tls.rs` for what actually stands in the way.
+//!
+//! The distinction still matters for this check: the lab's front is one server
+//! with one chain, and a hosted result has to be measured rather than inferred
+//! from it.
 
 use std::sync::OnceLock;
 
@@ -50,8 +57,14 @@ fn start(env: &Env) -> Result<Session, String> {
     };
     if env.target == Target::TailscaleSaas {
         return Err(
-            "the hosted service serves an RSA-PSS-only chain, and embedded-tls's RSA \
-             support requires alloc — see harness/src/tls.rs"
+            "no hosted TLS run yet. Not for the reason this check used to give: \
+             controlplane.tailscale.com serves ECDSA to a client offering ECDSA \
+             sigalgs (measured, tests/vectors/hosted_tls.json), and embedded-tls \
+             already offers the P-256 group its IPv4 frontend requires. What is \
+             missing is the p384 feature for the ecdsa-with-SHA384 chain \
+             signatures — allocation-free, unlike rsa — an anchor model that can \
+             stop before the topmost presented certificate, and MAX_CERT raised \
+             above the measured 3411-byte chain. See harness/src/tls.rs"
                 .into(),
         );
     }
@@ -171,9 +184,9 @@ pub fn tls(env: &Env) -> Status {
         "TLS 1.3 against a real server with the chain verified against a pinned anchor \
          and the hostname checked; the control plane's key came back over it ({}…). A \
          chain leading elsewhere and a certificate for another name were both refused. \
-         Limitation: the chain is ECDSA P-256, because embedded-tls's RSA support needs \
-         an allocator — so controlplane.tailscale.com, which is RSA-PSS only, is still \
-         out of reach.",
+         This is the lab's front, not the hosted service: hosted serves a four-entry \
+         chain whose intermediates are ecdsa-with-SHA384, which needs embedded-tls's \
+         p384 feature and an anchor set rather than a single pinned root.",
         &key[..21]
     ))
 }

@@ -8,16 +8,52 @@
 //! properly, against a pinned trust anchor, with hostname checking and a real
 //! clock so an expired certificate is refused.
 //!
-//! # ECDSA only, and that is a real limitation
+//! # ECDSA only, and what that does and does not rule out
 //!
 //! `embedded-tls`'s verifier is allocation-free for ECDSA chains. Its RSA
 //! support pulls in `alloc`, which this project does not have —
-//! `rsa = ["dep:rsa", "rustpki", "alloc"]` in its own manifest. And
-//! `controlplane.tailscale.com` serves an RSA-PSS-only chain.
+//! `rsa = ["dep:rsa", "rustpki", "alloc"]` in its own manifest.
 //!
-//! So this verifies a real chain against a real TLS 1.3 server, and it cannot
-//! yet talk to the hosted Tailscale service. The conformance check says exactly
-//! that rather than implying the harder half is done.
+//! This comment used to go on to say that `controlplane.tailscale.com` serves
+//! an RSA-PSS-only chain, and therefore that the hosted service was out of
+//! reach until someone wrote an allocation-free RSA verifier. **That was
+//! wrong**, and it sat in the roadmap as a blocker for longer than it should
+//! have. Measured — see `tests/vectors/hosted_tls.json` for the full record:
+//!
+//! ```text
+//! offering ECDSA+SHA256 only, 3/3 runs:
+//!   TLSv1.3, TLS_AES_128_GCM_SHA256, peer sig ecdsa_secp256r1_sha256
+//!   leaf  CN=controlplane.tailscale.com  P-256   ecdsa-with-SHA384
+//!   ←     CN=YE1 (Let's Encrypt)         P-384   ecdsa-with-SHA384
+//!   ←     CN=Root YE (ISRG)              P-384   ecdsa-with-SHA384
+//!   ←     ISRG Root X2                   P-384   sha256WithRSAEncryption
+//! ```
+//!
+//! The endpoint is dual-chain and selects on the client's `signature_algorithms`.
+//! An RSA chain appears only when the client offers RSA. `Suite` here is already
+//! `TLS_AES_128_GCM_SHA256`, and `ecdsa_secp256r1_sha256` is the one
+//! CertificateVerify scheme `embedded-tls` supports unconditionally.
+//!
+//! Three real obstacles remain, none of which is RSA:
+//!
+//! 1. **`ecdsa-with-SHA384` chain signatures** need embedded-tls's `p384`
+//!    feature. Unlike `rsa`, it does *not* pull in `alloc`:
+//!    `p384 = ["dep:p384", "rustpki"]`. One line, then measure the verification
+//!    cost on the device — three P-384 signatures per handshake.
+//! 2. **The anchor model.** Hosted presents four entries ending at ISRG Root X2,
+//!    whose own issuer is RSA-signed X1. A single pinned anchor has to be the
+//!    issuer of the *topmost presented* certificate, so pinning Root YE is one
+//!    hop short.
+//! 3. **[`MAX_CERT`] is 4096** against a measured chain of 3411 DER bytes plus
+//!    per-entry framing. That is a latent overflow, not headroom.
+//!
+//! Key exchange is *not* an obstacle, though it looked like one while this was
+//! being measured. `embedded-tls` offers `NamedGroup::Secp256r1`, and hosted's
+//! IPv4 frontend requires exactly that: X25519-only was refused by four fixed
+//! IPv4 backends, 8/8, while P-256-only succeeded 8/8. Over IPv6 the same
+//! X25519-only client is accepted. A client offering only X25519 would therefore
+//! work over IPv6 and fail over IPv4, which would present as an intermittent
+//! fault rather than a configuration difference.
 
 use embedded_tls::{
     Aes128GcmSha256, Certificate, CryptoProvider, NoVerify, TlsConfig, TlsConnection, TlsContext,

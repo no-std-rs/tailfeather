@@ -50,11 +50,16 @@ perfectly and a real client answered "failed to open naclbox (wrong rcpt?)", bec
 the Poly1305 tag before the ciphertext and every other AEAD in this tree appends it.
 
 The measurement is against the **lab**. Two things stand between here and hosted Tailscale, and
-both are named in the checks that touch them rather than hidden: `controlplane.tailscale.com`
-serves an RSA-PSS-only certificate chain, and `embedded-tls`'s RSA support requires an
-allocator, so the verified chain here is ECDSA P-256; and whether the hosted service honours a
-`MapRequest` that omits `Compress` is unknown, which matters because every zstd decoder in Rust
-needs a heap. See `tests/README.md` for what else the framework has established about the real
+both are named in the checks that touch them rather than hidden. The first is the certificate
+chain: `controlplane.tailscale.com` serves ECDSA to a client offering ECDSA signature
+algorithms — measured, and recorded in `tests/vectors/hosted_tls.json` — so what is needed is
+embedded-tls's `p384` feature for the `ecdsa-with-SHA384` chain signatures, which unlike its
+`rsa` feature does not pull in an allocator, plus a trust-anchor model that can stop before the
+topmost presented certificate. This README previously said the chain was RSA-PSS-only and
+therefore out of reach without an allocation-free RSA verifier; that was wrong, and it stood as
+a roadmap blocker until someone measured it. The second is that whether the hosted service
+honours a `MapRequest` that omits `Compress` is still unknown, which matters because every zstd
+decoder in Rust needs a heap. See `tests/README.md` for what else the framework has established about the real
 servers — including that Headscale v0.29.3 rejects any client advertising a capability version
 below 113.
 
