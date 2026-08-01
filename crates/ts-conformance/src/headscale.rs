@@ -10,6 +10,15 @@ use std::process::Command;
 /// The lab container, started by `tests/lab/lab.sh up`.
 const CONTAINER: &str = "headscale-lab";
 
+/// The container runtime to talk to it through.
+///
+/// podman locally, docker in CI — GitHub's runners ship docker. `lab.sh` reads
+/// the same variable, so the two cannot disagree about which daemon holds the
+/// container.
+fn runtime() -> String {
+    std::env::var("CONTAINER_RUNTIME").unwrap_or_else(|_| "podman".to_string())
+}
+
 /// One row of `headscale nodes list`.
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -26,7 +35,7 @@ pub struct Node {
 /// or `podman` is absent — which callers must report as a skip. A check that
 /// failed because the lab was down would make the suite unsafe to gate on.
 pub fn nodes() -> Result<Vec<Node>, String> {
-    let output = Command::new("podman")
+    let output = Command::new(runtime())
         .args([
             "exec",
             CONTAINER,
@@ -37,7 +46,7 @@ pub fn nodes() -> Result<Vec<Node>, String> {
             "json",
         ])
         .output()
-        .map_err(|e| format!("could not run podman: {e}"))?;
+        .map_err(|e| format!("could not run {}: {e}", runtime()))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -79,7 +88,7 @@ pub fn nodes() -> Result<Vec<Node>, String> {
 /// nodes it failed to clean up — silent partial cleanup is how the accumulation
 /// this exists to prevent starts again.
 pub fn delete_node(node_id: u64) -> Result<(), String> {
-    let output = Command::new("podman")
+    let output = Command::new(runtime())
         .args([
             "exec",
             CONTAINER,
@@ -91,7 +100,7 @@ pub fn delete_node(node_id: u64) -> Result<(), String> {
             "--force",
         ])
         .output()
-        .map_err(|e| format!("could not run podman: {e}"))?;
+        .map_err(|e| format!("could not run {}: {e}", runtime()))?;
     if !output.status.success() {
         return Err(format!(
             "headscale nodes delete {node_id} failed: {}",
@@ -117,7 +126,7 @@ pub struct Routes {
 
 /// `headscale nodes list-routes`, for one node.
 pub fn routes(node_id: u64) -> Result<Routes, String> {
-    let output = Command::new("podman")
+    let output = Command::new(runtime())
         .args([
             "exec",
             CONTAINER,
@@ -128,7 +137,7 @@ pub fn routes(node_id: u64) -> Result<Routes, String> {
             "json",
         ])
         .output()
-        .map_err(|e| format!("could not run podman: {e}"))?;
+        .map_err(|e| format!("could not run {}: {e}", runtime()))?;
     if !output.status.success() {
         return Err(format!(
             "headscale nodes list-routes failed: {}",
@@ -168,7 +177,7 @@ pub fn routes(node_id: u64) -> Result<Routes, String> {
 /// Approve routes on a node, which is the operator action an exit node needs
 /// before any client will use it.
 pub fn approve_routes(node_id: u64, routes: &[&str]) -> Result<(), String> {
-    let output = Command::new("podman")
+    let output = Command::new(runtime())
         .args([
             "exec",
             CONTAINER,
@@ -181,7 +190,7 @@ pub fn approve_routes(node_id: u64, routes: &[&str]) -> Result<(), String> {
             &routes.join(","),
         ])
         .output()
-        .map_err(|e| format!("could not run podman: {e}"))?;
+        .map_err(|e| format!("could not run {}: {e}", runtime()))?;
     if !output.status.success() {
         return Err(format!(
             "approve-routes failed: {}",

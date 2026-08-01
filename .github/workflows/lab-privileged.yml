@@ -1,0 +1,159 @@
+## The checks that need root: a reference tailscaled, network namespaces, and
+## the kernel's own WireGuard.
+##
+## Nightly rather than per-push. These are the slowest and least stable jobs in
+## the project — they create TUN devices and namespaces — and a flake here
+## blocking every pull request would teach everyone to ignore it.
+##
+## The drift job is the other half. The lab pins Headscale to a digest, which
+## keeps results reproducible but also means an upstream release goes unnoticed
+## indefinitely. So one job re-runs against `:latest` and reports when the two
+## disagree, without failing the pinned build.
+
+name: lab-privileged
+
+on:
+  schedule:
+    # 04:00 UTC. Nothing depends on the hour; it is off-peak for the runners.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CONTAINER_RUNTIME: docker
+
+jobs:
+  privileged:
+    name: reference client and interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nharness -> target"
+
+      # The reference client is the oracle for every disco check. A disco
+      # message is a sealed NaCl box: it either opens on the other side or the
+      # exchange is silent, so there is no way to check it against ourselves.
+      - name: install tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          tailscaled --version
+
+      - name: start the lab
+        run: tests/lab/lab.sh up
+
+      - name: start the reference client
+        run: tests/lab/lab.sh reference
+
+      - name: what this environment can measure
+        run: tests/lab/lab.sh doctor
+
+      - name: build the harness
+        run: cd harness && cargo build --release
+
+      - name: full conformance run
+        run: scripts/conformance.sh
+
+      - name: kernel WireGuard interop
+        run: sudo ./scripts/interop-wireguard.sh
+
+      - name: collect state on failure
+        if: failure()
+        run: |
+          tests/lab/lab.sh nodes || true
+          docker logs headscale-lab --tail 200 || true
+          sudo cat .lab/tailscaled.log | tail -200 || true
+
+      - name: tear down
+        if: always()
+        run: |
+          tests/lab/lab.sh prune || true
+          tests/lab/lab.sh reference-stop || true
+          tests/lab/lab.sh down || true
+
+  drift:
+    name: has upstream moved
+    runs-on: ubuntu-latest
+    # Independent of the job above: the point is to learn that upstream changed
+    # even on a day when the privileged run is broken for its own reasons.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nharness -> target"
+
+      - name: compare the pinned image against :latest
+        id: compare
+        run: |
+          pinned=$(python3 -c "import json;print(json.load(open('tests/vectors/versions.json'))['headscale'])")
+          docker pull -q docker.io/headscale/headscale:latest
+          latest=$(docker run --rm docker.io/headscale/headscale:latest version \
+            | head -1 | awk '{print $3}')
+          echo "pinned=$pinned"  >> "$GITHUB_OUTPUT"
+          echo "latest=$latest"  >> "$GITHUB_OUTPUT"
+          if [ "$pinned" = "$latest" ]; then
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+            echo "still on $pinned"
+          else
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::headscale upstream is $latest, the lab is pinned to $pinned"
+          fi
+
+      # Run the suite against the new server before deciding whether the upgrade
+      # is safe. A version bump that changes no behaviour is very different from
+      # one that does, and only a run can tell them apart.
+      - name: conformance against :latest
+        if: steps.compare.outputs.moved == 'true'
+        continue-on-error: true
+        env:
+          HEADSCALE_IMAGE: docker.io/headscale/headscale:latest
+        run: |
+          tests/lab/lab.sh up
+          tests/lab/lab.sh doctor
+          (cd harness && cargo build --release)
+          cargo run -q -p ts-conformance -- --json > /tmp/latest.json || true
+          cargo run -q -p ts-conformance -- --expect tests/expectations/lab.json \
+            2>&1 | tee /tmp/drift.txt || true
+          tests/lab/lab.sh prune || true
+          tests/lab/lab.sh down || true
+
+      - name: report
+        if: steps.compare.outputs.moved == 'true'
+        run: |
+          {
+            echo "## Headscale upstream moved"
+            echo
+            echo "| | version |"
+            echo "|---|---|"
+            echo "| pinned | \`${{ steps.compare.outputs.pinned }}\` |"
+            echo "| latest | \`${{ steps.compare.outputs.latest }}\` |"
+            echo
+            echo "Conformance against \`:latest\`, compared to the pinned baseline:"
+            echo
+            echo '```'
+            cat /tmp/drift.txt 2>/dev/null || echo "(the run did not complete)"
+            echo '```'
+            echo
+            echo "If this is clean, upgrade deliberately: bump the tag in"
+            echo "\`tests/lab/lab.sh\`, re-run \`tests/lab/capture.sh\`, and"
+            echo "regenerate the baselines with \`--write-expect\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: keep the evidence
+        if: steps.compare.outputs.moved == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift
+          path: |
+            /tmp/latest.json
+            /tmp/drift.txt
+          if-no-files-found: ignore

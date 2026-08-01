@@ -1,0 +1,84 @@
+## The live checks, against a real Headscale.
+##
+## Separate from ci.yml because this needs a container runtime and a server that
+## takes a few seconds to become healthy — and because when it breaks, the
+## question "is the code wrong or is the lab wrong?" should not also block the
+## host tests.
+##
+## No reference `tailscaled` here: that needs privileges the default runner does
+## not give, so the `disco.*` and `derp.relay` checks skip. That is recorded in
+## the baseline rather than hidden — see `tests/expectations/`.
+
+name: lab
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # GitHub's runners ship docker; `lab.sh` and `ts-conformance` both read this.
+  CONTAINER_RUNTIME: docker
+
+jobs:
+  lab:
+    name: conformance against Headscale
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nharness -> target"
+
+      # Not a `services:` container. Headscale needs its configuration file
+      # mounted from the checkout, which `services:` cannot do — it starts
+      # before the repository exists.
+      - name: start the lab
+        run: tests/lab/lab.sh up
+
+      - name: what this environment can measure
+        run: tests/lab/lab.sh doctor
+
+      # Fail loudly if the pinned image moved. The committed vectors describe
+      # one specific Headscale; a different one turns every disagreement into
+      # something that looks like our bug.
+      - name: the server is the version the vectors describe
+        run: |
+          expected=$(python3 -c "import json;print(json.load(open('tests/vectors/versions.json'))['headscale'])")
+          actual=$(docker exec headscale-lab headscale version | head -1 | awk '{print $3}')
+          echo "expected $expected, running $actual"
+          test "$expected" = "$actual"
+
+      - name: build the harness
+        run: cd harness && cargo build --release
+
+      - name: conformance matrix
+        run: cargo run -q -p ts-conformance
+
+      # The matrix test asserts no known incompatibility regressed. Kept
+      # separate from the run above so a failure names which of the two failed.
+      - name: matrix test
+        run: cargo test -p ts-conformance --test matrix
+
+      # Runs even when the suite failed: a failing run is precisely the one that
+      # leaves nodes behind if anything went wrong with cleanup, and the next
+      # run would then fail for an unrelated reason.
+      - name: what the lab was left holding
+        if: always()
+        run: |
+          tests/lab/lab.sh nodes || true
+          tests/lab/lab.sh prune || true
+
+      - name: lab logs
+        if: failure()
+        run: docker logs headscale-lab --tail 200 || true
+
+      - name: stop the lab
+        if: always()
+        run: tests/lab/lab.sh down || true

@@ -1,0 +1,116 @@
+## Everything that needs no lab, no reference client and no root.
+##
+## This is the gate on every push. The jobs below are ordered by how quickly
+## they fail: a formatting or clippy error should not wait behind a bare-metal
+## build.
+##
+## What this deliberately does *not* do is run the live checks. Those need a
+## Headscale, and pretending to run them here would produce a report full of
+## skips that still says "100% compatible" — which is the exact failure mode the
+## `--expect` baseline exists to catch. See lab.yml.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failed build should say why, not scroll.
+  RUST_BACKTRACE: 1
+
+jobs:
+  host:
+    name: host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The differential tests are the point of this job: snow, h2,
+      # fluke-hpack and the pcap replay all run on the host with no lab.
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
+      - name: doc tests
+        run: cargo test --workspace --doc
+
+  lint:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # No `cargo fmt --check` here, deliberately. This tree does not currently
+      # satisfy default rustfmt — the wrapping is hand-chosen in a lot of places,
+      # particularly around the byte-level constants and their explanations — so
+      # the gate would fail on its first run for reasons unrelated to any change.
+      # Adopting rustfmt means one large reformatting commit first; that is a
+      # decision to take deliberately rather than smuggle in with CI.
+
+  bare-target:
+    name: no_std, no alloc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The harness needs nightly for `build-std`: x86_64-unknown-linux-none is
+      # tier 3, so no prebuilt `core` ships for it. This is the only part of the
+      # project that is not on stable, and the firmware target below is.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: riscv32imac-unknown-none-elf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nharness -> target\nfirmware -> target"
+
+      # The real allocation guard. `x86_64-unknown-linux-none` with
+      # `build-std = ["core", "compiler_builtins"]` has no `alloc` crate at all,
+      # so a dependency that needs one cannot link — the failure happens here
+      # rather than on hardware.
+      - name: no-alloc guard
+        run: ./scripts/no-alloc-guard.sh
+
+      - name: firmware builds for the device target
+        run: cd firmware && cargo build --release
+
+  offline-matrix:
+    name: offline matrix vs baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nharness -> target"
+
+      # Built so the offline baseline describes an environment with a harness
+      # present. Without it the vector-backed checks would skip too and the
+      # baseline would not match.
+      - name: build the harness
+        run: cd harness && cargo build --release
+
+      - name: record what this environment can measure
+        run: tests/lab/lab.sh doctor
+
+      # The comparison, not the score. With no lab this run reports
+      # "14/14 — 100% compatible" while twenty checks measure nothing; only the
+      # baseline can tell the difference between that and a real result.
+      - name: compare against the offline baseline
+        run: |
+          cargo run -q -p ts-conformance -- \
+            --expect tests/expectations/offline.json

@@ -16,6 +16,8 @@
 
 set -euo pipefail
 
+RUNTIME="${CONTAINER_RUNTIME:-podman}"
+
 LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$LAB_DIR/../.." && pwd)"
 STATE_DIR="${LAB_STATE_DIR:-$REPO_ROOT/.lab}"
@@ -32,7 +34,7 @@ fi
 # shellcheck disable=SC1090
 source "$STATE_DIR/lab.env"
 
-# podman here is rootless, so anything touching the container must run as the
+# "$RUNTIME" here is rootless, so anything touching the container must run as the
 # invoking user; tcpdump and tailscaled need root. This script needs both, so
 # it runs as root and drops back down for the container calls.
 as_user() {
@@ -95,7 +97,7 @@ echo "== extracting the decrypted MapResponse"
 python3 "$LAB_DIR/extract_map.py" "$STATE_DIR/tailscaled.log" "$VECTORS/map_response.json"
 
 echo "== recording what the server believes"
-as_user podman exec headscale-lab headscale nodes list --output json >"$VECTORS/headscale_nodes.json" 2>/dev/null || true
+as_user "$RUNTIME" exec headscale-lab headscale nodes list --output json >"$VECTORS/headscale_nodes.json" 2>/dev/null || true
 curl -s "$HEADSCALE_URL/health" >"$VECTORS/health.json" || true
 
 # The captures are written as root; hand them back so ordinary builds can read

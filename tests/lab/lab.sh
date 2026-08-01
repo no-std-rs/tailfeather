@@ -26,6 +26,12 @@ REPO_ROOT="$(cd "$LAB_DIR/../.." && pwd)"
 STATE_DIR="${LAB_STATE_DIR:-$REPO_ROOT/.lab}"
 
 CONTAINER=headscale-lab
+
+# podman locally, docker in CI. The two are argument-compatible for everything
+# this script does, and GitHub's runners ship docker rather than podman — so
+# without this the lab workflow cannot start the very server it exists to
+# measure against.
+RUNTIME="${CONTAINER_RUNTIME:-podman}"
 # Pinned, not `:latest`.
 #
 # The committed vectors and the conformance expectations describe one specific
@@ -45,10 +51,13 @@ TS_SOCKET="$STATE_DIR/tailscaled.sock"
 TS_STATE="$STATE_DIR/tailscaled.state"
 TS_LOG="$STATE_DIR/tailscaled.log"
 
-hs() { podman exec "$CONTAINER" headscale "$@"; }
+hs() { "$RUNTIME" exec "$CONTAINER" headscale "$@"; }
+
+# `container exists` is podman-only; `container inspect` works on both.
+container_exists() { "$RUNTIME" container inspect "$CONTAINER" >/dev/null 2>&1; }
 
 require_container() {
-    if ! podman container exists "$CONTAINER" 2>/dev/null; then
+    if ! container_exists; then
         echo "lab is not running; start it with: $0 up" >&2
         exit 1
     fi
@@ -56,14 +65,14 @@ require_container() {
 
 cmd_up() {
     mkdir -p "$STATE_DIR/headscale"
-    if podman container exists "$CONTAINER" 2>/dev/null; then
+    if container_exists; then
         echo "== lab already exists, restarting"
-        podman rm -f "$CONTAINER" >/dev/null
+        "$RUNTIME" rm -f "$CONTAINER" >/dev/null
     fi
 
     echo "== starting headscale on $SERVER_URL"
     # :Z relabels for SELinux, which Fedora enforces on volume mounts.
-    podman run -d --name "$CONTAINER" \
+    "$RUNTIME" run -d --name "$CONTAINER" \
         -p "127.0.0.1:$PORT:8080" \
         -p "127.0.0.1:3478:3478/udp" \
         -v "$LAB_DIR/headscale.yaml:/etc/headscale/config.yaml:ro,Z" \
@@ -81,7 +90,7 @@ cmd_up() {
     done
     if ! curl -sf "$SERVER_URL/health" >/dev/null 2>&1; then
         echo " failed"
-        podman logs "$CONTAINER" 2>&1 | tail -30
+        "$RUNTIME" logs "$CONTAINER" 2>&1 | tail -30
         exit 1
     fi
 
@@ -151,24 +160,24 @@ for node in json.load(sys.stdin):
 cmd_doctor() {
     mkdir -p "$STATE_DIR"
 
-    local have_podman=false have_container=false have_tailscaled=false
+    local have_runtime=false have_container=false have_tailscaled=false
     local have_reference=false have_harness=false have_root=false
     local headscale_version="" image_digest="" reason=""
 
-    command -v podman >/dev/null 2>&1 && have_podman=true
+    command -v "$RUNTIME" >/dev/null 2>&1 && have_runtime=true
 
-    if [[ "$have_podman" == true ]] && podman container exists "$CONTAINER" 2>/dev/null; then
+    if [[ "$have_runtime" == true ]] && container_exists; then
         if curl -fsS --max-time 3 "$SERVER_URL/health" >/dev/null 2>&1; then
             have_container=true
             headscale_version="$(hs version 2>/dev/null | head -1 | awk '{print $3}')"
-            image_digest="$(podman inspect "$CONTAINER" --format '{{.ImageName}}' 2>/dev/null)"
+            image_digest="$("$RUNTIME" inspect "$CONTAINER" --format '{{.ImageName}}' 2>/dev/null)"
         else
             reason="the container exists but $SERVER_URL/health did not answer"
         fi
-    elif [[ "$have_podman" == true ]]; then
+    elif [[ "$have_runtime" == true ]]; then
         reason="no $CONTAINER container; run '$0 up'"
     else
-        reason="podman is not installed"
+        reason="$RUNTIME is not installed"
     fi
 
     command -v tailscaled >/dev/null 2>&1 && have_tailscaled=true
@@ -247,8 +256,8 @@ cmd_nodes() {
 }
 
 cmd_status() {
-    if podman container exists "$CONTAINER" 2>/dev/null; then
-        podman ps --filter "name=$CONTAINER" --format "{{.Names}} {{.Status}} {{.Image}}"
+    if container_exists; then
+        "$RUNTIME" ps --filter "name=$CONTAINER" --format "{{.Names}} {{.Status}} {{.Image}}"
         curl -sf "$SERVER_URL/health" && echo " health OK" || echo " health FAILED"
         [[ -f "$STATE_DIR/lab.env" ]] && cat "$STATE_DIR/lab.env"
     else
@@ -258,7 +267,7 @@ cmd_status() {
 
 cmd_down() {
     cmd_reference_stop
-    podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    "$RUNTIME" rm -f "$CONTAINER" >/dev/null 2>&1 || true
     echo "== lab stopped (state kept in $STATE_DIR; delete it to start clean)"
 }
 
