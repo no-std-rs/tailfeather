@@ -126,3 +126,31 @@ fn the_committed_baselines_cover_every_check() {
     }
     assert!(found >= 2, "expected at least the offline and lab baselines");
 }
+
+/// The doctor's "this disables these checks" lists name checks that exist.
+///
+/// Those lists are maintained by hand, so without this a renamed check leaves
+/// the banner confidently pointing at an id nobody can find — which is worse
+/// than saying nothing, because the banner is what someone reads when they are
+/// already confused about why a check skipped.
+#[test]
+fn the_doctor_only_names_checks_that_exist() {
+    let current: BTreeSet<&str> = ts_conformance::checks::all().iter().map(|c| c.id).collect();
+
+    // A doctor that found nothing reports every gap, which is what makes this a
+    // complete check of the id lists rather than of whichever gaps happen to
+    // apply on this machine.
+    let nothing = ts_conformance::doctor::Doctor::default();
+    let gaps = nothing.gaps();
+    assert!(!gaps.is_empty(), "an empty environment should report gaps");
+
+    for gap in gaps {
+        for id in gap.disables {
+            assert!(
+                current.contains(id),
+                "the doctor says '{}' disables '{id}', but no such check exists",
+                gap.what
+            );
+        }
+    }
+}

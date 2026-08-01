@@ -50,6 +50,12 @@ echo "== building the no_std harness"
 (cd harness && cargo build --release)
 echo
 
+# Record what this machine can measure. The suite reads .lab/doctor.json and
+# prints one banner naming what is missing and which checks it disables, rather
+# than repeating the same news inside nineteen separate skip messages.
+tests/lab/lab.sh doctor || true
+echo
+
 # `--expect` when a baseline for this environment exists.
 #
 # Gating on the printed score is not enough. A skip is excluded from the

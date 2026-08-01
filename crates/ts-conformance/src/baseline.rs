@@ -275,6 +275,7 @@ mod tests {
                 .collect(),
             headscale_version: None,
             tailscale_version: None,
+            doctor: None,
         }
     }
 

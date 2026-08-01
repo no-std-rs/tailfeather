@@ -1,6 +1,8 @@
 {
-  "headscale": "v0.29.3",
-  "tailscale_client": "1.94.2",
   "captured_by": "tests/lab/capture.sh",
-  "note": "Expectations in the conformance suite are pinned to these versions. Re-capture after upgrading either one."
+  "headscale": "v0.29.3",
+  "headscale_image": "docker.io/headscale/headscale:v0.29.3",
+  "headscale_image_digest": "sha256:0e7f1c6e4ce6c2a2a001103ecd3fa645a045adf30ac8a5234fe037b43000cd72",
+  "note": "Expectations in the conformance suite are pinned to these versions. Re-capture after upgrading either one. The image is pinned by tag in tests/lab/lab.sh; the digest is recorded so a re-tagged upstream image is detectable rather than silently becoming the new ground truth.",
+  "tailscale_client": "1.94.2"
 }

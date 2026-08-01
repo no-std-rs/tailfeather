@@ -17,6 +17,7 @@
 #   tests/lab/lab.sh reference     # join a real tailscaled to the lab as ground truth
 #   tests/lab/lab.sh nodes         # what the server thinks is registered
 #   tests/lab/lab.sh prune         # delete the nodes conformance runs left behind
+#   tests/lab/lab.sh doctor        # what is available, and which checks need it
 
 set -euo pipefail
 
@@ -25,7 +26,14 @@ REPO_ROOT="$(cd "$LAB_DIR/../.." && pwd)"
 STATE_DIR="${LAB_STATE_DIR:-$REPO_ROOT/.lab}"
 
 CONTAINER=headscale-lab
-IMAGE="${HEADSCALE_IMAGE:-docker.io/headscale/headscale:latest}"
+# Pinned, not `:latest`.
+#
+# The committed vectors and the conformance expectations describe one specific
+# Headscale. `:latest` silently becomes a different server, and the resulting
+# failures look like our bugs — the suite would be comparing today's code to
+# yesterday's ground truth with nothing saying so. The digest is recorded in
+# tests/vectors/versions.json and checked by `lab.sh doctor`.
+IMAGE="${HEADSCALE_IMAGE:-docker.io/headscale/headscale:v0.29.3}"
 PORT="${LAB_PORT:-8080}"
 SERVER_URL="http://127.0.0.1:$PORT"
 USER_NAME=conformance
@@ -130,6 +138,69 @@ for node in json.load(sys.stdin):
     echo "== pruned $count test node(s)"
 }
 
+# What the environment can and cannot measure.
+#
+# Writes $STATE_DIR/doctor.json, which the conformance suite reads so it can
+# print one banner naming what is missing and which checks that disables —
+# instead of nineteen separately-worded skips that each look like an isolated
+# problem.
+#
+# Never fails. "Nothing is available" is a valid, reportable answer; exiting
+# non-zero here would make it impossible to ask the question from a script that
+# has `set -e`.
+cmd_doctor() {
+    mkdir -p "$STATE_DIR"
+
+    local have_podman=false have_container=false have_tailscaled=false
+    local have_reference=false have_harness=false have_root=false
+    local headscale_version="" image_digest="" reason=""
+
+    command -v podman >/dev/null 2>&1 && have_podman=true
+
+    if [[ "$have_podman" == true ]] && podman container exists "$CONTAINER" 2>/dev/null; then
+        if curl -fsS --max-time 3 "$SERVER_URL/health" >/dev/null 2>&1; then
+            have_container=true
+            headscale_version="$(hs version 2>/dev/null | head -1 | awk '{print $3}')"
+            image_digest="$(podman inspect "$CONTAINER" --format '{{.ImageName}}' 2>/dev/null)"
+        else
+            reason="the container exists but $SERVER_URL/health did not answer"
+        fi
+    elif [[ "$have_podman" == true ]]; then
+        reason="no $CONTAINER container; run '$0 up'"
+    else
+        reason="podman is not installed"
+    fi
+
+    command -v tailscaled >/dev/null 2>&1 && have_tailscaled=true
+    [[ -S "$TS_SOCKET" ]] && have_reference=true
+    [[ -x "$REPO_ROOT/harness/target/x86_64-unknown-linux-none/release/harness" ]] &&
+        have_harness=true
+    sudo -n true 2>/dev/null && have_root=true
+
+    cat > "$STATE_DIR/doctor.json" <<JSON
+{
+  "_comment": "Written by tests/lab/lab.sh doctor. The conformance suite reads this to explain, once, why checks are skipped.",
+  "headscale": $have_container,
+  "headscale_version": "${headscale_version}",
+  "headscale_image": "${image_digest}",
+  "headscale_reason": "${reason}",
+  "tailscaled_installed": $have_tailscaled,
+  "reference_client": $have_reference,
+  "harness_built": $have_harness,
+  "passwordless_sudo": $have_root
+}
+JSON
+
+    echo "== lab doctor"
+    printf '  %-22s %s\n' "headscale" "$($have_container && echo "yes ($headscale_version)" || echo "no — $reason")"
+    printf '  %-22s %s\n' "tailscaled installed" "$($have_tailscaled && echo yes || echo "no — the disco and DERP checks need a reference client")"
+    printf '  %-22s %s\n' "reference client" "$($have_reference && echo yes || echo "no — run '$0 reference'")"
+    printf '  %-22s %s\n' "harness built" "$($have_harness && echo yes || echo "no — run 'cd harness && cargo build --release'")"
+    printf '  %-22s %s\n' "passwordless sudo" "$($have_root && echo yes || echo "no — the exit-node and interop checks need it")"
+    echo
+    echo "  wrote $STATE_DIR/doctor.json"
+}
+
 cmd_reference() {
     require_container
     # shellcheck disable=SC1090
@@ -200,8 +271,9 @@ case "${1:-}" in
     reference-stop) cmd_reference_stop ;;
     nodes) cmd_nodes ;;
     prune) cmd_prune ;;
+    doctor) cmd_doctor ;;
     *)
-        echo "usage: $0 {up|down|status|preauth-key|reference|reference-stop|nodes|prune}" >&2
+        echo "usage: $0 {up|down|status|preauth-key|reference|reference-stop|nodes|prune|doctor}" >&2
         exit 2
         ;;
 esac

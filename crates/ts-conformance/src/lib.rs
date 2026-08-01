@@ -32,6 +32,7 @@ pub mod baseline;
 pub mod checks;
 pub mod derp;
 pub mod disco;
+pub mod doctor;
 pub mod exit;
 pub mod harness;
 pub mod headscale;
@@ -186,6 +187,9 @@ pub struct Env {
     /// Where the lab's control server listens, split for the harness, which
     /// parses dotted quads rather than URLs.
     pub control_address: Option<(String, u16)>,
+    /// What `tests/lab/lab.sh doctor` found this machine can measure, if it has
+    /// been run. Used for one banner instead of nineteen worded skips.
+    pub doctor: Option<doctor::Doctor>,
     /// Tags the nodes this run registers and deletes them again when the run
     /// ends, including on the failure path.
     ///
@@ -209,6 +213,7 @@ impl Env {
             tailscale_version: None,
             harness: harness::Harness::discover(repo_root),
             control_address: None,
+            doctor: doctor::Doctor::load(repo_root),
             // Enabled below, once we know whether there is a lab to clean up.
             scope: runscope::RunScope::new(false),
         };
@@ -297,6 +302,7 @@ pub struct Report {
     pub outcomes: Vec<Outcome>,
     pub headscale_version: Option<String>,
     pub tailscale_version: Option<String>,
+    pub doctor: Option<doctor::Doctor>,
 }
 
 impl Report {
@@ -316,6 +322,7 @@ impl Report {
             outcomes,
             headscale_version: env.headscale_version.clone(),
             tailscale_version: env.tailscale_version.clone(),
+            doctor: env.doctor.clone(),
         }
     }
 
@@ -393,6 +400,12 @@ impl fmt::Display for Report {
             writeln!(f, "  tailscale client: {v}")?;
         }
         writeln!(f)?;
+
+        // One banner naming what is missing, rather than the same news
+        // rephrased inside every skipped check's detail line.
+        if let Some(doctor) = &self.doctor {
+            write!(f, "{}", doctor::Banner(doctor))?;
+        }
 
         let mut areas: Vec<Area> = self.outcomes.iter().map(|o| o.area).collect();
         areas.sort();
