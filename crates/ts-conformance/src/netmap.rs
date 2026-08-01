@@ -320,12 +320,15 @@ fn start(env: &Env) -> Result<Run, String> {
     let port = port.to_string();
 
     // A map request only answers a registered node.
-    let registered = harness.run(&["register", &state, host, &port, auth_key])?;
+    let registered = harness.run(&[
+        "register", &state, host, &port, auth_key,
+        "--hostname", env.scope.hostname(),
+    ])?;
     if registered.event("registered").is_none() {
         return Err(format!(
             "could not register before asking for a map: {}",
             registered.tail()
         ));
     }
-    harness.run(&["map", &state, host, &port])
+    harness.run(&["map", &state, host, &port, "--hostname", env.scope.hostname()])
 }

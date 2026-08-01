@@ -37,10 +37,20 @@ pub struct Hostinfo<'a> {
     pub routable_ips: &'a [&'a str],
 }
 
+impl Hostinfo<'_> {
+    /// What a real device calls itself.
+    ///
+    /// Exposed as a constant because the harness accepts a `--hostname`
+    /// override — the conformance suite tags the nodes it registers so it can
+    /// delete them again — and the default has to come from somewhere both can
+    /// name.
+    pub const DEFAULT_HOSTNAME: &'static str = "esp-gateway";
+}
+
 impl Default for Hostinfo<'_> {
     fn default() -> Self {
         Self {
-            hostname: "esp-gateway",
+            hostname: Self::DEFAULT_HOSTNAME,
             version: concat!("esp-gateway-", env!("CARGO_PKG_VERSION")),
             os: "esp32",
             routable_ips: &[],

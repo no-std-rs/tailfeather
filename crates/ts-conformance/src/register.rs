@@ -54,13 +54,19 @@ fn start(env: &Env) -> Result<Session, String> {
     let state = state.to_string_lossy().into_owned();
     let port = port.to_string();
 
-    let first = harness.run(&["register", &state, host, &port, auth_key])?;
+    let first = harness.run(&[
+        "register", &state, host, &port, auth_key,
+        "--hostname", env.scope.hostname(),
+    ])?;
     let nodes_after_first = headscale::nodes()?;
 
     // The same state directory, so the machine key is the one the server just
     // authenticated. That is what makes this a re-registration rather than a
     // second node.
-    let rotated = harness.run(&["register", &state, host, &port, auth_key, "--rotate"])?;
+    let rotated = harness.run(&[
+        "register", &state, host, &port, auth_key, "--rotate",
+        "--hostname", env.scope.hostname(),
+    ])?;
     let nodes_after_rotation = headscale::nodes()?;
 
     Ok(Session {
@@ -135,6 +141,8 @@ pub fn register(env: &Env) -> Status {
 
 /// The server accepted, and acted on, the Hostinfo we sent.
 pub fn hostinfo(env: &Env) -> Status {
+    let sent_hostname = env.scope.hostname().to_string();
+
     // What a real client reports, for the record — the gap between that and
     // what we send is the honest part of this check.
     let reference = env
@@ -161,9 +169,14 @@ pub fn hostinfo(env: &Env) -> Status {
 
         // The name the server shows comes from `Hostinfo.Hostname`. It matching
         // is proof the server parsed the structure, not merely tolerated it.
-        if node.name != "esp-gateway" {
+        //
+        // Compared against the hostname this run actually sent, not against a
+        // constant: the suite tags each run's nodes so it can delete them again,
+        // so a hard-coded name here would assert that the tagging did *not*
+        // happen. That the two agree is the evidence.
+        if node.name != sent_hostname {
             return Status::Fail(format!(
-                "the server named the node '{}' rather than the hostname we sent",
+                "the server named the node '{}' rather than the hostname we sent,                  '{sent_hostname}'",
                 node.name
             ));
         }

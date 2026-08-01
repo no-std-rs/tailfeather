@@ -43,6 +43,27 @@ pub struct Run {
 }
 
 impl Run {
+    /// Build a run from output already collected.
+    ///
+    /// Separate from [`Run::from_output`] for the checks that must read the
+    /// harness's stdout *while* it runs — the disco check waits for a readiness
+    /// event before nudging the reference client — and so cannot wait for the
+    /// process to exit first.
+    pub fn from_parts(stdout: String, stderr: String, code: Option<i32>) -> Self {
+        let events = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("#EVT "))
+            .filter_map(|json| serde_json::from_str(json).ok())
+            .collect();
+        Self {
+            events,
+            stdout,
+            stderr,
+            code,
+            note: String::new(),
+        }
+    }
+
     pub fn from_output(output: &std::process::Output) -> Self {
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let events = stdout

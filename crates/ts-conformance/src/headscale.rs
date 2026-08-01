@@ -72,6 +72,35 @@ pub fn nodes() -> Result<Vec<Node>, String> {
         .collect())
 }
 
+/// Delete one node.
+///
+/// Used by [`crate::runscope::RunScope`] to remove what a run registered. A
+/// failure is returned rather than ignored so that the caller can say how many
+/// nodes it failed to clean up — silent partial cleanup is how the accumulation
+/// this exists to prevent starts again.
+pub fn delete_node(node_id: u64) -> Result<(), String> {
+    let output = Command::new("podman")
+        .args([
+            "exec",
+            CONTAINER,
+            "headscale",
+            "nodes",
+            "delete",
+            "--identifier",
+            &node_id.to_string(),
+            "--force",
+        ])
+        .output()
+        .map_err(|e| format!("could not run podman: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "headscale nodes delete {node_id} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// The node holding a given node key, if the server has one.
 pub fn find_by_node_key<'a>(nodes: &'a [Node], node_key: &str) -> Option<&'a Node> {
     nodes.iter().find(|n| n.node_key == node_key)

@@ -27,9 +27,16 @@ if [[ "$CAPTURE" -eq 1 ]]; then
     echo
 fi
 
-# Each run registers nodes, and they accumulate. A netmap naming more peers than
-# a device can hold is refused rather than truncated, so without this the netmap
-# and disco checks eventually fail for a reason unrelated to the code.
+# Crash recovery, not routine hygiene.
+#
+# The suite now tags every node it registers with a per-run id and deletes
+# exactly those when it finishes, including when it finishes badly — see
+# `crates/ts-conformance/src/runscope.rs`. So this is only here to clear debris
+# left by a run that was killed outright, which no destructor can catch.
+#
+# It matters because the netmap refuses a map naming more peers than a device
+# can hold rather than truncating it, so orphaned nodes eventually fail the
+# netmap and disco checks for a reason unrelated to the code.
 if tests/lab/lab.sh status >/dev/null 2>&1; then
     tests/lab/lab.sh prune || true
     echo

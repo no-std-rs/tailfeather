@@ -39,6 +39,7 @@ pub mod multipeer;
 pub mod netmap;
 pub mod pcap;
 pub mod register;
+pub mod runscope;
 pub mod tls;
 pub mod ts2021;
 
@@ -168,6 +169,13 @@ pub struct Env {
     /// Where the lab's control server listens, split for the harness, which
     /// parses dotted quads rather than URLs.
     pub control_address: Option<(String, u16)>,
+    /// Tags the nodes this run registers and deletes them again when the run
+    /// ends, including on the failure path.
+    ///
+    /// Without it the lab accumulates a node per run until the netmap exceeds
+    /// `ts_netmap::MAX_PEERS` and five checks start failing for reasons
+    /// unrelated to the code. See [`runscope`].
+    pub scope: runscope::RunScope,
 }
 
 impl Env {
@@ -184,6 +192,8 @@ impl Env {
             tailscale_version: None,
             harness: harness::Harness::discover(repo_root),
             control_address: None,
+            // Enabled below, once we know whether there is a lab to clean up.
+            scope: runscope::RunScope::new(false),
         };
 
         if let Ok(text) = std::fs::read_to_string(repo_root.join(".lab/lab.env")) {
@@ -220,6 +230,14 @@ impl Env {
         }
 
         env.control_address = env.control_url.as_deref().and_then(split_address);
+
+        // Cleanup is only meaningful against the local lab: it deletes nodes
+        // through `headscale` in the lab container, which the hosted service
+        // has no equivalent of. A hosted run must not silently believe it is
+        // tidying up after itself.
+        env.scope = runscope::RunScope::new(
+            env.control_url.is_some() && env.target == Target::HeadscaleLab,
+        );
 
         if let Ok(text) = std::fs::read_to_string(env.vectors.join("versions.json"))
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)

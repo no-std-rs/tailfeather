@@ -116,9 +116,10 @@ const USAGE: &str = "usage:
 <peer ip> <peer port>
   harness selftest <state dir>
   harness ts2021   <state dir> <server ip> <port>
-  harness register <state dir> <server ip> <port> <preauth key> [--exit-node|--rotate]
-  harness map      <state dir> <server ip> <port> [responses]
-  harness disco    <state dir> <server ip> <port> [seconds]
+  harness register <state dir> <server ip> <port> <preauth key> \
+[--exit-node|--rotate] [--hostname <name>]
+  harness map      <state dir> <server ip> <port> [responses] [--hostname <name>]
+  harness disco    <state dir> <server ip> <port> [seconds] [--hostname <name>]
   harness tls      <server ip> <port> <server name> <ca der path>
   harness derp     <server ip> <port> <state dir a> <state dir b>";
 
@@ -157,7 +158,7 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
             let ip = parse_ipv4(ip).expect("server address must be IPv4");
             let port = parse_u16(port).expect("port must be a number");
             let wanted = args.get(5).and_then(parse_u16).unwrap_or(1) as usize;
-            control::run_map(state_dir, ip, port, wanted.max(1))
+            control::run_map(state_dir, ip, port, hostname(&args), wanted.max(1))
         }
         Some("derp") => {
             let (Some(ip), Some(port)) = (args.get(2), args.get(3)) else {
@@ -192,7 +193,7 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
             let ip = parse_ipv4(ip).expect("server address must be IPv4");
             let port = parse_u16(port).expect("port must be a number");
             let seconds = args.get(5).and_then(parse_u16).map(u64::from);
-            disco::run(state_dir, ip, port, seconds)
+            disco::run(state_dir, ip, port, hostname(&args), seconds)
         }
         Some("register") => {
             let (Some(state_dir), Some(ip), Some(port), Some(auth_key)) =
@@ -212,13 +213,34 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
                     _ => {}
                 }
             }
-            control::run_register(state_dir, ip, port, auth_key, exit_node, rotate)
+            control::run_register(
+                state_dir, ip, port, auth_key, hostname(&args), exit_node, rotate,
+            )
         }
         _ => {
             println!("{USAGE}");
             rt::exit(2)
         }
     }
+}
+
+/// The `--hostname <name>` this run should register under.
+///
+/// Defaults to the plain product name, which is what a real device sends. The
+/// conformance suite overrides it with `esp-gateway-<runid>` so that it can
+/// delete exactly the nodes it created — see `ts-conformance`'s `runscope`
+/// module for why leaving them behind breaks later runs.
+fn hostname(args: &Args) -> &'static str {
+    let mut index = 2;
+    while let Some(arg) = args.get(index) {
+        if arg == "--hostname" {
+            if let Some(name) = args.get(index + 1) {
+                return name;
+            }
+        }
+        index += 1;
+    }
+    ts_control::Hostinfo::DEFAULT_HOSTNAME
 }
 
 /// The five arguments both tunnel modes share.

@@ -33,12 +33,21 @@ const DEFAULT_LISTEN_MS: u64 = 12_000;
 /// How often to repeat the probes while waiting.
 const PROBE_INTERVAL_MS: u64 = 1_000;
 
-pub fn run(state_dir: &str, address: Ipv4Addr, port: u16, seconds: Option<u64>) -> ! {
+pub fn run(
+    state_dir: &str,
+    address: Ipv4Addr,
+    port: u16,
+    hostname: &str,
+    seconds: Option<u64>,
+) -> ! {
     let clock = Clock::start();
     let reactor = Reactor::new(clock);
 
     let listen_ms = seconds.map(|s| s * 1_000).unwrap_or(DEFAULT_LISTEN_MS);
-    match block_on(&reactor, exchange(&reactor, state_dir, address, port, clock, listen_ms)) {
+    match block_on(
+        &reactor,
+        exchange(&reactor, state_dir, address, port, hostname, clock, listen_ms),
+    ) {
         Ok(()) => crate::rt::exit(0),
         Err(e) => {
             println!("FAIL {e}");
@@ -55,11 +64,13 @@ struct Candidate {
     tx_id: [u8; 12],
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn exchange(
     reactor: &Reactor,
     state_dir: &str,
     address: Ipv4Addr,
     port: u16,
+    hostname: &str,
     clock: Clock,
     listen_ms: u64,
 ) -> Result<(), ControlError> {
@@ -87,7 +98,8 @@ async fn exchange(
     evt!("{{\"event\":\"endpoint\",\"advertised\":\"{endpoint_text}\"}}");
 
     let netmap =
-        crate::control::load_netmap(reactor, state_dir, address, port, &[&endpoint_text]).await?;
+        crate::control::load_netmap(reactor, state_dir, address, port, hostname, &[&endpoint_text])
+            .await?;
     let our_disco = identity.disco.public();
     println!("our disco key: {our_disco}");
 

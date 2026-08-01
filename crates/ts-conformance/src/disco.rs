@@ -11,18 +11,58 @@
 //! So the reference client is the oracle, in both directions: it must answer our
 //! probe, and it must accept our answer to its own.
 
+use std::io::{BufRead, BufReader};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::sync::mpsc;
 
 use serde_json::Value;
 
 use crate::harness::{NOT_BUILT, Run};
 use crate::{Env, Status, Target};
 
-/// How long the harness listens, and when the reference client is nudged into
-/// probing us.
+/// How long the harness listens for disco traffic.
 const LISTEN_SECONDS: u64 = 20;
-const TRIGGER_AFTER_SECONDS: u64 = 8;
+
+/// How long to wait for the harness to say it is listening before nudging the
+/// reference client anyway.
+///
+/// This is a backstop, not the normal path. The nudge used to fire on a fixed
+/// eight-second sleep, which was the flakiest thing in the suite: too early and
+/// the probe arrives before the socket is bound and the ping is simply lost;
+/// too late and it eats the listening window. Both failures look like "disco
+/// does not work".
+///
+/// The harness already announces readiness on its event stream, so the nudge now
+/// waits for that instead. Reaching this timeout means the harness never became
+/// ready, and firing regardless produces a clearer failure than hanging.
+const READY_TIMEOUT_SECONDS: u64 = 15;
+
+/// The event the harness emits once its disco socket is bound and its endpoint
+/// has been advertised to the server.
+const READY_EVENT: &str = "self";
+
+/// How long to wait for the reference client to learn about us.
+///
+/// Our own readiness is not the precondition for the nudge. `tailscale ping`
+/// only probes a peer the client already has in its netmap, so nudging as soon
+/// as *we* are listening makes the ping a no-op and `disco.pong` fails —
+/// measured, not assumed: conditioning on our own readiness alone failed three
+/// runs out of three. The condition that matters is the server having pushed
+/// our node to the reference client, which is what `peer_is_visible` polls for.
+const PEER_VISIBLE_TIMEOUT_SECONDS: u64 = 20;
+const POLL_INTERVAL_MS: u64 = 250;
+
+/// How many times to nudge before giving up.
+const NUDGE_ATTEMPTS: usize = 4;
+
+/// What the stdout reader tells the main thread about, as it happens.
+enum Signal {
+    /// The harness has bound its socket and advertised its endpoint.
+    Ready,
+    /// The harness answered a probe from the reference client.
+    PingAnswered,
+}
 
 /// Where the lab's reference client listens.
 fn socket_path(env: &Env) -> std::path::PathBuf {
@@ -63,7 +103,10 @@ fn start(env: &Env) -> Result<Run, String> {
     let state = state.to_string_lossy().into_owned();
     let port = port.to_string();
 
-    let registered = harness.run(&["register", &state, host, &port, auth_key])?;
+    let registered = harness.run(&[
+        "register", &state, host, &port, auth_key,
+        "--hostname", env.scope.hostname(),
+    ])?;
     let Some(node_key) = registered
         .event("registered")
         .and_then(|e| e["node"].as_str())
@@ -78,38 +121,178 @@ fn start(env: &Env) -> Result<Run, String> {
 
     // The harness listens while a nudge is delivered partway through.
     let seconds = LISTEN_SECONDS.to_string();
-    let child = Command::new(harness.path())
+    let mut child = Command::new(harness.path())
         .args(["disco", &state, host, &port, &seconds])
+        .args(["--hostname", env.scope.hostname()])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not start the harness: {e}"))?;
 
-    std::thread::sleep(std::time::Duration::from_secs(TRIGGER_AFTER_SECONDS));
-    // `--until-direct=false` because the tunnel itself is not up: what is being
-    // checked is the path discovery, not the traffic that would follow it.
-    let nudge = Command::new("sudo")
+    // Read the harness's stdout on a thread, both to learn when it is ready and
+    // because a piped child that fills its stdout buffer blocks forever. The
+    // previous version only read after the process exited, which worked solely
+    // because the output happened to stay under the pipe capacity.
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let (event_tx, event_rx) = mpsc::channel::<Signal>();
+    let reader = std::thread::spawn(move || {
+        let mut collected = String::new();
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(json) = line.strip_prefix("#EVT ")
+                && let Ok(event) = serde_json::from_str::<Value>(json)
+            {
+                match event["event"].as_str() {
+                    Some(READY_EVENT) => {
+                        let _ = event_tx.send(Signal::Ready);
+                    }
+                    // The reference client probed us and we answered — the
+                    // condition `disco.pong` is waiting for.
+                    Some("ping") => {
+                        let _ = event_tx.send(Signal::PingAnswered);
+                    }
+                    _ => {}
+                }
+            }
+            collected.push_str(&line);
+            collected.push('\n');
+        }
+        collected
+    });
+
+    // Wait for readiness rather than for the clock: first ours, then the
+    // reference client's view of us.
+    let mut ready = false;
+    let mut answered = false;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(READY_TIMEOUT_SECONDS);
+    while std::time::Instant::now() < deadline && !ready {
+        match event_rx.recv_timeout(std::time::Duration::from_millis(POLL_INTERVAL_MS)) {
+            Ok(Signal::Ready) => ready = true,
+            Ok(Signal::PingAnswered) => answered = true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let visible = wait_for_peer(&socket, node_key, PEER_VISIBLE_TIMEOUT_SECONDS);
+
+    // Nudge until the harness reports having answered a probe, rather than once
+    // and hoping.
+    //
+    // A single nudge is still a race even once the peer is visible: the
+    // reference client can have our node in its netmap without yet having our
+    // endpoint, and `tailscale ping` then resolves over DERP without ever
+    // probing the address we are listening on. That failed two runs in three.
+    // Retrying costs nothing when the first attempt works, which is the usual
+    // case.
+    let mut nudge = None;
+    for _ in 0..NUDGE_ATTEMPTS {
+        if answered {
+            break;
+        }
+        // `--until-direct=false` because the tunnel itself is not up: what is
+        // being checked is the path discovery, not the traffic that would
+        // follow it.
+        nudge = Command::new("sudo")
+            .args([
+                "-n",
+                "tailscale",
+                &format!("--socket={}", socket.display()),
+                "ping",
+                "--c",
+                "3",
+                "--until-direct=false",
+                &address,
+            ])
+            .output()
+            .ok();
+
+        // Give the answer a moment to come back before trying again.
+        let wait = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < wait && !answered {
+            match event_rx.recv_timeout(std::time::Duration::from_millis(POLL_INTERVAL_MS)) {
+                Ok(Signal::PingAnswered) => answered = true,
+                Ok(Signal::Ready) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("the harness did not finish: {e}"))?;
+    let stdout = reader.join().unwrap_or_default();
+    let mut stderr = String::new();
+    if let Some(mut handle) = child.stderr.take() {
+        use std::io::Read as _;
+        let _ = handle.read_to_string(&mut stderr);
+    }
+
+    let mut run = Run::from_parts(stdout, stderr, status.code());
+    if !ready {
+        run.note = format!(
+            "the harness never emitted its '{READY_EVENT}' event within              {READY_TIMEOUT_SECONDS}s, so the nudge was sent blind; "
+        );
+    }
+    if !visible {
+        run.note.push_str(&format!(
+            "the reference client still did not list {node_key} as a peer after \
+             {PEER_VISIBLE_TIMEOUT_SECONDS}s, so its probe had nothing to aim at; "
+        ));
+    }
+    if let Some(nudge) = nudge {
+        run.note
+            .push_str(&String::from_utf8_lossy(&nudge.stdout));
+    }
+    Ok(run)
+}
+
+/// Poll the reference client until it lists `node_key` among its peers.
+///
+/// Returns whether it appeared. This replaces a fixed sleep, so the nudge is
+/// sent as soon as the precondition holds rather than after a hopeful interval.
+///
+/// Keyed on the node key, not the tailnet address. Headscale reuses addresses
+/// as nodes come and go, so a stale peer left over from an earlier run can carry
+/// the address this run was just assigned — which satisfied an address-based
+/// check instantly and put the flakiness straight back. The node key is freshly
+/// generated per run and cannot collide that way.
+fn wait_for_peer(socket: &std::path::Path, node_key: &str, timeout_seconds: u64) -> bool {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+    while std::time::Instant::now() < deadline {
+        if peer_is_visible(socket, node_key) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+    }
+    false
+}
+
+/// Whether the reference client's own status lists `node_key` as a peer.
+fn peer_is_visible(socket: &std::path::Path, node_key: &str) -> bool {
+    let Ok(output) = Command::new("sudo")
         .args([
             "-n",
             "tailscale",
             &format!("--socket={}", socket.display()),
-            "ping",
-            "--c",
-            "3",
-            "--until-direct=false",
-            &address,
+            "status",
+            "--json",
         ])
-        .output();
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("the harness did not finish: {e}"))?;
-
-    let mut run = Run::from_output(&output);
-    if let Ok(nudge) = nudge {
-        run.note = String::from_utf8_lossy(&nudge.stdout).into_owned();
-    }
-    Ok(run)
+        .output()
+    else {
+        return false;
+    };
+    let Ok(status) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return false;
+    };
+    let Some(peers) = status["Peer"].as_object() else {
+        return false;
+    };
+    // The map is keyed by node key; `PublicKey` repeats it inside each entry.
+    peers.iter().any(|(key, peer)| {
+        key == node_key || peer["PublicKey"].as_str() == Some(node_key)
+    })
 }
 
 /// The tailnet address the server gave a node key.

@@ -41,7 +41,10 @@ fn start(env: &Env) -> Result<Session, String> {
     let state = state.to_string_lossy().into_owned();
     let port = port.to_string();
 
-    let run = harness.run(&["register", &state, host, &port, auth_key, "--exit-node"])?;
+    let run = harness.run(&[
+        "register", &state, host, &port, auth_key, "--exit-node",
+        "--hostname", env.scope.hostname(),
+    ])?;
     let Some(node_key) = run.event("registered").and_then(|e| e["node"].as_str()) else {
         return Err(format!("could not register: {}", run.tail()));
     };

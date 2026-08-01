@@ -39,7 +39,8 @@ fn start(env: &Env) -> Result<Run, String> {
     for name in ["derp-a", "derp-b"] {
         let state = harness.scratch(name);
         let state = state.to_string_lossy().into_owned();
-        let run = harness.run(&["register", &state, host, &port, auth_key])?;
+        let run = harness.run(&["register", &state, host, &port, auth_key,
+            "--hostname", env.scope.hostname()])?;
         if run.event("registered").is_none() {
             return Err(format!("could not register {name}: {}", run.tail()));
         }

@@ -99,11 +99,16 @@ cmd_preauth_key() {
         python3 -c "import json,sys; print(json.load(sys.stdin)['key'])"
 }
 
-# Every conformance run registers a node, and they accumulate. That is not
-# cosmetic: a netmap naming more peers than a device can hold is refused rather
-# than silently truncated, so after enough runs the netmap checks start failing
-# for a reason that has nothing to do with the code. Pruning is part of running
-# the suite, not a tidy-up.
+# Crash recovery for nodes the suite could not delete itself.
+#
+# A conformance run tags its nodes `esp-gateway-<runid>` and removes them when
+# it ends, on the failure path too. What it cannot clean up after is being
+# killed outright — no destructor runs on SIGKILL — so this deletes anything
+# still carrying the `esp-gateway` prefix.
+#
+# It matters because a netmap naming more peers than a device can hold is
+# refused rather than silently truncated, so orphans eventually make the netmap
+# and disco checks fail for a reason that has nothing to do with the code.
 cmd_prune() {
     require_container
     local ids

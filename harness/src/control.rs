@@ -121,9 +121,10 @@ pub async fn load_netmap(
     state_dir: &str,
     address: Ipv4Addr,
     port: u16,
+    hostname: &str,
     endpoints: &[&str],
 ) -> Result<ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>, ControlError> {
-    fetch_map(reactor, state_dir, address, port, 1, endpoints).await
+    fetch_map(reactor, state_dir, address, port, hostname, 1, endpoints).await
 }
 
 /// Everything up to an established channel with the early payload consumed.
@@ -409,18 +410,22 @@ pub fn write_host(address: Ipv4Addr, port: u16, out: &mut [u8; 32]) -> &str {
 }
 
 /// Register with the control server using a preauth key.
+#[allow(clippy::too_many_arguments)]
 pub fn run_register(
     state_dir: &str,
     address: Ipv4Addr,
     port: u16,
     auth_key: &str,
+    hostname: &str,
     exit_node: bool,
     rotate: bool,
 ) -> ! {
     let clock = crate::time::Clock::start();
     let reactor = Reactor::new(clock);
 
-    let work = register(&reactor, state_dir, address, port, auth_key, exit_node, rotate);
+    let work = register(
+        &reactor, state_dir, address, port, auth_key, hostname, exit_node, rotate,
+    );
     match crate::exec::block_on(&reactor, work) {
         Ok(()) => {
             evt!("{{\"event\":\"register\",\"result\":\"ok\"}}");
@@ -434,12 +439,14 @@ pub fn run_register(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn register(
     reactor: &Reactor,
     state_dir: &str,
     address: Ipv4Addr,
     port: u16,
     auth_key: &str,
+    hostname: &str,
     exit_node: bool,
     rotate: bool,
 ) -> Result<(), ControlError> {
@@ -475,6 +482,10 @@ async fn register(
         old_node_key,
         auth_key,
         hostinfo: ts_control::Hostinfo {
+            // Supplied by the caller so that a conformance run can tag the nodes
+            // it creates and delete exactly those afterwards. Defaults to the
+            // plain product name on a real device.
+            hostname,
             routable_ips: if exit_node {
                 &ts_control::EXIT_NODE_ROUTES
             } else {
@@ -539,11 +550,17 @@ async fn register(
 /// compression? Every zstd decoder in Rust needs an allocator, so if the answer
 /// is no, the no-allocation property of this whole project is in question and
 /// the netmap parser cannot be written as planned.
-pub fn run_map(state_dir: &str, address: Ipv4Addr, port: u16, wanted: usize) -> ! {
+pub fn run_map(
+    state_dir: &str,
+    address: Ipv4Addr,
+    port: u16,
+    hostname: &str,
+    wanted: usize,
+) -> ! {
     let clock = crate::time::Clock::start();
     let reactor = Reactor::new(clock);
 
-    let work = fetch_map(&reactor, state_dir, address, port, wanted, &[]);
+    let work = fetch_map(&reactor, state_dir, address, port, hostname, wanted, &[]);
     match crate::exec::block_on(&reactor, work) {
         Ok(_) => crate::rt::exit(0),
         Err(e) => {
@@ -554,11 +571,13 @@ pub fn run_map(state_dir: &str, address: Ipv4Addr, port: u16, wanted: usize) -> 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_map(
     reactor: &Reactor,
     state_dir: &str,
     address: Ipv4Addr,
     port: u16,
+    hostname: &str,
     wanted: usize,
     endpoints: &[&str],
 ) -> Result<ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>, ControlError> {
@@ -578,7 +597,10 @@ async fn fetch_map(
         version: ts_control::CAPABILITY_VERSION,
         node_key: &identity.node.public(),
         disco_key: &identity.disco.public(),
-        hostinfo: ts_control::Hostinfo::default(),
+        hostinfo: ts_control::Hostinfo {
+            hostname,
+            ..Default::default()
+        },
         // The long poll is the only form that returns a map at all.
         stream: true,
         omit_peers: false,
