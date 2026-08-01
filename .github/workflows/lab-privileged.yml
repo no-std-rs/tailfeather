@@ -97,7 +97,7 @@ jobs:
           pinned=$(python3 -c "import json;print(json.load(open('tests/vectors/versions.json'))['headscale'])")
           docker pull -q docker.io/headscale/headscale:latest
           latest=$(docker run --rm docker.io/headscale/headscale:latest version \
-            | head -1 | awk '{print $3}')
+            | awk 'NR==1 {print $3}')
           echo "pinned=$pinned"  >> "$GITHUB_OUTPUT"
           echo "latest=$latest"  >> "$GITHUB_OUTPUT"
           if [ "$pinned" = "$latest" ]; then

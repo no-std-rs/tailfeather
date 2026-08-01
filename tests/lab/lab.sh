@@ -100,7 +100,7 @@ cmd_up() {
         echo "HEADSCALE_URL=$SERVER_URL"
         echo "HEADSCALE_USER=$USER_NAME"
         echo "HEADSCALE_PREAUTH_KEY=$(cat "$STATE_DIR/preauth.key")"
-        echo "HEADSCALE_VERSION=$(hs version 2>/dev/null | head -1 | awk '{print $NF}')"
+        echo "HEADSCALE_VERSION=$(hs version 2>/dev/null | awk 'NR==1 {print $NF}')"
     } >"$STATE_DIR/lab.env"
 
     echo "== lab ready"
@@ -175,8 +175,15 @@ cmd_doctor() {
     if [[ "$have_runtime" == true ]] && container_exists; then
         if curl -fsS --max-time 3 "$SERVER_URL/health" >/dev/null 2>&1; then
             have_container=true
-            headscale_version="$(hs version 2>/dev/null | head -1 | awk '{print $3}')"
-            image_digest="$("$RUNTIME" inspect "$CONTAINER" --format '{{.ImageName}}' 2>/dev/null)"
+            # `awk NR==1` rather than `head -1`: under `set -o pipefail`, head
+            # exiting after the first of headscale's four output lines gives the
+            # writer SIGPIPE and the whole pipeline a non-zero status, which
+            # `set -e` then turns into an abort. That is buffering-dependent —
+            # it never fired under podman locally and failed on the first docker
+            # run in CI — so both assignments are also `|| true`.
+            headscale_version="$(hs version 2>/dev/null | awk 'NR==1 {print $3}')" || true
+            image_digest="$("$RUNTIME" inspect "$CONTAINER" \
+                --format '{{.ImageName}}' 2>/dev/null)" || true
         else
             reason="the container exists but $SERVER_URL/health did not answer"
         fi

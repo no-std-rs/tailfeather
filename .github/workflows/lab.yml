@@ -51,7 +51,10 @@ jobs:
       - name: the server is the version the vectors describe
         run: |
           expected=$(python3 -c "import json;print(json.load(open('tests/vectors/versions.json'))['headscale'])")
-          actual=$(docker exec headscale-lab headscale version | head -1 | awk '{print $3}')
+          # `awk NR==1`, not `head -1`: GitHub runs steps under `bash -e -o
+          # pipefail`, where head closing the pipe early makes the whole
+          # pipeline fail.
+          actual=$(docker exec headscale-lab headscale version | awk 'NR==1 {print $3}')
           echo "expected $expected, running $actual"
           test "$expected" = "$actual"
 
