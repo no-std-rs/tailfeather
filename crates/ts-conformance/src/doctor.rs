@@ -125,17 +125,24 @@ impl Doctor {
                 disables: &[],
             });
         }
+        // All three disco checks and nothing else. `derp.relay` was listed here
+        // until a CI run with no reference client passed it — DERP relaying is
+        // between two of our own harness instances through the server, so it
+        // needs no second implementation. A banner that names checks which
+        // actually work is worse than no banner, because it is read by someone
+        // already trying to explain a skip.
+        const NEEDS_REFERENCE: &[&str] = &["disco.pong", "disco.ping", "disco.endpoints"];
         if !self.tailscaled_installed {
             gaps.push(Gap {
                 what: "tailscaled is not installed",
                 remedy: "install the tailscale package",
-                disables: &["disco.pong", "disco.ping", "derp.relay"],
+                disables: NEEDS_REFERENCE,
             });
         } else if !self.reference_client {
             gaps.push(Gap {
                 what: "no reference client is running",
                 remedy: "tests/lab/lab.sh reference",
-                disables: &["disco.pong", "disco.ping", "derp.relay"],
+                disables: NEEDS_REFERENCE,
             });
         }
         if !self.tls_front {
@@ -149,7 +156,7 @@ impl Doctor {
             gaps.push(Gap {
                 what: "no passwordless sudo",
                 remedy: "configure sudo, or run the interop scripts by hand",
-                disables: &["exit.forward.udp", "exit.forward.tcp", "disco.pong"],
+                disables: &["exit.forward.udp", "exit.forward.tcp"],
             });
         }
         gaps
