@@ -5,17 +5,21 @@
 //! actually wrong. That keeps it runnable from the very first day rather than
 //! only once the project is complete.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use ts_conformance::{Env, Report, Status};
 
-fn env() -> Env {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .expect("crates/ts-conformance sits two levels below the repository root")
-        .to_path_buf();
-    Env::discover(&repo_root)
+        .to_path_buf()
+}
+
+fn env() -> Env {
+    Env::discover(&repo_root())
 }
 
 #[test]
@@ -70,4 +74,55 @@ fn print_the_matrix() {
     // suite with --nocapture.
     let report = Report::run(&env());
     println!("{report}");
+}
+
+/// Every committed baseline names exactly the checks that exist.
+///
+/// Without this, adding a check leaves the baselines describing a suite that no
+/// longer exists, and the omission only surfaces the next time someone runs
+/// `--expect` — which, for the offline baseline, may be in CI on someone else's
+/// branch. Cheap to check here, and needs no lab.
+#[test]
+fn the_committed_baselines_cover_every_check() {
+    let repo_root = repo_root();
+    let expectations = repo_root.join("tests/expectations");
+    let current: BTreeSet<&str> = ts_conformance::checks::all().iter().map(|c| c.id).collect();
+
+    let mut found = 0;
+    for entry in std::fs::read_dir(&expectations).expect("tests/expectations exists") {
+        let path = entry.expect("readable entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        found += 1;
+
+        let text = std::fs::read_to_string(&path).expect("baseline is readable");
+        let document: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let checks = document["checks"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{}: no \"checks\" object", path.display()));
+        let recorded: BTreeSet<&str> = checks.keys().map(String::as_str).collect();
+
+        let added: Vec<&&str> = current.difference(&recorded).collect();
+        let removed: Vec<&&str> = recorded.difference(&current).collect();
+        assert!(
+            added.is_empty() && removed.is_empty(),
+            "{} is out of date.\n  checks missing from it: {added:?}\n  \
+             checks it names that no longer exist: {removed:?}\n  \
+             Regenerate with `cargo run -p ts-conformance -- --write-expect {}`",
+            path.display(),
+            path.display(),
+        );
+
+        // A baseline of nothing but skips would satisfy the above and measure
+        // nothing, so require that at least one check is expected to be a real
+        // result. The offline baseline still has the vector-backed ones.
+        assert!(
+            checks.values().any(|v| v == "pass" || v == "external"),
+            "{} expects no check to pass at all",
+            path.display()
+        );
+    }
+    assert!(found >= 2, "expected at least the offline and lab baselines");
 }

@@ -28,6 +28,7 @@
 //! [`Status::Fail`] is a real defect, and [`Status::Skip`] means the check
 //! could not run, which is never counted as success.
 
+pub mod baseline;
 pub mod checks;
 pub mod derp;
 pub mod disco;
@@ -119,6 +120,22 @@ impl Status {
 
     pub fn is_counted(&self) -> bool {
         !matches!(self, Self::Skip(_))
+    }
+
+    /// A stable, machine-readable name for this status.
+    ///
+    /// Distinct from [`Status::marker`], which is for humans and may be
+    /// reworded. This one appears in `--json` output and in the committed
+    /// baselines under `tests/expectations/`, so changing a string here
+    /// invalidates every baseline file.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Pass(_) => "pass",
+            Self::External(_) => "external",
+            Self::Fail(_) => "fail",
+            Self::Todo(_) => "todo",
+            Self::Skip(_) => "skip",
+        }
     }
 
     fn marker(&self) -> &'static str {
@@ -320,6 +337,39 @@ impl Report {
         self.outcomes
             .iter()
             .filter(|o| matches!(o.status, Status::Fail(_)))
+    }
+
+    /// The report as JSON, for `--json` and for comparison against a baseline.
+    ///
+    /// Only the status *kind* is recorded per check, never the detail string.
+    /// Details name addresses, ports, key material and node ids that differ on
+    /// every run, so a baseline that included them could never match twice.
+    pub fn to_json(&self) -> serde_json::Value {
+        let checks: serde_json::Map<String, serde_json::Value> = self
+            .outcomes
+            .iter()
+            .map(|o| (o.id.to_string(), serde_json::Value::from(o.status.kind())))
+            .collect();
+
+        serde_json::json!({
+            "target": self.target.to_string(),
+            "headscale_version": self.headscale_version,
+            "tailscale_version": self.tailscale_version,
+            "compatible": self.compatible(),
+            "counted": self.counted(),
+            "total": self.outcomes.len(),
+            "checks": checks,
+            "details": self
+                .outcomes
+                .iter()
+                .map(|o| {
+                    (
+                        o.id.to_string(),
+                        serde_json::Value::from(o.status.detail()),
+                    )
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        })
     }
 
     pub fn percentage(&self) -> f64 {

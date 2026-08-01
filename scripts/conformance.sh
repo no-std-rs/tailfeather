@@ -50,5 +50,25 @@ echo "== building the no_std harness"
 (cd harness && cargo build --release)
 echo
 
+# `--expect` when a baseline for this environment exists.
+#
+# Gating on the printed score is not enough. A skip is excluded from the
+# denominator, so a lab that stopped running reports "14/14 — 100% compatible"
+# while twenty checks quietly measure nothing. The baseline names the expected
+# status of every check, so that shows up as twenty regressions instead.
+#
+# Which baseline depends on whether a control server answered.
+if [[ -n "${TS_CONTROL_URL:-}" ]]; then
+    BASELINE=""      # hosted has no committed baseline yet
+elif tests/lab/lab.sh status >/dev/null 2>&1; then
+    BASELINE="tests/expectations/lab.json"
+else
+    BASELINE="tests/expectations/offline.json"
+fi
+
 echo "== compatibility matrix"
-cargo run -q -p ts-conformance --bin conformance
+if [[ -n "$BASELINE" && -f "$BASELINE" ]]; then
+    cargo run -q -p ts-conformance --bin conformance -- --expect "$BASELINE"
+else
+    cargo run -q -p ts-conformance --bin conformance
+fi
