@@ -38,6 +38,9 @@ pub struct Doctor {
     pub reference_client: bool,
     pub harness_built: bool,
     pub passwordless_sudo: bool,
+    /// The TLS terminator from `tests/lab/tls.sh`, which is separate from
+    /// `lab.sh up` and so can be absent while everything else is present.
+    pub tls_front: bool,
 }
 
 /// One missing capability, and what it costs.
@@ -70,6 +73,7 @@ impl Doctor {
             reference_client: flag("reference_client"),
             harness_built: flag("harness_built"),
             passwordless_sudo: flag("passwordless_sudo"),
+            tls_front: flag("tls_front"),
         })
     }
 
@@ -132,6 +136,13 @@ impl Doctor {
                 what: "no reference client is running",
                 remedy: "tests/lab/lab.sh reference",
                 disables: &["disco.pong", "disco.ping", "derp.relay"],
+            });
+        }
+        if !self.tls_front {
+            gaps.push(Gap {
+                what: "no TLS front",
+                remedy: "tests/lab/tls.sh up",
+                disables: &["transport.tls"],
             });
         }
         if !self.passwordless_sudo {
@@ -203,6 +214,7 @@ mod tests {
             reference_client: true,
             harness_built: true,
             passwordless_sudo: true,
+            tls_front: true,
         }
     }
 

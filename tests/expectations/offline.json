@@ -1,5 +1,5 @@
 {
-  "_comment": "Expected status of every check, compared by `conformance --expect`. Any difference in either direction is an error: a check that silently degrades to \"skip\" leaves the score at 100% because skips are excluded from the denominator, which is this suite's dominant failure mode. Regenerate deliberately with `--write-expect`, and read the diff.",
+  "_comment": "Expected status of every check, compared by `conformance --expect`. Any difference in either direction is an error: a check that silently degrades to \"skip\" leaves the score at 100% because skips are excluded from the denominator, which is this suite's dominant failure mode. Regenerate deliberately with `--write-expect`, and read the diff. NOTE: \"offline\" means no lab infrastructure of any kind \u2014 no control server and no TLS front (tests/lab/tls.sh). This file was first generated on a machine that happened to have the TLS front running, which made transport.tls read \"pass\"; CI caught it on the first run, which is the whole point of comparing rather than trusting the score.",
   "checks": {
     "control.capver.minimum": "skip",
     "control.controlbase.framing": "skip",
@@ -28,7 +28,7 @@
     "netmap.streaming": "pass",
     "netmap.to_peers": "skip",
     "transport.http2": "skip",
-    "transport.tls": "pass",
+    "transport.tls": "skip",
     "wg.handshake.initiator": "external",
     "wg.handshake.responder": "external",
     "wg.multipeer": "pass",

@@ -162,9 +162,15 @@ cmd_doctor() {
 
     local have_runtime=false have_container=false have_tailscaled=false
     local have_reference=false have_harness=false have_root=false
+    local have_tls_front=false
     local headscale_version="" image_digest="" reason=""
 
-    command -v "$RUNTIME" >/dev/null 2>&1 && have_runtime=true
+    # Every probe below is `|| true`. This function runs under the `set -e` at
+    # the top of the file, and `check && flag=true` returns non-zero when the
+    # check fails — so a missing tool aborted the whole command. That made
+    # `doctor` fail in exactly the degraded environment it exists to describe;
+    # it did so on its first CI run, where tailscaled is absent.
+    command -v "$RUNTIME" >/dev/null 2>&1 && have_runtime=true || true
 
     if [[ "$have_runtime" == true ]] && container_exists; then
         if curl -fsS --max-time 3 "$SERVER_URL/health" >/dev/null 2>&1; then
@@ -180,11 +186,16 @@ cmd_doctor() {
         reason="$RUNTIME is not installed"
     fi
 
-    command -v tailscaled >/dev/null 2>&1 && have_tailscaled=true
-    [[ -S "$TS_SOCKET" ]] && have_reference=true
+    command -v tailscaled >/dev/null 2>&1 && have_tailscaled=true || true
+    [[ -S "$TS_SOCKET" ]] && have_reference=true || true
     [[ -x "$REPO_ROOT/harness/target/x86_64-unknown-linux-none/release/harness" ]] &&
-        have_harness=true
-    sudo -n true 2>/dev/null && have_root=true
+        have_harness=true || true
+    sudo -n true 2>/dev/null && have_root=true || true
+
+    # The TLS front is separate infrastructure (tests/lab/tls.sh), not part of
+    # `lab.sh up`, so it has to be probed rather than assumed from the container.
+    curl -fsS --max-time 3 -k "https://127.0.0.1:8443/health" >/dev/null 2>&1 &&
+        have_tls_front=true || true
 
     cat > "$STATE_DIR/doctor.json" <<JSON
 {
@@ -196,7 +207,8 @@ cmd_doctor() {
   "tailscaled_installed": $have_tailscaled,
   "reference_client": $have_reference,
   "harness_built": $have_harness,
-  "passwordless_sudo": $have_root
+  "passwordless_sudo": $have_root,
+  "tls_front": $have_tls_front
 }
 JSON
 
@@ -206,6 +218,7 @@ JSON
     printf '  %-22s %s\n' "reference client" "$($have_reference && echo yes || echo "no — run '$0 reference'")"
     printf '  %-22s %s\n' "harness built" "$($have_harness && echo yes || echo "no — run 'cd harness && cargo build --release'")"
     printf '  %-22s %s\n' "passwordless sudo" "$($have_root && echo yes || echo "no — the exit-node and interop checks need it")"
+    printf '  %-22s %s\n' "TLS front" "$($have_tls_front && echo yes || echo "no — run 'tests/lab/tls.sh up'")"
     echo
     echo "  wrote $STATE_DIR/doctor.json"
 }
