@@ -37,6 +37,7 @@ pub mod headscale;
 pub mod http;
 pub mod multipeer;
 pub mod netmap;
+pub mod pcap;
 pub mod register;
 pub mod tls;
 pub mod ts2021;

@@ -18,4 +18,10 @@ x25519-dalek.workspace = true
 zeroize.workspace      = true
 
 [dev-dependencies]
-hex = "0.4"
+# The KAT in tests/kat.rs reads tests/vectors/noise-ik.json. Dev-dependencies
+# are not compiled into the library, so this does not reach the firmware and
+# the crate stays no_std and allocation-free where it counts.
+hex        = "0.4"
+serde_json = "1"
+# The KAT needs to build keys from the vector bytes.
+x25519-dalek.workspace = true

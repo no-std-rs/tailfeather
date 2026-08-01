@@ -20,7 +20,12 @@ make the gap explicit, measurable, and impossible to forget. So this is not a
 set of tests that pass or fail; it is an enumeration of every behaviour a
 Tailscale-compatible node must exhibit, each carrying a status. Unimplemented
 behaviour is *declared*, not omitted, so the score starts low and honestly and
-rises as real work lands. Today it reads 9 of 34.
+rises as real work lands. Today it reads 34 of 34 against the local lab.
+
+That number is hand-typed here and in the top-level `README.md`, and it has
+already gone stale once — this line said "9 of 34" long after the suite reached
+34. Treat `cargo run -p ts-conformance` as the authority until the figure is
+generated rather than written.
 
 **Nothing here is a mock.** The one protocol bug on this project that cost real
 time — WireGuard's Noise construction string — would have passed any test

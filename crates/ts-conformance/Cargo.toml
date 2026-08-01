@@ -22,3 +22,43 @@ serde_json = "1"
 ts-netmap.workspace = true
 ts-noise.workspace  = true
 wg-core.workspace  = true
+
+[dev-dependencies]
+# Pinned exactly. `fixed_ephemeral_key_for_testing_only` is public in the source
+# but absent from the rendered docs, so it carries no semver promise; byte
+# equality against snow is only meaningful if the version cannot move under us.
+# `risky-raw-split` exposes the Split() output, which is what lets the record
+# tests build a nonce by hand instead of accepting snow's little-endian one.
+#
+# The three primitive features name exactly the ts2021 suite, so a mismatch
+# between what we ask snow for and what ts2021 uses is a compile error rather
+# than a silently different comparison.
+snow = { version = "=0.10.0", default-features = false, features = [
+  "default-resolver",
+  "risky-raw-split",
+  "std",
+  "use-curve25519",
+  "use-chacha20poly1305",
+  "use-blake2",
+  # Only so a negative control can vary the hash while holding everything
+  # else fixed; ts2021 itself never uses SHA-256.
+  "use-sha2",
+  # The builder demands an RNG even when the ephemeral key is supplied.
+  "use-getrandom",
+] }
+# Only the differential tests need these. Keeping them out of [dependencies]
+# means the `conformance` binary stays as light as it is.
+# A real HTTP/2 implementation to drive micro-h2 against. `h2` is what enforces
+# flow control, which is the one HTTP/2 rule our own tests structurally could
+# not check.
+bytes                  = "1"
+h2                     = "0.4"
+http                   = "1"
+tokio                  = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time"] }
+# An independent HPACK, to decode what we encode and encode what we decode.
+fluke-hpack            = "0.3"
+hex                    = "0.4"
+micro-h2.workspace     = true
+ts-control.workspace   = true
+ts-keys.workspace      = true
+x25519-dalek.workspace = true

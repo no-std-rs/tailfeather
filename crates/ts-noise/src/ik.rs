@@ -49,7 +49,14 @@ pub const TYPE_RESPONSE: u8 = 2;
 /// `2B version BE ‖ 1B type ‖ 2B length BE ‖ 32B e ‖ 48B sealed static ‖ 16B tag`.
 ///
 /// The capture shows a real client sending exactly this: 101 bytes, version 131,
-/// type 1, declared length 96.
+/// type 1, declared length 96 — and 5 + 96 is 101, so the wire's own length field
+/// corroborates this constant rather than merely being consistent with it.
+///
+/// Note where those bytes travel. The initiation is **not** sent on the TCP
+/// stream: it rides base64-encoded in the `X-Tailscale-Handshake` header of the
+/// `POST /ts2021` request, and the first byte after that request's blank line is
+/// already the client's first record. `ts-conformance`'s `pcap_replay` test
+/// reads it back out of the header and checks all of this against the capture.
 pub const INITIATION_LEN: usize = 5 + 32 + (32 + TAG_LEN) + TAG_LEN;
 
 /// `1B type ‖ 2B length BE ‖ 32B e ‖ 16B tag`.

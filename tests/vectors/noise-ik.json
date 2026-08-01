@@ -1,0 +1,33 @@
+{
+  "_comment": "Noise IK initiations for ts2021, byte-equal to snow 0.10.0's message 1 with the ts2021 5-byte header prefixed. Regenerate with `cargo test -p ts-conformance --test noise_vs_snow -- --ignored`.",
+  "capability_version": 131,
+  "generated_by": "snow 0.10.0",
+  "prologue": "Tailscale Control Protocol v131",
+  "protocol": "Noise_IK_25519_ChaChaPoly_BLAKE2s",
+  "vectors": [
+    {
+      "ephemeral_private": "3333333333333333333333333333333333333333333333333333333333333333",
+      "initiation": "00830100607b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b1461d2949213e755bc180b5d5dbbd8c50a2a1beb69f8940d24cab4606a34cd5d41a34698088f8e8125fafc319ba1f6b8bb1a32615fa9feecb032ed657996022213",
+      "machine_private": "1111111111111111111111111111111111111111111111111111111111111111",
+      "server_public": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"
+    },
+    {
+      "ephemeral_private": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+      "initiation": "0083010060ffe851688ca15799239e0f6deddc806858aeb0cd75c8eaf0d7c726572e91291f0c6d17cb7adcd1307cca58c8c819c22fb63e5091890a08e18d8aadfe099c37c4b19a20b33651e999c3dca4e6165fbb1f463e021246ba5d87c280aade8d9b2d1c",
+      "machine_private": "0101010101010101010101010101010101010101010101010101010101010101",
+      "server_public": "823ffa5082d8cd43eff42af39423dd18fa9245c711e9ec38b863801490447a06"
+    },
+    {
+      "ephemeral_private": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+      "initiation": "0083010060bfda3768f927db529fe9f0f6ee4ba469e432c93bb6fbb8ed5d04e87ed0a45d7b19a55d9bdb722dc4d5e49b324cdcfc5b0919cff669bc281ba3060c8bb5d95dcd76449e3ecfe5c1a6ba13cbb3d59cea1817c44dba42e9ea1a00ce44fe1f5a803f",
+      "machine_private": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "server_public": "b0d08f35b4683381489afb32825e59152d47d19bc9e050d6d5a954984c9d1e2c"
+    },
+    {
+      "ephemeral_private": "8080808080808080808080808080808080808080808080808080808080808080",
+      "initiation": "0083010060c84a0f784d9723c28577272ff700d42b6c923c23f5bdd38e933ac77d6ceb91579a9433f53028990a9a7cf358fbc002d93db51b5c84c6e9c046d9ed9946a6810c9693e584f8fef5bdcd11baa74d20b6e5a29f6323e82be85857f0d7fab293fe0d",
+      "machine_private": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "server_public": "2fe57da347cd62431528daac5fbb290730fff684afc4cfc2ed90995f58cb3b74"
+    }
+  ]
+}

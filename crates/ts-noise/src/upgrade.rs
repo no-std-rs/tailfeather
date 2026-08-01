@@ -227,46 +227,58 @@ mod tests {
         assert!(text.ends_with("\r\n\r\n"));
     }
 
+    /// Base64 against RFC 4648's own test vectors.
+    ///
+    /// This used to be a copy of the `X-Tailscale-Handshake` header from
+    /// `tests/vectors/ts2021-session.pcap`, transcribed by hand. That anchor now
+    /// lives where it can never go stale — `ts-conformance`'s `pcap_replay`
+    /// test reads the header out of the capture and re-encodes it — so what is
+    /// left here is the part that needs no capture: the encoding itself,
+    /// checked against the vectors in the standard that defines it.
+    ///
+    /// Every padding case appears: `len % 3` of 0, 1 and 2.
     #[test]
-    fn base64_matches_the_captured_header_byte_for_byte() {
-        // The exact handshake header a real tailscaled 1.94.2 sent, decoded from
-        // tests/vectors/ts2021-session.pcap. Encoding those same 101 bytes must
-        // reproduce it, padding included.
-        const CAPTURED: &str = "AIMBAGAhJl0OSgRSdEyDE6UmQiO4EDCkQu1+/r9+pcWPJd5rDVKG/IKWrrpi4K+5anFDQAPAFl7GPAA83SUUaAuty/juJd23wPBXbEt7IwXjSDk7OvKfpYL+Jb1m9Zx44jRdRHk=";
-        let initiation = decode_base64(CAPTURED);
-        assert_eq!(initiation.len(), 101);
-        // Sanity: this really is the message this crate builds.
-        assert_eq!(u16::from_be_bytes([initiation[0], initiation[1]]), 131);
-        assert_eq!(initiation[2], 1);
+    fn base64_matches_rfc_4648s_vectors_including_padding() {
+        const VECTORS: &[(&str, &str)] = &[
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ];
+        for (input, expected) in VECTORS {
+            let mut out = [0u8; MAX_REQUEST];
+            let mut w = Writer::new(&mut out);
+            w.base64(input.as_bytes()).unwrap();
+            assert_eq!(
+                core::str::from_utf8(w.finish()).unwrap(),
+                *expected,
+                "base64({input:?})"
+            );
+        }
 
+        // The `+` and `/` of the standard alphabet, which the URL-safe variant
+        // spells differently. Headscale refuses the URL-safe form.
         let mut out = [0u8; MAX_REQUEST];
         let mut w = Writer::new(&mut out);
-        w.base64(&initiation).unwrap();
-        assert_eq!(core::str::from_utf8(w.finish()).unwrap(), CAPTURED);
+        w.base64(&[0xfb, 0xff, 0xbf]).unwrap();
+        assert_eq!(core::str::from_utf8(w.finish()).unwrap(), "+/+/");
     }
 
-    fn decode_base64(text: &str) -> [u8; 101] {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = [0u8; 101];
-        let mut written = 0;
-        let mut accumulator = 0u32;
-        let mut bits = 0;
-        for c in text.bytes() {
-            if c == b'=' {
-                break;
-            }
-            let value = ALPHABET.iter().position(|&a| a == c).unwrap() as u32;
-            accumulator = accumulator << 6 | value;
-            bits += 6;
-            if bits >= 8 {
-                bits -= 8;
-                out[written] = (accumulator >> bits) as u8;
-                written += 1;
-            }
-        }
-        assert_eq!(written, 101);
-        out
+    /// A 101-byte input is what the handshake header actually carries, and its
+    /// encoded length is a constant other code sizes buffers against.
+    #[test]
+    fn an_initiation_sized_input_encodes_to_the_declared_header_length() {
+        let mut out = [0u8; MAX_REQUEST];
+        let mut w = Writer::new(&mut out);
+        w.base64(&[0x41; 101]).unwrap();
+        let encoded = w.finish();
+        assert_eq!(encoded.len(), HANDSHAKE_HEADER_LEN);
+        // 101 % 3 == 2, so exactly one '=' of padding.
+        assert!(encoded.ends_with(b"="));
+        assert!(!encoded.ends_with(b"=="));
     }
 
     #[test]
