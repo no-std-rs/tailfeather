@@ -70,10 +70,23 @@ jobs:
           cargo run -q -p ts-conformance -- \
             --expect tests/expectations/lab-ci.json
 
-      # The matrix test asserts no known incompatibility regressed. Kept
-      # separate from the run above so a failure names which of the two failed.
-      - name: matrix test
-        run: cargo test -p ts-conformance --test matrix
+      # No separate `cargo test --test matrix` step here.
+      #
+      # It re-ran the entire suite a second time in the same job — another 30
+      # seconds and another six registrations — and its only live assertion,
+      # `no_known_incompatibilities`, is strictly weaker than the `--expect`
+      # comparison above: it fails on a Fail and is blind to a check that
+      # degraded to Skip. The matrix file's other tests need no lab and run in
+      # ci.yml's host job.
+      #
+      # OPEN ISSUE, recorded here so it is not lost: that second run failed once
+      # with `netmap.to_peers: FAIL ts2021: decryption failed; noise session
+      # established; <- noise response, 51 bytes`, and passed on rerun. A record
+      # layer that decrypts fine and then fails is the signature the nonce
+      # convention produces (see crates/ts-noise/src/record.rs), so this is worth
+      # chasing rather than assuming it was the lab. It is not reproducible
+      # locally so far. Removing this step reduces how often the condition is
+      # exercised, which is a reason to chase it deliberately, not a fix.
 
       # Runs even when the suite failed: a failing run is precisely the one that
       # leaves nodes behind if anything went wrong with cleanup, and the next
