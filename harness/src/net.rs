@@ -109,8 +109,7 @@ impl<'r> UdpSocket<'r> {
     /// of any NAT, and a peer across one still has to learn the translated
     /// address from the pong it sends back.
     pub fn advertisable_address(fallback: &SocketAddrV4) -> Result<Ipv4Addr, NetError> {
-        const PUBLIC: SocketAddrV4 =
-            SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
+        const PUBLIC: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
         match Self::outbound_address(&PUBLIC) {
             Ok(address) if !address.is_loopback() && !address.is_unspecified() => Ok(address),
             // No default route, or it is loopback: fall back to whatever reaches
@@ -190,9 +189,7 @@ impl<'r> TcpListener<'r> {
                     });
                 }
                 Err(e) if would_block(e) => {
-                    self.reactor
-                        .ready(self.fd.as_raw_fd(), PollFlags::IN)
-                        .await;
+                    self.reactor.ready(self.fd.as_raw_fd(), PollFlags::IN).await;
                 }
                 Err(e) => return Err(NetError::Errno(e)),
             }

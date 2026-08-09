@@ -26,6 +26,13 @@
 //! [`conn::Connection`] never touches a socket. It is fed the bytes that arrived
 //! and writes the bytes to send, so the same code runs over TCP, over a ts2021
 //! Noise channel, and over a captured session in a test.
+//!
+//! ```
+//! let mut connection = micro_h2::Connection::new();
+//! let mut out = [0u8; 256];
+//! let written = connection.start(&mut out).unwrap();
+//! assert!(written > 24); // client preface plus SETTINGS and WINDOW_UPDATE
+//! ```
 
 #![no_std]
 #![forbid(unsafe_code)]

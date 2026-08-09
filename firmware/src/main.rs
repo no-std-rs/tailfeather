@@ -1,8 +1,8 @@
-//! ESP32-C6 WireGuard gateway.
+//! ESP32-C6 tailfeather gateway.
 //!
 //! Milestone M1 is what runs here end to end: join a Wi-Fi network as a
 //! station, take an address by DHCP, then hand the stack to the tunnel task
-//! which drives [`wg_core::Device`] over UDP.
+//! which drives one [`tailfeather::Node`] actor over UDP.
 
 #![no_std]
 #![no_main]
@@ -37,6 +37,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 pub const WIFI_SSID: &str = env!("WIFI_SSID");
 pub const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 pub const WG_PRIVATE_KEY: [u8; 32] = hex32(env!("WG_PRIVATE_KEY"));
+pub const MACHINE_PRIVATE_KEY: [u8; 32] = hex32(env!("MACHINE_PRIVATE_KEY"));
+pub const DISCO_PRIVATE_KEY: [u8; 32] = hex32(env!("DISCO_PRIVATE_KEY"));
 pub const WG_PEER_PUBLIC_KEY: [u8; 32] = hex32(env!("WG_PEER_PUBLIC_KEY"));
 pub const WG_TUNNEL_IP: [u8; 4] = ipv4(env!("WG_TUNNEL_IP"));
 
@@ -116,9 +118,8 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    let (wifi_controller, interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default())
-            .expect("Failed to initialize Wi-Fi controller");
+    let (wifi_controller, interfaces) = esp_radio::wifi::new(peripherals.WIFI, Default::default())
+        .expect("Failed to initialize Wi-Fi controller");
 
     let rng = Rng::new();
     // smoltcp randomizes ephemeral ports and the DHCP transaction ID from this.

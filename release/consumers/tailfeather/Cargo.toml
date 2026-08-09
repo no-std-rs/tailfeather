@@ -1,0 +1,11 @@
+[package]
+name = "tailfeather-isolated-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+embedded-io-async = "0.7"
+tailfeather = "0.1.0"

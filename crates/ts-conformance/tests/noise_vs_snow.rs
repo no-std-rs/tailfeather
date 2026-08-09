@@ -1,4 +1,4 @@
-//! `ts-noise`'s Noise IK against `snow`, an implementation that passes the Noise
+//! Tailfeather's Noise IK against `snow`, an implementation that passes the Noise
 //! specification's own test vectors.
 //!
 //! This is the largest self-referential gap in the suite closed. Every other
@@ -30,12 +30,12 @@
 //! and the empty-but-still-sealed payload.
 
 use snow::Builder;
-use ts_noise::ik::{TYPE_INITIATION, TYPE_RESPONSE};
-use ts_noise::{CAPABILITY_VERSION, HEADER_LEN, INITIATION_LEN, RESPONSE_LEN, initiate};
+use tailfeather::noise::ik::{TYPE_INITIATION, TYPE_RESPONSE};
+use tailfeather::noise::{CAPABILITY_VERSION, HEADER_LEN, INITIATION_LEN, RESPONSE_LEN, initiate};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// The parameter string ts2021 uses. snow parses this into the same primitives
-/// `ts-noise` hard-codes.
+/// Tailfeather hard-codes.
 const PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
 fn prologue(version: u16) -> Vec<u8> {
@@ -133,7 +133,10 @@ fn our_initiation_is_byte_equal_to_snows() {
         // The ts2021 header sits in front and is not part of the transcript.
         assert_eq!(u16::from_be_bytes([ours[0], ours[1]]), CAPABILITY_VERSION);
         assert_eq!(ours[2], TYPE_INITIATION);
-        assert_eq!(u16::from_be_bytes([ours[3], ours[4]]) as usize, theirs.len());
+        assert_eq!(
+            u16::from_be_bytes([ours[3], ours[4]]) as usize,
+            theirs.len()
+        );
     }
 }
 
@@ -177,10 +180,18 @@ fn omitting_the_prologue_entirely_produces_different_bytes() {
 fn a_different_protocol_name_produces_different_bytes() {
     for t in triples().iter() {
         let ours = our_initiation(t);
-        let sha256 = snow_initiation(t, &prologue(CAPABILITY_VERSION), "Noise_IK_25519_ChaChaPoly_SHA256");
+        let sha256 = snow_initiation(
+            t,
+            &prologue(CAPABILITY_VERSION),
+            "Noise_IK_25519_ChaChaPoly_SHA256",
+        );
         assert_ne!(&ours[5..], &sha256[..]);
     }
-    assert_eq!(PARAMS.len(), 33, "the name is one byte past the padding boundary");
+    assert_eq!(
+        PARAMS.len(),
+        33,
+        "the name is one byte past the padding boundary"
+    );
 }
 
 /// Different static keys must give different sealed blobs. Guards against the
@@ -235,9 +246,15 @@ fn snow_accepts_our_initiation_and_we_accept_its_reply() {
 
         // Identity hiding, verified from the outside: our machine key was not in
         // the clear, and snow recovered it by decrypting.
-        let recovered = responder.get_remote_static().expect("snow recovered a static key");
+        let recovered = responder
+            .get_remote_static()
+            .expect("snow recovered a static key");
         let expected = PublicKey::from(&t.machine);
-        assert_eq!(recovered, expected.as_bytes(), "triple {i}: wrong machine key recovered");
+        assert_eq!(
+            recovered,
+            expected.as_bytes(),
+            "triple {i}: wrong machine key recovered"
+        );
         assert!(
             !ours[5..].windows(32).any(|w| w == expected.as_bytes()),
             "triple {i}: the machine key appears in the clear in the initiation"
@@ -246,13 +263,20 @@ fn snow_accepts_our_initiation_and_we_accept_its_reply() {
         // snow's reply, framed the way Headscale frames it.
         let mut reply = [0u8; 256];
         let reply_len = responder.write_message(&[], &mut reply).unwrap();
-        assert_eq!(reply_len, 48, "triple {i}: the IK response body is 48 bytes");
+        assert_eq!(
+            reply_len, 48,
+            "triple {i}: the IK response body is 48 bytes"
+        );
 
         let mut framed = [0u8; RESPONSE_LEN];
         framed[0] = TYPE_RESPONSE;
         framed[1..3].copy_from_slice(&(reply_len as u16).to_be_bytes());
         framed[3..].copy_from_slice(&reply[..reply_len]);
-        assert_eq!(&framed[..3], &[0x02, 0x00, 0x30], "the captured response header");
+        assert_eq!(
+            &framed[..3],
+            &[0x02, 0x00, 0x30],
+            "the captured response header"
+        );
 
         handshake
             .consume_response(&framed)
@@ -342,7 +366,7 @@ fn the_record_counter_is_big_endian_where_noises_is_little_endian() {
 
     let mut le_record = vec![0u8; HEADER_LEN];
     let sealed = seal_chacha(&client_rx, &nonce_le(1), b"little endian");
-    le_record[0] = ts_noise::record::TYPE_RECORD;
+    le_record[0] = tailfeather::noise::record::TYPE_RECORD;
     le_record[1..3].copy_from_slice(&(sealed.len() as u16).to_be_bytes());
     le_record.extend_from_slice(&sealed);
 
@@ -368,18 +392,18 @@ fn nonce_le(counter: u64) -> [u8; 12] {
     nonce
 }
 
-/// ChaCha20-Poly1305 open, via `wg-core`'s primitives, with the nonce supplied
+/// ChaCha20-Poly1305 open, via `wirefeather`'s primitives, with the nonce supplied
 /// explicitly rather than derived from a counter.
 fn open_chacha(key: &[u8; 32], nonce: &[u8; 12], body: &[u8]) -> Option<Vec<u8>> {
     let (ciphertext, tag) = body.split_at(body.len() - 16);
     let mut plaintext = ciphertext.to_vec();
-    wg_core::crypto::aead_open_nonce(key, nonce, &[], &mut plaintext, tag).ok()?;
+    wirefeather::crypto::aead_open_nonce(key, nonce, &[], &mut plaintext, tag).ok()?;
     Some(plaintext)
 }
 
 fn seal_chacha(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8]) -> Vec<u8> {
     let mut out = plaintext.to_vec();
-    let tag = wg_core::crypto::aead_seal_nonce(key, nonce, &[], &mut out);
+    let tag = wirefeather::crypto::aead_seal_nonce(key, nonce, &[], &mut out);
     out.extend_from_slice(&tag);
     out
 }
@@ -390,7 +414,7 @@ fn seal_chacha(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8]) -> Vec<u8> {
 
 /// Regenerate `tests/vectors/noise-ik.json` from the byte-equal outputs above.
 ///
-/// Run with `--ignored` after a deliberate change. `ts-noise`'s own `kat` test
+/// Run with `--ignored` after a deliberate change. Tailfeather's own `kat` test
 /// reads the file, which gives that crate an external anchor without taking a
 /// dev-dependency on `snow`.
 #[test]
@@ -427,7 +451,7 @@ fn regenerate_the_frozen_vectors() {
 
 /// The committed vectors still describe what the code produces.
 ///
-/// Duplicated deliberately in `ts-noise`'s own test suite: there it runs without
+/// Duplicated deliberately in Tailfeather's own test suite: there it runs without
 /// `snow`, here it runs beside the generator that produced the file.
 #[test]
 fn the_frozen_vectors_match_what_we_produce() {

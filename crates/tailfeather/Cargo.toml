@@ -1,0 +1,26 @@
+[package]
+name = "tailfeather"
+description = "Allocation-free, transport-agnostic building blocks for a Tailscale-compatible mesh node"
+readme = "README.md"
+keywords = ["tailscale", "wireguard", "no-std", "embedded", "sans-io"]
+categories = ["network-programming", "no-std", "embedded"]
+exclude = ["tests/"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+crypto_box = { version = "0.9", default-features = false, features = ["salsa20"] }
+embedded-io-async = "0.7"
+heapless.workspace = true
+micro-h2.workspace = true
+subtle.workspace = true
+wirefeather.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+hex = "0.4"
+serde_json = "1"

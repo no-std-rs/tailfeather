@@ -1,4 +1,4 @@
-//! Drives a real `wg-core` device through several concurrent sessions.
+//! Drives a real `wirefeather` device through several concurrent sessions.
 //!
 //! # What this does and does not prove
 //!
@@ -16,7 +16,7 @@
 //! the construction is kernel-verified and the *multiplicity* is verified here.
 //! The check reports it that way rather than claiming more.
 
-use wg_core::{Action, Device, Instant, PeerId, Rng, Tai64n};
+use wirefeather::{Action, Device, Instant, PeerId, Rng, Tai64n};
 
 use crate::Status;
 
@@ -24,7 +24,7 @@ use crate::Status;
 /// trivially satisfied, and more than one full mesh's worth for a small tailnet.
 const PEERS: usize = 8;
 
-const MAX: usize = wg_core::MAX_DATAGRAM_LEN;
+const MAX: usize = wirefeather::MAX_DATAGRAM_LEN;
 
 /// Deterministic, so a failure is reproducible, but not constant, so distinct
 /// session indices and ephemeral keys are exercised.
@@ -99,8 +99,7 @@ fn exercise() -> Result<String, String> {
     // interval" limiter fails here.
     let mut connected = 0;
     for (i, spoke) in spokes.iter_mut().enumerate() {
-        handshake(&mut hub, spoke, hub_peers[i], i, now)
-            .map_err(|e| format!("peer {i}: {e}"))?;
+        handshake(&mut hub, spoke, hub_peers[i], i, now).map_err(|e| format!("peer {i}: {e}"))?;
         connected += 1;
     }
     if connected != PEERS {
@@ -110,7 +109,9 @@ fn exercise() -> Result<String, String> {
     // All sessions are live at once.
     for (i, peer) in hub_peers.iter().enumerate() {
         if !hub.is_connected(*peer, now) {
-            return Err(format!("peer {i} has no usable session after all handshakes"));
+            return Err(format!(
+                "peer {i} has no usable session after all handshakes"
+            ));
         }
     }
 
@@ -150,7 +151,7 @@ fn exercise() -> Result<String, String> {
 
     // One peer rekeying must not disturb the others. This is the failure mode a
     // single-peer test structurally cannot see.
-    let later = Instant(now.0 + wg_core::timers::REKEY_AFTER_TIME_MS);
+    let later = Instant(now.0 + wirefeather::timers::REKEY_AFTER_TIME_MS);
     handshake(&mut hub, &mut spokes[0], hub_peers[0], PEERS, later)
         .map_err(|e| format!("peer 0 could not rekey: {e}"))?;
     for (i, peer) in hub_peers.iter().enumerate() {
@@ -160,7 +161,7 @@ fn exercise() -> Result<String, String> {
     }
 
     Ok(format!(
-        "{PEERS} concurrent sessions through wg-core: all handshaked in one millisecond, \
+        "{PEERS} concurrent sessions through wirefeather: all handshaked in one millisecond, \
          each peer's traffic attributed correctly, and one peer's rekey left the other \
          {} untouched. The messages are built by the same functions kernel WireGuard \
          accepted in scripts/interop-wireguard.sh, in both roles.",
@@ -231,8 +232,13 @@ fn handshake(
     };
 
     let mut sink = vec![0u8; MAX];
-    match hub.handle_udp(&keepalive[..keepalive_len], now, &mut TestRng(201), &mut sink) {
-        Ok(Action::None) => Ok(()),
+    match hub.handle_udp(
+        &keepalive[..keepalive_len],
+        now,
+        &mut TestRng(201),
+        &mut sink,
+    ) {
+        Ok(Action::Authenticated { .. }) => Ok(()),
         Ok(other) => Err(format!("the confirming keepalive produced {other:?}")),
         Err(e) => Err(format!("the hub rejected the confirming keepalive: {e}")),
     }

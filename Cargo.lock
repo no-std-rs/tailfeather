@@ -185,6 +185,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
+name = "embedded-io-async"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2564b9f813c544241430e147d8bc454815ef9ac998878d30cc3055449f7fd4c0"
+dependencies = [
+ "embedded-io",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -480,6 +495,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -589,6 +605,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "tailfeather"
+version = "0.1.0"
+dependencies = [
+ "crypto_box",
+ "embedded-io-async",
+ "heapless",
+ "hex",
+ "micro-h2",
+ "serde_json",
+ "subtle",
+ "wirefeather",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "tailfeather-testkit"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tailfeather",
+]
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -667,70 +709,10 @@ dependencies = [
  "micro-h2",
  "serde_json",
  "snow",
+ "tailfeather",
  "tokio",
- "ts-control",
- "ts-keys",
- "ts-netmap",
- "ts-noise",
- "wg-core",
+ "wirefeather",
  "x25519-dalek",
-]
-
-[[package]]
-name = "ts-control"
-version = "0.1.0"
-dependencies = [
- "heapless",
- "ts-keys",
- "ts-noise",
-]
-
-[[package]]
-name = "ts-derp"
-version = "0.1.0"
-dependencies = [
- "crypto_box",
- "heapless",
- "ts-keys",
-]
-
-[[package]]
-name = "ts-disco"
-version = "0.1.0"
-dependencies = [
- "crypto_box",
- "heapless",
- "ts-keys",
-]
-
-[[package]]
-name = "ts-keys"
-version = "0.1.0"
-dependencies = [
- "subtle",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "ts-netmap"
-version = "0.1.0"
-dependencies = [
- "heapless",
- "serde_json",
- "ts-keys",
-]
-
-[[package]]
-name = "ts-noise"
-version = "0.1.0"
-dependencies = [
- "hex",
- "serde_json",
- "ts-keys",
- "wg-core",
- "x25519-dalek",
- "zeroize",
 ]
 
 [[package]]
@@ -780,20 +762,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen",
-]
-
-[[package]]
-name = "wg-core"
-version = "0.1.0"
-dependencies = [
- "blake2",
- "chacha20poly1305",
- "heapless",
- "hex",
- "hmac",
- "subtle",
- "x25519-dalek",
- "zeroize",
 ]
 
 [[package]]
@@ -868,6 +836,20 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "wirefeather"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "chacha20poly1305",
+ "heapless",
+ "hex",
+ "hmac",
+ "subtle",
+ "x25519-dalek",
+ "zeroize",
+]
 
 [[package]]
 name = "wit-bindgen"

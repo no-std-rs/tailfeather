@@ -1,6 +1,6 @@
 //! The JSON we emit, read back by a real parser.
 //!
-//! `ts-control`'s own tests compare `Writer` output to string literals that we
+//! Tailfeather's own tests compare `Writer` output to string literals that we
 //! also wrote. That catches a changed field name and nothing else: an escaper
 //! bug producing a document no parser accepts passes, because the literal is
 //! wrong in exactly the same way. It would take a server rejecting a
@@ -14,9 +14,9 @@
 //! The hostname is the interesting input: on a real device it comes from
 //! configuration, so it is the one field an outsider can influence.
 
-use ts_control::hostinfo::Hostinfo;
-use ts_control::register::RegisterRequest;
-use ts_keys::NodePrivate;
+use tailfeather::control::hostinfo::Hostinfo;
+use tailfeather::control::register::RegisterRequest;
+use tailfeather::keys::NodePrivate;
 
 /// Big enough for every document below, including the pathological hostnames.
 const BUFFER: usize = 8192;
@@ -47,12 +47,10 @@ fn render(hostname: &str, auth_key: &str) -> serde_json::Value {
     let mut out = [0u8; BUFFER];
     let bytes = request.write(&mut out).expect("the document fits");
 
-    let text = std::str::from_utf8(bytes).unwrap_or_else(|e| {
-        panic!("the register body is not UTF-8 ({e}): {:?}", bytes)
-    });
-    serde_json::from_str(text).unwrap_or_else(|e| {
-        panic!("the register body is not valid JSON ({e}): {text}")
-    })
+    let text = std::str::from_utf8(bytes)
+        .unwrap_or_else(|e| panic!("the register body is not UTF-8 ({e}): {:?}", bytes));
+    serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("the register body is not valid JSON ({e}): {text}"))
 }
 
 #[test]
@@ -71,7 +69,9 @@ fn a_registration_parses_and_carries_the_fields_the_server_reads() {
 
     // Absent means "no previous key", spelled as Go's zero value rather than
     // omitted or null — a server reading it as a key must get 32 zero bytes.
-    let old = value["OldNodeKey"].as_str().expect("OldNodeKey is a string");
+    let old = value["OldNodeKey"]
+        .as_str()
+        .expect("OldNodeKey is a string");
     assert_eq!(old, "nodekey:{}".replace("{}", &"0".repeat(64)));
 
     // Services is present and empty, not missing.
@@ -91,7 +91,10 @@ fn every_hostname_survives_a_round_trip_through_a_real_parser() {
     const HOSTNAMES: &[(&str, &str)] = &[
         ("plain", "the ordinary case"),
         ("with\"quote", "an unescaped quote ends the string early"),
-        ("with\\backslash", "a lone backslash escapes the closing quote"),
+        (
+            "with\\backslash",
+            "a lone backslash escapes the closing quote",
+        ),
         ("both\"and\\", "the two structural characters together"),
         ("tab\there", "a literal tab is not allowed raw in JSON"),
         ("newline\nhere", "a literal newline is not allowed raw"),
@@ -101,10 +104,16 @@ fn every_hostname_survives_a_round_trip_through_a_real_parser() {
         ("\u{7f}delete", "DEL is not a JSON control character"),
         ("héllo-wörld", "two-byte UTF-8"),
         ("日本語ホスト", "three-byte UTF-8"),
-        ("emoji-\u{1f600}", "four-byte UTF-8, a surrogate pair if escaped"),
+        (
+            "emoji-\u{1f600}",
+            "four-byte UTF-8, a surrogate pair if escaped",
+        ),
         ("\u{feff}bom", "a byte-order mark inside the string"),
         ("\\u0041", "the literal characters of an escape, not an 'A'"),
-        ("}{\"Version\":9999,\"x\":\"", "an attempt to inject a field"),
+        (
+            "}{\"Version\":9999,\"x\":\"",
+            "an attempt to inject a field",
+        ),
         ("", "empty"),
     ];
 
@@ -242,7 +251,7 @@ fn exit_node_routes_parse_as_an_array_of_prefixes() {
             hostname: "gw",
             version: "1.94.2",
             os: "linux",
-            routable_ips: &ts_control::hostinfo::EXIT_NODE_ROUTES,
+            routable_ips: &tailfeather::control::hostinfo::EXIT_NODE_ROUTES,
         },
         ephemeral: true,
     };

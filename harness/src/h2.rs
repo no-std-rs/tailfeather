@@ -10,7 +10,7 @@
 //! bytes, tops it up a record at a time, and hands out whole HTTP/2 frames.
 
 use micro_h2::{Connection, Event, frame};
-use ts_noise::Session;
+use tailfeather::noise::Session;
 
 use crate::net::{NetError, TcpStream};
 
@@ -23,7 +23,7 @@ const OUT_BUFFER: usize = 4096;
 #[derive(Debug, Clone, Copy)]
 pub enum H2Error {
     Net(NetError),
-    Noise(ts_noise::Error),
+    Noise(tailfeather::noise::Error),
     Http2(micro_h2::Error),
     /// A frame larger than the buffer this client keeps.
     FrameTooLarge,
@@ -46,8 +46,8 @@ impl From<NetError> for H2Error {
     }
 }
 
-impl From<ts_noise::Error> for H2Error {
-    fn from(e: ts_noise::Error) -> Self {
+impl From<tailfeather::noise::Error> for H2Error {
+    fn from(e: tailfeather::noise::Error) -> Self {
         Self::Noise(e)
     }
 }
@@ -226,9 +226,9 @@ impl<'r> Http2<'r> {
 
     /// Seal and send, splitting across records when needed.
     async fn send(&mut self, mut plaintext: &[u8]) -> Result<(), H2Error> {
-        let mut record = [0u8; ts_noise::MAX_MESSAGE];
+        let mut record = [0u8; tailfeather::noise::MAX_MESSAGE];
         while !plaintext.is_empty() {
-            let take = plaintext.len().min(ts_noise::MAX_PLAINTEXT);
+            let take = plaintext.len().min(tailfeather::noise::MAX_PLAINTEXT);
             let len = self.session.seal(&plaintext[..take], &mut record)?;
             self.stream.write_all(&record[..len]).await?;
             plaintext = &plaintext[take..];
@@ -255,11 +255,11 @@ impl<'r> Http2<'r> {
 
     /// Decrypt one record onto the end of the buffer.
     async fn fill(&mut self) -> Result<(), H2Error> {
-        let mut header = [0u8; ts_noise::HEADER_LEN];
+        let mut header = [0u8; tailfeather::noise::HEADER_LEN];
         self.stream.read_exact(&mut header).await?;
         let len = Session::ciphertext_len(&header)?;
 
-        let mut ciphertext = [0u8; ts_noise::MAX_MESSAGE];
+        let mut ciphertext = [0u8; tailfeather::noise::MAX_MESSAGE];
         self.stream.read_exact(&mut ciphertext[..len]).await?;
 
         let plaintext_len = self

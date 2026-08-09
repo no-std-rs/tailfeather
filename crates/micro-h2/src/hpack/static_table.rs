@@ -91,10 +91,7 @@ pub fn find(name: &str, value: &str) -> Option<usize> {
 
 /// Find an entry matching the name alone.
 pub fn find_name(name: &str) -> Option<usize> {
-    ENTRIES
-        .iter()
-        .position(|(n, _)| *n == name)
-        .map(|i| i + 1)
+    ENTRIES.iter().position(|(n, _)| *n == name).map(|i| i + 1)
 }
 
 #[cfg(test)]

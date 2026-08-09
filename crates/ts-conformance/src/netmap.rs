@@ -10,7 +10,7 @@
 use std::sync::OnceLock;
 
 use serde_json::Value;
-use ts_netmap::{Netmap, Parser};
+use tailfeather::netmap::{Netmap, Parser};
 
 use crate::harness::{NOT_BUILT, Run};
 use crate::{Env, Status, Target};
@@ -204,7 +204,7 @@ pub fn streaming(env: &Env) -> Status {
          buffer that scales with the document holds one string — {} bytes, against a \
          longest captured string of {longest} — so a tailnet ten times the size needs \
          no more memory.",
-        ts_netmap::MAX_STRING
+        tailfeather::netmap::MAX_STRING
     ))
 }
 
@@ -253,7 +253,7 @@ pub fn to_peers(env: &Env) -> Status {
         }
         let reachable = peers["reachable"].as_u64().unwrap_or(0);
         Status::Pass(format!(
-            "the live netmap configured {configured} wg-core peer(s), {reachable} with a \
+            "the live netmap configured {configured} wirefeather peer(s), {reachable} with a \
              direct IPv4 endpoint. The node key is the WireGuard key, which is what makes \
              a netmap a data-plane configuration rather than a directory; the harness \
              checked that its device's public key is the one the server published."
@@ -306,7 +306,9 @@ fn start(env: &Env) -> Result<Run, String> {
         return Err(NOT_BUILT.into());
     };
     if env.target == Target::TailscaleSaas {
-        return Err("the hosted service is HTTPS-only and there is no TLS client yet".into());
+        return Err(
+            "this conformance path does not yet route hosted requests through verified TLS".into(),
+        );
     }
     let Some((host, port)) = &env.control_address else {
         return Err("no control server configured; start one with tests/lab/lab.sh up".into());
@@ -321,8 +323,13 @@ fn start(env: &Env) -> Result<Run, String> {
 
     // A map request only answers a registered node.
     let registered = harness.run(&[
-        "register", &state, host, &port, auth_key,
-        "--hostname", env.scope.hostname(),
+        "register",
+        &state,
+        host,
+        &port,
+        auth_key,
+        "--hostname",
+        env.scope.hostname(),
     ])?;
     if registered.event("registered").is_none() {
         return Err(format!(
@@ -330,5 +337,12 @@ fn start(env: &Env) -> Result<Run, String> {
             registered.tail()
         ));
     }
-    harness.run(&["map", &state, host, &port, "--hostname", env.scope.hostname()])
+    harness.run(&[
+        "map",
+        &state,
+        host,
+        &port,
+        "--hostname",
+        env.scope.hostname(),
+    ])
 }

@@ -84,7 +84,9 @@ fn start(env: &Env) -> Result<Run, String> {
         return Err(NOT_BUILT.into());
     };
     if env.target == Target::TailscaleSaas {
-        return Err("the hosted service is HTTPS-only and there is no TLS client yet".into());
+        return Err(
+            "this conformance path does not yet route hosted requests through verified TLS".into(),
+        );
     }
     let (Some((host, port)), Some(auth_key)) = (&env.control_address, &env.preauth_key) else {
         return Err("no lab; start one with tests/lab/lab.sh up".into());
@@ -104,8 +106,13 @@ fn start(env: &Env) -> Result<Run, String> {
     let port = port.to_string();
 
     let registered = harness.run(&[
-        "register", &state, host, &port, auth_key,
-        "--hostname", env.scope.hostname(),
+        "register",
+        &state,
+        host,
+        &port,
+        auth_key,
+        "--hostname",
+        env.scope.hostname(),
     ])?;
     let Some(node_key) = registered
         .event("registered")
@@ -241,8 +248,7 @@ fn start(env: &Env) -> Result<Run, String> {
         ));
     }
     if let Some(nudge) = nudge {
-        run.note
-            .push_str(&String::from_utf8_lossy(&nudge.stdout));
+        run.note.push_str(&String::from_utf8_lossy(&nudge.stdout));
     }
     Ok(run)
 }
@@ -258,8 +264,7 @@ fn start(env: &Env) -> Result<Run, String> {
 /// check instantly and put the flakiness straight back. The node key is freshly
 /// generated per run and cannot collide that way.
 fn wait_for_peer(socket: &std::path::Path, node_key: &str, timeout_seconds: u64) -> bool {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
     while std::time::Instant::now() < deadline {
         if peer_is_visible(socket, node_key) {
             return true;
@@ -290,9 +295,9 @@ fn peer_is_visible(socket: &std::path::Path, node_key: &str) -> bool {
         return false;
     };
     // The map is keyed by node key; `PublicKey` repeats it inside each entry.
-    peers.iter().any(|(key, peer)| {
-        key == node_key || peer["PublicKey"].as_str() == Some(node_key)
-    })
+    peers
+        .iter()
+        .any(|(key, peer)| key == node_key || peer["PublicKey"].as_str() == Some(node_key))
 }
 
 /// The tailnet address the server gave a node key.
@@ -388,10 +393,7 @@ pub fn pong(env: &Env) -> Status {
 /// Our endpoints reach the server, and peers use them.
 pub fn endpoints(env: &Env) -> Status {
     with_session(env, |run| {
-        let Some(advertised) = run
-            .event("endpoint")
-            .and_then(|e| e["advertised"].as_str())
-        else {
+        let Some(advertised) = run.event("endpoint").and_then(|e| e["advertised"].as_str()) else {
             return Status::Fail(format!("no endpoint was advertised: {}", run.tail()));
         };
         if advertised.starts_with("127.") || advertised.starts_with("0.0.0.0") {

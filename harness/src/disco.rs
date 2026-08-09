@@ -12,16 +12,16 @@
 
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use ts_disco::{Message, Ping, Pong};
-use ts_keys::DiscoPublic;
+use tailfeather::disco::{Message, Ping, Pong};
+use tailfeather::keys::DiscoPublic;
 
+use crate::OsRng;
 use crate::control::ControlError;
 use crate::exec::{Either, Reactor, block_on, select};
 use crate::net::UdpSocket;
 use crate::time::Clock;
-use crate::OsRng;
 
-impl ts_disco::packet::Rng for OsRng {
+impl tailfeather::disco::packet::Rng for OsRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         crate::rt::getrandom(dest);
     }
@@ -46,7 +46,9 @@ pub fn run(
     let listen_ms = seconds.map(|s| s * 1_000).unwrap_or(DEFAULT_LISTEN_MS);
     match block_on(
         &reactor,
-        exchange(&reactor, state_dir, address, port, hostname, clock, listen_ms),
+        exchange(
+            &reactor, state_dir, address, port, hostname, clock, listen_ms,
+        ),
     ) {
         Ok(()) => crate::rt::exit(0),
         Err(e) => {
@@ -74,12 +76,12 @@ async fn exchange(
     clock: Clock,
     listen_ms: u64,
 ) -> Result<(), ControlError> {
-    let store = crate::store::FileStore::new(state_dir, "identity.bin")
-        .map_err(ControlError::Store)?;
+    let store =
+        crate::store::FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
     let (identity, _) =
-        ts_keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
-            ts_keys::store::IdentityError::Store(e) => ControlError::Store(e),
-            ts_keys::store::IdentityError::Format(e) => ControlError::Identity(e),
+        tailfeather::keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
+            tailfeather::keys::store::IdentityError::Store(e) => ControlError::Store(e),
+            tailfeather::keys::store::IdentityError::Format(e) => ControlError::Identity(e),
         })?;
 
     // Bound before the map request, because the port has to be in it. Peers
@@ -97,9 +99,15 @@ async fn exchange(
     println!("advertising endpoint {endpoint_text}");
     evt!("{{\"event\":\"endpoint\",\"advertised\":\"{endpoint_text}\"}}");
 
-    let netmap =
-        crate::control::load_netmap(reactor, state_dir, address, port, hostname, &[&endpoint_text])
-            .await?;
+    let netmap = crate::control::load_netmap(
+        reactor,
+        state_dir,
+        address,
+        port,
+        hostname,
+        &[&endpoint_text],
+    )
+    .await?;
     let our_disco = identity.disco.public();
     println!("our disco key: {our_disco}");
 
@@ -116,7 +124,7 @@ async fn exchange(
     }
 
     // Every peer that published both a disco key and an address we can reach.
-    let mut candidates: heapless::Vec<Candidate, { ts_netmap::MAX_PEERS }> =
+    let mut candidates: heapless::Vec<Candidate, { tailfeather::netmap::MAX_PEERS }> =
         heapless::Vec::new();
     for peer in netmap.peers.iter() {
         let (Some(disco), Some(endpoint)) = (peer.disco_key, peer.direct_endpoint()) else {
@@ -145,8 +153,8 @@ async fn exchange(
 
     let mut pongs = 0usize;
     let mut pings = 0usize;
-    let mut packet = [0u8; ts_disco::MAX_PACKET];
-    let mut plaintext = [0u8; ts_disco::MAX_PACKET];
+    let mut packet = [0u8; tailfeather::disco::MAX_PACKET];
+    let mut plaintext = [0u8; tailfeather::disco::MAX_PACKET];
     let deadline = clock.millis() + listen_ms;
 
     let mut next_probe = 0u64;
@@ -159,7 +167,7 @@ async fn exchange(
                     node_key: Some(identity.node.public()),
                 });
                 let len = ping.encode(&mut plaintext).map_err(ControlError::Disco)?;
-                let total = ts_disco::seal(
+                let total = tailfeather::disco::seal(
                     &identity.disco,
                     &our_disco,
                     &candidate.disco,
@@ -173,7 +181,7 @@ async fn exchange(
             }
         }
 
-        let mut incoming = [0u8; ts_disco::MAX_PACKET];
+        let mut incoming = [0u8; tailfeather::disco::MAX_PACKET];
         let received = match select(
             socket.recv_from(&mut incoming),
             reactor.sleep(PROBE_INTERVAL_MS),
@@ -185,7 +193,7 @@ async fn exchange(
         };
         let (len, from) = received;
 
-        if !ts_disco::is_disco(&incoming[..len]) {
+        if !tailfeather::disco::is_disco(&incoming[..len]) {
             // WireGuard traffic on the shared socket. Nothing here handles it;
             // reporting it is how a demultiplexing mistake would show up.
             println!("<- {len} bytes from {from}, not disco");
@@ -194,7 +202,7 @@ async fn exchange(
 
         // The sender's key names which peer to expect. It is not proof of
         // anything until the box opens under it.
-        let claimed = match ts_disco::packet::sender_key(&incoming[..len]) {
+        let claimed = match tailfeather::disco::packet::sender_key(&incoming[..len]) {
             Ok(key) => key,
             Err(e) => {
                 println!("!! malformed disco packet: {e}");
@@ -206,7 +214,7 @@ async fn exchange(
             continue;
         };
 
-        let opened = match ts_disco::open(
+        let opened = match tailfeather::disco::open(
             &identity.disco,
             &candidate.disco,
             &incoming[..len],
@@ -245,7 +253,7 @@ async fn exchange(
                     src: SocketAddr::V4(from),
                 });
                 let plen = pong.encode(&mut plaintext).map_err(ControlError::Disco)?;
-                let total = ts_disco::seal(
+                let total = tailfeather::disco::seal(
                     &identity.disco,
                     &our_disco,
                     &claimed,

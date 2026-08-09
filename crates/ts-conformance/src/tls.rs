@@ -60,13 +60,17 @@ fn start(env: &Env) -> Result<Session, String> {
             "no hosted TLS run yet. Not for the reason this check used to give: \
              controlplane.tailscale.com serves ECDSA to a client offering ECDSA \
              sigalgs (measured, tests/vectors/hosted_tls.json), and embedded-tls \
-             already offers the P-256 group its IPv4 frontend requires. What is \
-             missing is the p384 feature for the ecdsa-with-SHA384 chain \
-             signatures — allocation-free, unlike rsa — an anchor model that can \
-             stop before the topmost presented certificate, and MAX_CERT raised \
-             above the measured 3411-byte chain. See harness/src/tls.rs"
+             already offers the P-256 group its IPv4 frontend requires. P-384 \
+             chain verification is enabled. What remains is an anchor model that \
+             can stop before the topmost presented certificate and measured \
+             certificate-buffer headroom above the 3411-byte chain. See \
+             harness/src/tls.rs"
                 .into(),
         );
+    }
+
+    if !env.doctor.as_ref().is_some_and(|doctor| doctor.tls_front) {
+        return Err("no live TLS front reported by tests/lab/lab.sh doctor".into());
     }
 
     let root = lab_root(env);
@@ -146,24 +150,28 @@ pub fn tls(env: &Env) -> Status {
         Err(reason) => return Status::Skip(reason.clone()),
     };
 
-    if session.trusted.event("handshake").and_then(|e| e["verified"].as_bool()) != Some(true) {
+    if session
+        .trusted
+        .event("handshake")
+        .and_then(|e| e["verified"].as_bool())
+        != Some(true)
+    {
         return Status::Fail(format!(
             "the TLS handshake did not complete: {}",
             session.trusted.tail()
         ));
     }
     // Bytes had to cross it in both directions, not merely a handshake.
-    let Some(key) = session
-        .trusted
-        .event("key")
-        .and_then(|e| e["key"].as_str())
-    else {
+    let Some(key) = session.trusted.event("key").and_then(|e| e["key"].as_str()) else {
         return Status::Fail("no control-plane traffic crossed the TLS connection".into());
     };
 
     // The negative cases are what make the positive one mean anything.
     if session.wrong_anchor.event("handshake").is_some()
-        || session.wrong_anchor.event("tls").map(|e| e["result"].clone())
+        || session
+            .wrong_anchor
+            .event("tls")
+            .map(|e| e["result"].clone())
             == Some(Value::String("ok".into()))
     {
         return Status::Fail(

@@ -34,17 +34,14 @@
 //! `TLS_AES_128_GCM_SHA256`, and `ecdsa_secp256r1_sha256` is the one
 //! CertificateVerify scheme `embedded-tls` supports unconditionally.
 //!
-//! Three real obstacles remain, none of which is RSA:
+//! P-384 chain-signature verification is enabled in this harness without
+//! allocation. Two hosted-integration obstacles remain, neither of which is RSA:
 //!
-//! 1. **`ecdsa-with-SHA384` chain signatures** need embedded-tls's `p384`
-//!    feature. Unlike `rsa`, it does *not* pull in `alloc`:
-//!    `p384 = ["dep:p384", "rustpki"]`. One line, then measure the verification
-//!    cost on the device — three P-384 signatures per handshake.
-//! 2. **The anchor model.** Hosted presents four entries ending at ISRG Root X2,
+//! 1. **The anchor model.** Hosted presents four entries ending at ISRG Root X2,
 //!    whose own issuer is RSA-signed X1. A single pinned anchor has to be the
 //!    issuer of the *topmost presented* certificate, so pinning Root YE is one
 //!    hop short.
-//! 3. **[`MAX_CERT`] is 4096** against a measured chain of 3411 DER bytes plus
+//! 2. **[`MAX_CERT`] is 4096** against a measured chain of 3411 DER bytes plus
 //!    per-entry framing. That is a latent overflow, not headroom.
 //!
 //! Key exchange is *not* an obstacle, though it looked like one while this was
@@ -197,7 +194,10 @@ pub fn run(address: core::net::Ipv4Addr, port: u16, server_name: &str, ca_path: 
     let clock = crate::time::Clock::start();
     let reactor = crate::exec::Reactor::new(clock);
 
-    match crate::exec::block_on(&reactor, fetch(&reactor, address, port, server_name, ca_path)) {
+    match crate::exec::block_on(
+        &reactor,
+        fetch(&reactor, address, port, server_name, ca_path),
+    ) {
         Ok(()) => {
             evt!("{{\"event\":\"tls\",\"result\":\"ok\"}}");
             crate::rt::exit(0)
@@ -259,8 +259,8 @@ async fn fetch(
 
     use embedded_io_async::Write as _;
 
-    let mut request = [0u8; ts_noise::upgrade::MAX_REQUEST];
-    let request = ts_noise::upgrade::write_key_request(server_name, &mut request)
+    let mut request = [0u8; tailfeather::noise::upgrade::MAX_REQUEST];
+    let request = tailfeather::noise::upgrade::write_key_request(server_name, &mut request)
         .map_err(|_| TlsFailure::Tls(TlsError::EncodeError))?;
     connection
         .write_all(request)

@@ -19,7 +19,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn env() -> Env {
-    Env::discover(&repo_root())
+    Env::offline(&repo_root())
 }
 
 #[test]
@@ -124,7 +124,10 @@ fn the_committed_baselines_cover_every_check() {
             path.display()
         );
     }
-    assert!(found >= 2, "expected at least the offline and lab baselines");
+    assert!(
+        found >= 2,
+        "expected at least the offline and lab baselines"
+    );
 }
 
 /// The doctor's "this disables these checks" lists name checks that exist.

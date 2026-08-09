@@ -10,11 +10,11 @@
 //! Every assertion here is answered by bytes a Go implementation put on a wire.
 //! Where an assertion is answered by our own code instead, it says so.
 
+use tailfeather::keys::MachinePublic;
+use tailfeather::noise::ik::{TYPE_INITIATION, TYPE_RESPONSE};
+use tailfeather::noise::record::TYPE_RECORD;
+use tailfeather::noise::{HEADER_LEN, INITIATION_LEN, MAX_MESSAGE, RESPONSE_LEN, Session, upgrade};
 use ts_conformance::pcap::Capture;
-use ts_keys::MachinePublic;
-use ts_noise::ik::{TYPE_INITIATION, TYPE_RESPONSE};
-use ts_noise::record::TYPE_RECORD;
-use ts_noise::{HEADER_LEN, INITIATION_LEN, MAX_MESSAGE, RESPONSE_LEN, Session, upgrade};
 
 /// The `/key` exchange, on its own short-lived connection.
 const KEY_REQUEST: (u16, u16) = (47610, 8080);
@@ -73,8 +73,15 @@ fn headscales_key_response_parses_and_the_body_offset_is_exact() {
         .and_then(|rest| rest.split("\r\n").next())
         .and_then(|n| n.parse().ok())
         .expect("Content-Length");
-    assert_eq!(body.len(), declared, "body length disagrees with Content-Length");
-    assert_eq!(declared, 176, "Headscale v0.29.3 sends a 176-byte /key body");
+    assert_eq!(
+        body.len(),
+        declared,
+        "body length disagrees with Content-Length"
+    );
+    assert_eq!(
+        declared, 176,
+        "Headscale v0.29.3 sends a 176-byte /key body"
+    );
 
     // The trailing newline is Go's json.Encoder, not an accident, and a parser
     // that assumes the body ends at `}` would be reading a different length than
@@ -83,7 +90,7 @@ fn headscales_key_response_parses_and_the_body_offset_is_exact() {
 }
 
 #[test]
-fn the_published_machine_key_parses_with_ts_keys() {
+fn the_published_machine_key_parses_with_tailfeather() {
     let capture = capture();
     let response = stream(&capture, KEY_RESPONSE);
     let parsed = upgrade::parse_response(response).unwrap();
@@ -91,7 +98,7 @@ fn the_published_machine_key_parses_with_ts_keys() {
 
     let value: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
     let published = value["publicKey"].as_str().expect("publicKey");
-    let key = MachinePublic::parse(published).expect("ts-keys parses Headscale's mkey:");
+    let key = MachinePublic::parse(published).expect("Tailfeather parses Headscale's mkey:");
 
     // Round-tripping proves our encoder agrees with the server's, not merely
     // that our decoder accepted something.
@@ -117,9 +124,16 @@ fn the_legacy_key_is_emitted_first_and_the_needle_must_be_quote_anchored() {
     let parsed = upgrade::parse_response(response).unwrap();
     let body = std::str::from_utf8(&response[parsed.header_len..]).unwrap();
 
-    let legacy = body.find("legacyPublicKey").expect("legacyPublicKey is present");
-    let quoted = body.find("\"publicKey\"").expect("\"publicKey\" is present");
-    assert!(legacy < quoted, "the legacy key comes first in the real body");
+    let legacy = body
+        .find("legacyPublicKey")
+        .expect("legacyPublicKey is present");
+    let quoted = body
+        .find("\"publicKey\"")
+        .expect("\"publicKey\" is present");
+    assert!(
+        legacy < quoted,
+        "the legacy key comes first in the real body"
+    );
 
     // Case-sensitively, the bare needle is safe here: its first hit is the same
     // field, one byte past the opening quote.
@@ -370,7 +384,9 @@ fn segmentation_is_identical_at_every_chunk_size() {
                     break;
                 }
                 let Ok(len) = Session::ciphertext_len(&pending[..HEADER_LEN]) else {
-                    panic!("chunk size {chunk}: a header the whole-stream framer accepted was refused");
+                    panic!(
+                        "chunk size {chunk}: a header the whole-stream framer accepted was refused"
+                    );
                 };
                 if pending.len() < HEADER_LEN + len {
                     break;
@@ -379,7 +395,11 @@ fn segmentation_is_identical_at_every_chunk_size() {
                 pending.drain(..HEADER_LEN + len);
             }
         }
-        assert!(pending.is_empty(), "chunk size {chunk} left {} bytes", pending.len());
+        assert!(
+            pending.is_empty(),
+            "chunk size {chunk} left {} bytes",
+            pending.len()
+        );
         assert_eq!(
             records, expected,
             "chunk size {chunk} segmented the same bytes differently"
@@ -461,16 +481,15 @@ fn the_first_three_server_records_are_the_early_payload_sizes() {
 
     // The first plaintext is exactly the early-payload magic; the second is the
     // 4-byte length that follows it.
-    assert_eq!(plaintexts[0], ts_noise::EARLY_MAGIC.len());
-    assert_eq!(plaintexts[0] + plaintexts[1], ts_noise::PROBE_LEN);
-    assert!(plaintexts[2] <= ts_noise::early::MAX_PAYLOAD);
+    assert_eq!(plaintexts[0], tailfeather::noise::EARLY_MAGIC.len());
+    assert_eq!(plaintexts[0] + plaintexts[1], tailfeather::noise::PROBE_LEN);
+    assert!(plaintexts[2] <= tailfeather::noise::early::MAX_PAYLOAD);
 }
 
 // ---------------------------------------------------------------------------
 
 fn decode_base64(text: &str) -> Vec<u8> {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::new();
     let mut accumulator = 0u32;
     let mut bits = 0;

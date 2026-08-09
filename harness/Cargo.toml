@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 version = "0.1.0"
 
 [dependencies]
-# Already in the tree via wg-core; named here because the reactor's fixed
+# Already in the tree via wirefeather; named here because the reactor's fixed
 # descriptor table is the harness's own, not something a library hands it.
 heapless = "0.9"
 
@@ -21,24 +21,19 @@ heapless = "0.9"
 rustix = { version = "1", default-features = false, features = ["event", "fs", "net", "rand", "time"] }
 
 micro-h2   = { path = "../crates/micro-h2" }
+tailfeather = { path = "../crates/tailfeather" }
 # TLS 1.3 with an allocation-free certificate verifier. `rustpki` is the
 # verifier; the `rsa` feature would pull in `alloc`, so only ECDSA chains can be
 # checked — see harness/src/tls.rs.
-embedded-tls       = { version = "0.19", default-features = false, features = ["rustpki"] }
+embedded-tls       = { version = "0.19", default-features = false, features = ["p384", "rustpki"] }
 embedded-io-async  = "0.7"
 p256               = { version = "0.13", default-features = false, features = ["ecdsa"] }
 rand_core          = { version = "0.6.3", default-features = false }
 
-ts-control = { path = "../crates/ts-control" }
-ts-derp    = { path = "../crates/ts-derp" }
-ts-disco   = { path = "../crates/ts-disco" }
-ts-keys    = { path = "../crates/ts-keys" }
-ts-netmap  = { path = "../crates/ts-netmap" }
-ts-noise   = { path = "../crates/ts-noise" }
-wg-core    = { path = "../crates/wg-core" }
+wirefeather    = { path = "../crates/wirefeather" }
 
 # Named directly because `control.rs` builds the ephemeral key for the ts2021
-# handshake; every other use of it is behind ts-keys or wg-core.
+# handshake; every other use of it is behind tailfeather::keys or wirefeather.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "precomputed-tables", "zeroize"] }
 
 # There is no unwinder on a target with no libc, and nothing to unwind into.

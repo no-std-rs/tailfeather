@@ -1,12 +1,12 @@
 //! Clocks, in the two shapes the protocol needs them.
 //!
-//! `wg-core` wants a monotonic millisecond counter for its timers and a TAI64N
+//! `wirefeather` wants a monotonic millisecond counter for its timers and a TAI64N
 //! stamp for handshake initiations. Those are different clocks for a reason: the
 //! first must never jump, and the second must survive a reboot and be comparable
 //! against what the peer last saw from us.
 
 use rustix::time::{ClockId, clock_gettime};
-use wg_core::{Instant, Tai64n};
+use wirefeather::{Instant, Tai64n};
 
 fn millis(clock: ClockId) -> u64 {
     let ts = clock_gettime(clock);

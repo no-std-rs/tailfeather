@@ -43,7 +43,7 @@ mod wg;
 
 use core::net::{Ipv4Addr, SocketAddrV4};
 
-use wg_core::Rng;
+use wirefeather::Rng;
 
 /// The kernel's entropy pool, via `getrandom`.
 pub struct OsRng;
@@ -139,8 +139,7 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
         }
         Some("selftest") => selftest::run(args.get(2).unwrap_or("/tmp/harness-selftest")),
         Some("ts2021") => {
-            let (Some(state_dir), Some(ip), Some(port)) =
-                (args.get(2), args.get(3), args.get(4))
+            let (Some(state_dir), Some(ip), Some(port)) = (args.get(2), args.get(3), args.get(4))
             else {
                 println!("{USAGE}");
                 rt::exit(2)
@@ -214,7 +213,13 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
                 }
             }
             control::run_register(
-                state_dir, ip, port, auth_key, hostname(&args), exit_node, rotate,
+                state_dir,
+                ip,
+                port,
+                auth_key,
+                hostname(&args),
+                exit_node,
+                rotate,
             )
         }
         _ => {
@@ -240,7 +245,7 @@ fn hostname(args: &Args) -> &'static str {
         }
         index += 1;
     }
-    ts_control::Hostinfo::DEFAULT_HOSTNAME
+    tailfeather::control::Hostinfo::DEFAULT_HOSTNAME
 }
 
 /// The five arguments both tunnel modes share.

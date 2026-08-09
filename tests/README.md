@@ -10,8 +10,8 @@ sudo tests/lab/capture.sh        # capture vectors from both into tests/vectors/
 cargo run -p ts-conformance --bin conformance
 ```
 
-The last command prints the compatibility matrix and exits non-zero only on a
-genuine incompatibility — never merely because work is unfinished.
+The last command prints the compatibility matrix. Release gating additionally
+compares every status with an exact environment-specific baseline.
 
 ## Why it is built this way
 
@@ -20,12 +20,8 @@ make the gap explicit, measurable, and impossible to forget. So this is not a
 set of tests that pass or fail; it is an enumeration of every behaviour a
 Tailscale-compatible node must exhibit, each carrying a status. Unimplemented
 behaviour is *declared*, not omitted, so the score starts low and honestly and
-rises as real work lands. Today it reads 34 of 34 against the local lab.
-
-That number is hand-typed here and in the top-level `README.md`, and it has
-already gone stale once — this line said "9 of 34" long after the suite reached
-34. Treat `cargo run -p ts-conformance` as the authority until the figure is
-generated rather than written.
+rises as real work lands. No count is copied into documentation: the command's
+schema-versioned report and exact baseline are the authority.
 
 **Nothing here is a mock.** The one protocol bug on this project that cost real
 time — WireGuard's Noise construction string — would have passed any test
@@ -82,12 +78,14 @@ and each is a constraint the implementation has to satisfy:
 
 ## Testing against hosted Tailscale
 
-Point the same checks at the hosted service with `TS_CONTROL_URL` and
-`TS_AUTHKEY`. This is opt-in because it needs credentials and internet access.
+Hosted testing is opt-in and needs OAuth credentials with `auth_keys`,
+`devices:core`, and `devices:routes`. The release runner must create one
+non-ephemeral DUT key and one ephemeral reference key, approve exit routes,
+exercise TCP and UDP, force direct→DERP→direct, verify reboot identity reuse,
+and delete all run-scoped resources in a `finally` path. A hosted result is not
+accepted from committed captures or a local Headscale run; integrated checks
+must be live `pass` for the candidate commit.
 
-It currently reports the honest answer: the hosted service is HTTPS-only and
-there is no TLS client yet, so those checks are `TODO` rather than passing
-quietly against a lab that happens to be easier. Compatibility with Headscale on
-a LAN is **not** evidence about `controlplane.tailscale.com` — plaintext HTTP
-and skipping DERP are exactly the simplifications the hosted service does not
-allow.
+The harness has a TLS client, but the firmware trusted-time bootstrap and the
+complete hosted orchestration remain release blockers. Hosted map responses
+must be uncompressed until a bounded allocation-free decoder exists.

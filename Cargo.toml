@@ -10,14 +10,10 @@
 exclude  = ["firmware", "harness"]
 members  = [
   "crates/micro-h2",
+  "crates/tailfeather",
+  "crates/tailfeather-testkit",
   "crates/ts-conformance",
-  "crates/ts-control",
-  "crates/ts-derp",
-  "crates/ts-disco",
-  "crates/ts-keys",
-  "crates/ts-netmap",
-  "crates/ts-noise",
-  "crates/wg-core",
+  "crates/wirefeather",
 ]
 resolver = "3"
 
@@ -42,13 +38,8 @@ heapless = "0.9"
 
 # --- internal ---
 micro-h2 = { path = "crates/micro-h2", version = "0.1.0" }
-ts-control = { path = "crates/ts-control", version = "0.1.0" }
-ts-derp  = { path = "crates/ts-derp", version = "0.1.0" }
-ts-disco = { path = "crates/ts-disco", version = "0.1.0" }
-ts-keys  = { path = "crates/ts-keys", version = "0.1.0" }
-ts-netmap = { path = "crates/ts-netmap", version = "0.1.0" }
-ts-noise = { path = "crates/ts-noise", version = "0.1.0" }
-wg-core  = { path = "crates/wg-core", version = "0.1.0" }
+tailfeather = { path = "crates/tailfeather", version = "0.1.0" }
+wirefeather = { path = "crates/wirefeather", version = "0.1.0" }
 
 # ChaCha20-Poly1305 is the throughput bottleneck of the whole tunnel and is
 # unusably slow when compiled without optimization, so optimize dependencies

@@ -40,8 +40,8 @@ Unit tests cover framing, HPACK state, Huffman decoding, and flow control.
 Differential tests in `ts-conformance` exchange traffic with the Rust `h2`
 implementation and compare HPACK in both directions with `fluke-hpack`.
 
-See the [repository README](../../README.md) for where this crate sits in the
-full stack.
+See the [repository README](https://github.com/pawelchcki/tailfeather) for where
+this crate sits in the full stack.
 
 ## License
 

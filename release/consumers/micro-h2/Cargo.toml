@@ -1,0 +1,10 @@
+[package]
+name = "micro-h2-isolated-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+micro-h2 = "0.1.0"

@@ -32,7 +32,9 @@ fn start(env: &Env) -> Result<Run, String> {
         return Err(NOT_BUILT.into());
     };
     if env.target == Target::TailscaleSaas {
-        return Err("the hosted service is HTTPS-only and there is no TLS client yet".into());
+        return Err(
+            "this conformance path does not yet route hosted requests through verified TLS".into(),
+        );
     }
     let Some((host, port)) = &env.control_address else {
         return Err("no control server configured; start one with tests/lab/lab.sh up".into());
@@ -53,12 +55,8 @@ fn with_session(env: &Env, f: impl FnOnce(&Run) -> Status) -> Status {
 
 /// The `identity` event, which every key check reads.
 fn identity(run: &Run) -> Result<&Value, Status> {
-    run.event("identity").ok_or_else(|| {
-        Status::Fail(format!(
-            "the harness reported no identity: {}",
-            run.tail()
-        ))
-    })
+    run.event("identity")
+        .ok_or_else(|| Status::Fail(format!("the harness reported no identity: {}", run.tail())))
 }
 
 /// Check one key: present, correctly prefixed, and 32 bytes of hex.
@@ -123,10 +121,14 @@ pub fn persistence(env: &Env) -> Status {
         return Status::Skip(NOT_BUILT.into());
     };
     if env.target == Target::TailscaleSaas {
-        return Status::Skip("no TLS client for the hosted service yet".into());
+        return Status::Skip(
+            "this conformance path does not yet route hosted requests through verified TLS".into(),
+        );
     }
     let Some((host, port)) = &env.control_address else {
-        return Status::Skip("no control server configured; start one with tests/lab/lab.sh up".into());
+        return Status::Skip(
+            "no control server configured; start one with tests/lab/lab.sh up".into(),
+        );
     };
 
     let directory = harness.scratch("persistence");
@@ -139,7 +141,10 @@ pub fn persistence(env: &Env) -> Status {
         Err(e) => return Status::Fail(e),
     };
     let Some(first_identity) = first.event("identity").cloned() else {
-        return Status::Fail(format!("the first run reported no identity: {}", first.tail()));
+        return Status::Fail(format!(
+            "the first run reported no identity: {}",
+            first.tail()
+        ));
     };
     if first_identity["new"] != Value::Bool(true) {
         return Status::Fail("the first run did not report a fresh identity".into());
@@ -150,10 +155,15 @@ pub fn persistence(env: &Env) -> Status {
         Err(e) => return Status::Fail(e),
     };
     let Some(second_identity) = second.event("identity").cloned() else {
-        return Status::Fail(format!("the second run reported no identity: {}", second.tail()));
+        return Status::Fail(format!(
+            "the second run reported no identity: {}",
+            second.tail()
+        ));
     };
     if second_identity["new"] != Value::Bool(false) {
-        return Status::Fail("the second run generated a new identity instead of loading one".into());
+        return Status::Fail(
+            "the second run generated a new identity instead of loading one".into(),
+        );
     }
     for field in ["machine", "node", "disco"] {
         if first_identity[field] != second_identity[field] {
@@ -269,7 +279,7 @@ pub fn capver_minimum(env: &Env) -> Status {
                 run.tail()
             ));
         }
-        let advertised = ts_noise::CAPABILITY_VERSION as u64;
+        let advertised = tailfeather::noise::CAPABILITY_VERSION as u64;
         if advertised < minimum {
             return Status::Fail(format!(
                 "we advertise v{advertised} but this server rejects anything below v{minimum}"

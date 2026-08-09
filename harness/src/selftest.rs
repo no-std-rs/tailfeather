@@ -25,11 +25,20 @@ pub fn run(state_dir: &str) -> ! {
 
     failures += check("timer sleeps for at least the requested time", timers());
     failures += check("a datagram round-trips over loopback", loopback());
-    failures += check("select returns the branch that is ready", select_picks_ready());
+    failures += check(
+        "select returns the branch that is ready",
+        select_picks_ready(),
+    );
     failures += check("a TCP stream connects and carries bytes", tcp_roundtrip());
-    failures += check("a refused connection is reported, not hidden", tcp_refused());
+    failures += check(
+        "a refused connection is reported, not hidden",
+        tcp_refused(),
+    );
     failures += check("stored state survives a reload", store_roundtrip(state_dir));
-    failures += check("a corrupted blob is refused", store_rejects_corruption(state_dir));
+    failures += check(
+        "a corrupted blob is refused",
+        store_rejects_corruption(state_dir),
+    );
     failures += check("tai64n is monotonic and correctly shaped", timestamps());
 
     if failures == 0 {
@@ -135,7 +144,10 @@ fn tcp_roundtrip() -> Result<(), &'static str> {
             Either::Second(()) => return Err("timed out establishing the connection"),
         };
 
-        client.write_all(b"ping over tcp").await.map_err(|_| "write")?;
+        client
+            .write_all(b"ping over tcp")
+            .await
+            .map_err(|_| "write")?;
         let mut buf = [0u8; 13];
         // `read_exact` is the one everything above depends on, so it is the one
         // worth proving: a short read here would be indistinguishable from a

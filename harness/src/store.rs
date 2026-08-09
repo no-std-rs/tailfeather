@@ -18,7 +18,7 @@
 
 use rustix::fs::{AtFlags, CWD, Mode, OFlags};
 use rustix::io::Errno;
-use wg_core::crypto;
+use wirefeather::crypto;
 
 const MAGIC: &[u8; 4] = b"ESPG";
 const VERSION: u8 = 1;
@@ -179,13 +179,8 @@ impl FileStore {
             let _ = rustix::fs::unlinkat(CWD, self.temporary.as_c_str(), AtFlags::empty());
             return result;
         }
-        rustix::fs::renameat(
-            CWD,
-            self.temporary.as_c_str(),
-            CWD,
-            self.path.as_c_str(),
-        )
-        .map_err(StoreError::Errno)
+        rustix::fs::renameat(CWD, self.temporary.as_c_str(), CWD, self.path.as_c_str())
+            .map_err(StoreError::Errno)
     }
 
     fn write_temporary(&self, blob: &[u8]) -> Result<(), StoreError> {

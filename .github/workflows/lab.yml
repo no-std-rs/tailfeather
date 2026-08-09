@@ -83,7 +83,7 @@ jobs:
       # with `netmap.to_peers: FAIL ts2021: decryption failed; noise session
       # established; <- noise response, 51 bytes`, and passed on rerun. A record
       # layer that decrypts fine and then fails is the signature the nonce
-      # convention produces (see crates/ts-noise/src/record.rs), so this is worth
+      # convention produces (see crates/tailfeather/src/noise/record.rs), so this is worth
       # chasing rather than assuming it was the lab. It is not reproducible
       # locally so far. Removing this step reduces how often the condition is
       # exercised, which is a reason to chase it deliberately, not a fix.

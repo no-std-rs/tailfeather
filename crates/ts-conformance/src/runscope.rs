@@ -3,14 +3,14 @@
 //! # The failure this prevents
 //!
 //! Every run that reaches `control.register` leaves a node behind on the lab
-//! server. They accumulate. `ts_netmap::MAX_PEERS` is 32, and a netmap naming
+//! server. They accumulate. `tailfeather::netmap::MAX_PEERS` is 32, and a netmap naming
 //! more peers than that is *refused outright* rather than truncated — so once
 //! roughly thirty runs have gone by, `netmap.to_peers` and all three `disco.*`
 //! checks begin failing for a reason that has nothing to do with the code.
 //!
 //! That is not hypothetical. It happened while this module was being written:
-//! two consecutive `cargo test` runs took the lab from 34/34 to five failures
-//! and 42 registered nodes, and `lab.sh prune` restored it. A suite whose result
+//! two consecutive `cargo test` runs introduced five failures and left 42
+//! registered nodes; `lab.sh prune` restored it. A suite whose result
 //! depends on how many times it has been run before is not measuring the code.
 //!
 //! # The shape
@@ -201,7 +201,7 @@ impl Drop for Inner {
                  removes them. Past {} the netmap checks start failing for reasons \
                  unrelated to the code.",
                 cleanup.left_behind,
-                ts_netmap::MAX_PEERS,
+                tailfeather::netmap::MAX_PEERS,
             );
         }
     }

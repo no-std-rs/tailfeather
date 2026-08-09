@@ -26,7 +26,9 @@ fn start(env: &Env) -> Result<Run, String> {
         return Err(NOT_BUILT.into());
     };
     if env.target == Target::TailscaleSaas {
-        return Err("the hosted service is HTTPS-only and there is no TLS client yet".into());
+        return Err(
+            "this conformance path does not yet route hosted requests through verified TLS".into(),
+        );
     }
     let (Some((host, port)), Some(auth_key)) = (&env.control_address, &env.preauth_key) else {
         return Err("no lab; start one with tests/lab/lab.sh up".into());
@@ -39,8 +41,15 @@ fn start(env: &Env) -> Result<Run, String> {
     for name in ["derp-a", "derp-b"] {
         let state = harness.scratch(name);
         let state = state.to_string_lossy().into_owned();
-        let run = harness.run(&["register", &state, host, &port, auth_key,
-            "--hostname", env.scope.hostname()])?;
+        let run = harness.run(&[
+            "register",
+            &state,
+            host,
+            &port,
+            auth_key,
+            "--hostname",
+            env.scope.hostname(),
+        ])?;
         if run.event("registered").is_none() {
             return Err(format!("could not register {name}: {}", run.tail()));
         }
@@ -63,7 +72,10 @@ pub fn relay(env: &Env) -> Status {
         ));
     };
     let Some(relayed) = run.event("relayed") else {
-        return Status::Fail(format!("the relay did not deliver the packet: {}", run.tail()));
+        return Status::Fail(format!(
+            "the relay did not deliver the packet: {}",
+            run.tail()
+        ));
     };
     if relayed["intact"] != Value::Bool(true) {
         return Status::Fail("the relayed bytes were not the ones sent".into());

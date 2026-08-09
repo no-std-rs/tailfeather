@@ -14,8 +14,8 @@
 //! decoder must handle all of it, and until now only hand-written blocks
 //! exercised those paths.
 
-use micro_h2::hpack::{DEFAULT_TABLE_SIZE, Decoder};
 use micro_h2::hpack::encode::encode_header;
+use micro_h2::hpack::{DEFAULT_TABLE_SIZE, Decoder};
 
 use fluke_hpack::Decoder as TheirDecoder;
 use fluke_hpack::Encoder as TheirEncoder;
@@ -80,7 +80,7 @@ fn cases() -> Vec<Vec<(&'static str, &'static str)>> {
         // Branch 1: name and value both in the static table, so a bare index.
         vec![(":method", "GET"), (":scheme", "https"), (":status", "200")],
         // Branch 2: name in the table, value not.
-        vec![(":path", "/machine/map"), ("user-agent", "ts-noise")],
+        vec![(":path", "/machine/map"), ("user-agent", "tailfeather")],
         // Branch 3: neither in the table.
         vec![("x-tailscale-thing", "value"), ("another-one", "x")],
         // Values that stress string lengths and the integer continuation rules:
@@ -122,7 +122,10 @@ fn fluke_hpack_decodes_every_block_we_emit() {
             .iter()
             .map(|(n, v)| (n.to_string(), v.to_string()))
             .collect();
-        assert_eq!(decoded, expected, "case {i}: fluke-hpack read our block differently");
+        assert_eq!(
+            decoded, expected,
+            "case {i}: fluke-hpack read our block differently"
+        );
     }
 }
 
@@ -204,8 +207,10 @@ fn we_decode_blocks_from_an_indexing_encoder() {
             .iter()
             .map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec()))
             .collect();
-        let borrowed: Vec<(&[u8], &[u8])> =
-            owned.iter().map(|(n, v)| (n.as_slice(), v.as_slice())).collect();
+        let borrowed: Vec<(&[u8], &[u8])> = owned
+            .iter()
+            .map(|(n, v)| (n.as_slice(), v.as_slice()))
+            .collect();
         let block = theirs.encode(borrowed);
 
         let decoded = our_decode(&mut ours, &block);
@@ -213,7 +218,10 @@ fn we_decode_blocks_from_an_indexing_encoder() {
             .iter()
             .map(|(n, v)| (n.to_string(), v.to_string()))
             .collect();
-        assert_eq!(decoded, expected, "case {i}: we read their block differently");
+        assert_eq!(
+            decoded, expected,
+            "case {i}: we read their block differently"
+        );
     }
 }
 
@@ -319,7 +327,11 @@ fn a_dynamic_table_size_update_shrinks_and_clears_the_table() {
 
     // 0x20 | 0 — set the maximum table size to zero, which evicts everything.
     our_decode(&mut ours, &[0x20]);
-    assert_eq!(ours.table().len(), 0, "a size-zero update did not clear the table");
+    assert_eq!(
+        ours.table().len(),
+        0,
+        "a size-zero update did not clear the table"
+    );
     assert_eq!(ours.table().size(), 0);
 
     // 0x3f 0xe1 0x1f — the 4096 that a real peer restores it to.
@@ -346,7 +358,11 @@ fn both_directions_agree_on_every_case() {
 
         // ours -> ours (the pre-existing self-referential check, kept as a floor)
         let mut ours = Decoder::new(DEFAULT_TABLE_SIZE);
-        assert_eq!(our_decode(&mut ours, &our_encode(headers)), expected, "case {i}");
+        assert_eq!(
+            our_decode(&mut ours, &our_encode(headers)),
+            expected,
+            "case {i}"
+        );
 
         // ours -> theirs -> (re-encoded) -> ours
         let mut their_decoder = TheirDecoder::new();

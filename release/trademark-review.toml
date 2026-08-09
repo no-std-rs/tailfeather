@@ -1,0 +1,15 @@
+schema_version = 1
+
+[wireguard]
+status = "blocked"
+policy = "https://www.wireguard.com/trademark-policy/"
+authorization_id = ""
+approved_wording = ""
+acknowledgment = ""
+non_affiliation_disclaimer = ""
+
+[tailscale]
+status = "blocked"
+review_id = ""
+approved_wording = ""
+non_affiliation_disclaimer = ""

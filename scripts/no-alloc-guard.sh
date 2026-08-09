@@ -17,8 +17,8 @@
 #      all, so a dependency that needs one cannot link. It fails at build time
 #      rather than on hardware.
 #
-# `crates/ts-conformance` is exempt: it is `publish = false`, `std`, and exists
-# to measure the others.
+# `crates/ts-conformance` and the intentionally std-only
+# `tailfeather-testkit` are exempt from the source scan.
 
 set -euo pipefail
 
@@ -30,7 +30,7 @@ STATUS=0
 echo "== checking our sources for allocation"
 SOURCES=(harness/src firmware/src)
 for crate in crates/*/; do
-    [[ "$crate" == "crates/ts-conformance/" ]] && continue
+    [[ "$crate" == "crates/ts-conformance/" || "$crate" == "crates/tailfeather-testkit/" ]] && continue
     [[ -d "$crate/src" ]] && SOURCES+=("$crate/src")
 done
 

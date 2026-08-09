@@ -1,172 +1,118 @@
 # tailfeather
 
-Allocation-free Rust building blocks for a Tailscale-compatible mesh node, plus
-ESP32-C6 firmware for a small IPv4 WireGuard exit gateway.
+Allocation-free Rust for a small Tailscale-compatible mesh node, plus an
+ESP32-C6 IPv4 exit gateway and a no-libc Linux interoperability harness.
 
-The portable crates implement WireGuard, the ts2021 control transport, HTTP/2,
-netmap parsing, disco, and DERP without `std` or `alloc`. The same code runs in a
-bare Linux harness, where it can be tested against real reference implementations
-before it is wired into the device.
+This is experimental protocol and embedded-systems software. It is not audited,
+not a general-purpose Tailscale client, and not ready to publish as `0.1.0` until
+the external release gates below have current evidence.
 
-> **Experimental:** this is protocol and embedded-systems work, not an audited
-> VPN appliance. The complete control plane works in the harness; the firmware
-> currently contains the WireGuard and TCP/UDP forwarding path.
-
-## Status
-
-| Where | What works today |
-|---|---|
-| ESP32-C6 | WiFi STA + DHCP, WireGuard responder, IPv4 UDP/TCP forwarding and NAT |
-| Bare Linux harness | WireGuard in both roles, ts2021, registration, netmaps, disco, DERP, exit-route advertisement, and TLS against the local lab |
-| Local conformance lab | Committed 34/34 baseline against Headscale v0.29.3 and tailscaled 1.94.2 |
-
-Hosted Tailscale has not passed end to end yet. Its measured certificate chain
-needs `embedded-tls`'s `p384` support and a trust-anchor model that can stop
-before the topmost presented certificate. We also still need to verify that the
-hosted service accepts a `MapRequest` without zstd compression; the local
-Headscale lab does.
-
-The next substantial step is integration: move the control-plane path that
-already runs in the harness onto the ESP32 firmware.
-
-## Try it
-
-Run the portable crate tests and the conformance matrix backed by committed
-reference vectors:
+## Quick start
 
 ```sh
-cargo test
-scripts/conformance.sh
+cargo test --workspace --all-targets
+cargo run -p tailfeather-testkit -- check --json
+scripts/no-alloc-guard.sh
 ```
 
-Run the full local lab against a real Headscale and a real `tailscaled`:
+The harness and firmware are sibling workspaces because each pins a different
+bare target:
 
 ```sh
-tests/lab/lab.sh up
-tests/lab/lab.sh reference
-tests/lab/tls.sh up
-scripts/conformance.sh
+(cd harness && cargo build --release)
+(cd firmware && cargo build --release)
 ```
 
-Some lab and WireGuard interop steps need root, containers, network namespaces,
-or a local Tailscale installation. `tests/lab/lab.sh doctor` reports what is
-available. See [`tests/README.md`](tests/README.md) for the model, statuses, and
-capture workflow.
+## What works now
 
-## Architecture
-
-| Path | Purpose |
+| Environment | Current implementation |
 |---|---|
-| [`crates/wg-core`](crates/wg-core/README.md) | Sans-I/O WireGuard: handshakes, transport, replay protection, and timers |
-| [`crates/ts-keys`](crates/ts-keys/README.md) | Machine, node, and disco identities plus persistence |
-| [`crates/ts-noise`](crates/ts-noise/README.md) | ts2021 Noise IK transport and controlbase framing |
-| [`crates/micro-h2`](crates/micro-h2/README.md) | Minimal bounded HTTP/2 client and HPACK decoder |
-| [`crates/ts-control`](crates/ts-control/README.md) | Registration, Hostinfo, and map requests |
-| [`crates/ts-netmap`](crates/ts-netmap/README.md) | Streaming full and delta `MapResponse` parser |
-| [`crates/ts-disco`](crates/ts-disco/README.md) | NaCl-boxed path-discovery pings and pongs |
-| [`crates/ts-derp`](crates/ts-derp/README.md) | DERP v2 relay client |
-| `harness` | No-`std`, no-libc Linux runtime for reference interop |
-| `firmware` | ESP32-C6 WiFi, tunnel, NAT, and forwarding |
-| `tests` / [`crates/ts-conformance`](crates/ts-conformance/README.md) | Live lab, captured vectors, baselines, and compatibility matrix |
+| Portable crates | WireGuard initiator/responder, ts2021 Noise, bounded HTTP/2, registration messages, streaming netmaps, disco, DERP, and the cooperative `Node<PEERS>` API |
+| Linux harness | No libc, allocator, threads, or hidden runtime; drives live Headscale control, TLS, HTTP/2, registration, maps, disco, DERP, and both WireGuard roles. Netmaps are reconciled through `Node` |
+| ESP32-C6 | One `Node<32>` actor owns the tunnel state; Wi-Fi/DHCP, static fallback peer configuration through a transactional map lease, IPv4 UDP/TCP forwarding, and NAT build for the device |
+| Offline testkit | Published std-only synthetic-fixture checks with human, JSON, and exact-baseline output |
 
-The protocol crates know nothing about sockets. They operate on caller-owned
-buffers and use `embedded-io-async` or `embedded-nal-async` at the edges, so the
-firmware and harness drive the same implementations.
+The ESP firmware does **not** yet run the full hosted control/DERP task set,
+trusted-time bootstrap, two-slot flash store, or dynamic route installation.
+Hosted Tailscale, pinned Headscale, and the complete physical-device suite must
+therefore remain release blockers. The committed captures prove specific codec
+behaviour; they are not evidence that a current hosted run passed.
+
+## Crates
+
+| Package | Purpose | Runtime |
+|---|---|---|
+| [`tailfeather`](crates/tailfeather/README.md) | Public `Node` plus keys, Noise, control, netmap, disco, and DERP; reexports `wirefeather` as `tunnel` and `micro-h2` as `http2` | `no_std`, no allocation |
+| [`wirefeather`](crates/wirefeather/README.md) | Sans-I/O WireGuard-compatible handshake, transport, replay, and timers | `no_std`, no allocation |
+| [`micro-h2`](crates/micro-h2/README.md) | Bounded client-side HTTP/2 and HPACK | `no_std`, no allocation |
+| [`tailfeather-testkit`](crates/tailfeather-testkit/README.md) | Portable offline vectors, replay, reports, and CLI | `std` |
+
+`ts-conformance` remains unpublished and owns privileged/live compatibility
+orchestration and repo-only captures.
 
 ## Design constraints
 
-- **No allocation in project code.** Buffers are fixed-size and collections are
-  `heapless`. `esp-alloc` exists only for the ESP radio C blob's private heap.
-- **No host-shaped test double.** The harness targets
-  `x86_64-unknown-linux-none`: Linux syscalls, but no libc, `std`, allocator,
-  threads, or hidden runtime.
-- **Bounded memory.** Protocol limits and buffer sizes are explicit constants;
-  netmaps are streamed rather than collected into one large document.
-- **Reference implementations decide.** WireGuard is checked against the Linux
-  kernel, and the control plane against Headscale and `tailscaled`, or against
-  bytes captured from them.
+- `Node` owns identity, live netmap, tunnel sessions, paths, DERP choice,
+  registration state, and deadlines, but owns no transport, clock, executor,
+  RNG, or store.
+- Control and DERP sessions own their streams and emit decoded events. Node
+  actions explicitly request direct sends, control/DERP work, IPv4 delivery,
+  persistence, or status changes.
+- Maps are applied transactionally with one exclusively borrowed staging lease.
+  Unchanged peer keys retain tunnel sessions; removed or rotated keys do not.
+- Persistent blobs are versioned and zeroized, include the three identities and
+  nondecreasing trusted-time floor, and exclude auth keys, maps, and session
+  keys. A new identity is created only by explicit factory reset.
+- Project runtime code does not allocate. Fixed bounds are errors, never silent
+  truncation. The radio C blob alone has a 64 KiB heap.
+- The data plane is IPv4-only with a 1280-byte inner MTU. WireGuard cookies /
+  `mac2` are not implemented.
 
-That last rule catches bugs self-tests cannot. For example, tailfeather once
-sealed and opened its own disco packets perfectly while a real Tailscale client
-rejected them: NaCl puts its authentication tag before the ciphertext, unlike
-the other AEAD layouts used here.
+## Verification and release gates
 
-## Verification
-
-```sh
-cargo test                                  # host unit and differential tests
-scripts/no-alloc-guard.sh                   # source scan + bare harness build
-sudo scripts/interop-wireguard.sh           # std example vs kernel WireGuard
-sudo scripts/interop-wireguard.sh harness   # bare harness as responder
-sudo scripts/interop-wireguard.sh initiator # bare harness starts the handshake
-```
-
-The interop script creates a network namespace and requires both a completed
-handshake and a successful in-tunnel ping. In `initiator` mode the kernel peer
-has no endpoint, so a handshake proves tailfeather started it.
-
-The conformance score is deliberately not a claim of universal compatibility.
-Each `PASS` is tied to a live reference implementation or committed external
-evidence, skipped checks do not count, and CI compares the full status matrix
-with a baseline so a vanished measurement cannot masquerade as success.
-
-## Run it on an ESP32-C6
-
-Configuration is compiled into the firmware. Copy the example, fill in the WiFi
-and WireGuard values, then build and flash:
+Automatic checks cover formatting, workspace tests, clippy, rustdoc warnings,
+the no-allocation harness, firmware release builds, fixture provenance, resource
+limits, and package contents. The compatibility suite is pinned to Headscale
+v0.29.3 and tailscaled 1.94.2; its exact baselines are authoritative, not a
+handwritten pass count.
 
 ```sh
-cp .env.example .env
-scripts/flash.sh
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
+scripts/conformance.sh
+scripts/release-gates.sh
 ```
 
-With a device on the network, the helper scripts can configure a kernel peer
-and exercise forwarding:
+A release also needs fresh same-commit evidence for hosted Tailscale, pinned
+Headscale, physical-device/adversarial tests, stack headroom, resource limits,
+cleanup, fixture audit, and both trademark reviews. Hosted integrated checks
+must be live `pass`; `todo`, `skip`, `fail`, or unlinked `external` results block
+release. Hosted map compression is a hard blocker unless the server accepts an
+uncompressed response.
 
-```sh
-sudo scripts/device-peer.sh up <device-lan-ip>
-sudo scripts/bench-exit.sh <device-lan-ip>
-sudo scripts/test-http.sh <device-lan-ip>
-sudo scripts/device-peer.sh down
-```
+The future publication order is `wirefeather`, `micro-h2`, `tailfeather`, then
+`tailfeather-testkit`. Nothing in this repository preparation publishes a crate
+or transfers the repository.
 
-For the peer helpers, also add `LAPTOP_PRIVATE_KEY_B64` and
-`DEVICE_PUBLIC_KEY_B64` to `.env`.
+## Trademark and repository status
 
-UDP uses ordinary station-side sockets. TCP is translated segment by segment
-through a raw socket, with RFC 1624 checksum updates and MSS clamping for the
-1280-byte tunnel MTU.
+The package name remains `wirefeather`. Publication is blocked until written
+authorization records the exact permitted descriptive WireGuard compatibility
+wording, acknowledgment, policy link, and non-affiliation disclaimer. Tailscale
+wording requires a separate review. WireGuard and Tailscale are marks of their
+respective owners; this project is not affiliated with or endorsed by either.
 
-## Measured on hardware
+Metadata intentionally retains the current repository URL. After the owner
+transfers it, update every package and documentation link to
+`https://github.com/no-std-rs/tailfeather`, verify links, and repeat all package
+checks.
 
-One ESP32-C6 on 2.4 GHz WiFi produced the following results; they describe that
-setup, not a general performance guarantee.
+## References and license
 
-| Workload | Observed result |
-|---|---|
-| UDP, 1024-byte payloads | 4.3 Mbit/s peak; 3.85 Mbit/s sustained below 5% loss |
-| HTTP through the exit path | 2.6–3.4 Mbit/s for a 2 MiB body |
+Protocol references include Tailscale's `controlbase`, `tailcfg.go`, and
+`disco.go`; Headscale's `hscontrol/noise.go` and `hscontrol/poll.go`; the Noise
+and WireGuard specifications; and RFC 7540/RFC 7541.
 
-The current path handles one packet from decrypt through reply encryption
-before starting the next, so latency and WiFi round trips dominate. Pipelining
-the two directions is the obvious next performance improvement.
-
-## Current limits
-
-- hosted Tailscale support is incomplete
-- the control plane is not yet integrated into the firmware
-- forwarding is IPv4-only, with MTU 1280 and no fragmentation
-- firmware WireGuard is responder-only, although `wg-core` supports both roles
-- WireGuard cookies / `mac2` DoS protection are not implemented
-- throughput is a few Mbit/s on the tested hardware and radio setup
-
-## References
-
-- Tailscale's `controlbase`, `tailcfg.go`, and `disco.go`
-- Headscale's `hscontrol/noise.go` and `hscontrol/poll.go`
-- [tailscale/tailscale-rs](https://github.com/tailscale/tailscale-rs) for wire formats
-- [MicroLink](https://github.com/CamM2325/microlink) for an ESP32 implementation in C
-
-## License
-
-Dual-licensed under MIT or Apache-2.0, at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
+option.

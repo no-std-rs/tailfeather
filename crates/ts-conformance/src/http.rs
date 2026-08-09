@@ -30,8 +30,9 @@ pub fn get(url: &str) -> Result<Response, String> {
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| format!("timeout: {e}"))?;
 
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nAccept: */*\r\n\r\n");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nAccept: */*\r\n\r\n"
+    );
     stream
         .write_all(request.as_bytes())
         .map_err(|e| format!("write: {e}"))?;

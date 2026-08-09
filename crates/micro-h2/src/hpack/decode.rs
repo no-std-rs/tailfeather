@@ -290,7 +290,11 @@ mod tests {
         );
         assert_eq!(third[0].as_str(), ":status: 200");
         assert_eq!(third[4].as_str(), "content-encoding: gzip");
-        assert!(third[5].as_str().starts_with("set-cookie: foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU"));
+        assert!(
+            third[5]
+                .as_str()
+                .starts_with("set-cookie: foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU")
+        );
     }
 
     #[test]

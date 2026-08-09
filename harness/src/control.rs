@@ -1,6 +1,6 @@
 //! Bringing up a ts2021 connection against a real control server.
 //!
-//! This is the thin layer that turns `ts-noise`'s sans-io pieces into something
+//! This is the thin layer that turns `tailfeather::noise`'s sans-io pieces into something
 //! that talks to a socket. It stops once the Noise channel is established and
 //! the early payload has been read, because everything past that point is HTTP/2
 //! and does not exist yet.
@@ -12,8 +12,8 @@
 
 use core::net::Ipv4Addr;
 
-use ts_keys::{Identity, MachinePublic, Rng as _};
-use ts_noise::{Session, upgrade};
+use tailfeather::keys::{Identity, MachinePublic, Rng as _};
+use tailfeather::noise::{Session, upgrade};
 use x25519_dalek::StaticSecret;
 
 use crate::exec::Reactor;
@@ -27,15 +27,15 @@ const HTTP_BUFFER: usize = 2048;
 #[derive(Debug, Clone, Copy)]
 pub enum ControlError {
     Net(NetError),
-    Noise(ts_noise::Error),
+    Noise(tailfeather::noise::Error),
     Store(crate::store::StoreError),
-    Identity(ts_keys::StoreError),
-    Keys(ts_keys::DecodeError),
-    Netmap(ts_netmap::Error),
-    Disco(ts_disco::Error),
-    Derp(ts_derp::Error),
+    Identity(tailfeather::keys::StoreError),
+    Keys(tailfeather::keys::DecodeError),
+    Netmap(tailfeather::netmap::Error),
+    Disco(tailfeather::disco::Error),
+    Derp(tailfeather::derp::Error),
     Http2(crate::h2::H2Error),
-    Json(ts_control::JsonError),
+    Json(tailfeather::control::JsonError),
     /// The server understood the request and refused it.
     Rejected,
     /// The `/key` response did not contain a machine key.
@@ -73,19 +73,19 @@ impl From<NetError> for ControlError {
     }
 }
 
-impl From<ts_noise::Error> for ControlError {
-    fn from(e: ts_noise::Error) -> Self {
+impl From<tailfeather::noise::Error> for ControlError {
+    fn from(e: tailfeather::noise::Error) -> Self {
         Self::Noise(e)
     }
 }
 
-impl ts_keys::Rng for OsRng {
+impl tailfeather::keys::Rng for OsRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         crate::rt::getrandom(dest);
     }
 }
 
-impl ts_keys::store::Store for FileStore {
+impl tailfeather::keys::store::Store for FileStore {
     type Error = crate::store::StoreError;
 
     fn load(&self, out: &mut [u8]) -> Result<Option<usize>, Self::Error> {
@@ -123,7 +123,7 @@ pub async fn load_netmap(
     port: u16,
     hostname: &str,
     endpoints: &[&str],
-) -> Result<ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>, ControlError> {
+) -> Result<tailfeather::netmap::Netmap<{ tailfeather::netmap::MAX_PEERS }>, ControlError> {
     fetch_map(reactor, state_dir, address, port, hostname, 1, endpoints).await
 }
 
@@ -135,12 +135,11 @@ pub async fn connect<'r>(
     port: u16,
 ) -> Result<Ts2021<'r>, ControlError> {
     let store = FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
-    let (identity, is_new) = ts_keys::store::load_or_create(&store, &mut OsRng).map_err(|e| {
-        match e {
-            ts_keys::store::IdentityError::Store(e) => ControlError::Store(e),
-            ts_keys::store::IdentityError::Format(e) => ControlError::Identity(e),
-        }
-    })?;
+    let (identity, is_new) =
+        tailfeather::keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
+            tailfeather::keys::store::IdentityError::Store(e) => ControlError::Store(e),
+            tailfeather::keys::store::IdentityError::Format(e) => ControlError::Identity(e),
+        })?;
     report_identity(&identity, is_new);
 
     // A `Host` header the server will accept. Headscale compares it against its
@@ -231,8 +230,8 @@ async fn handshake<'r>(
     OsRng.fill_bytes(&mut ephemeral_bytes);
     let ephemeral = StaticSecret::from(ephemeral_bytes);
 
-    let mut initiation = [0u8; ts_noise::INITIATION_LEN];
-    let (len, handshake) = ts_noise::initiate(
+    let mut initiation = [0u8; tailfeather::noise::INITIATION_LEN];
+    let (len, handshake) = tailfeather::noise::initiate(
         identity.machine.secret(),
         server_key.as_public(),
         &ephemeral,
@@ -252,7 +251,7 @@ async fn handshake<'r>(
     let parsed = loop {
         match upgrade::parse_response(&buffer[..filled]) {
             Ok(parsed) => break parsed,
-            Err(ts_noise::Error::Incomplete) => {}
+            Err(tailfeather::noise::Error::Incomplete) => {}
             Err(e) => return Err(e.into()),
         }
         let n = stream.read(&mut buffer[filled..]).await?;
@@ -263,15 +262,18 @@ async fn handshake<'r>(
     };
 
     if !upgrade::is_upgrade(&buffer[..filled], parsed) {
-        println!("!! the server refused the upgrade: status {}", parsed.status);
+        println!(
+            "!! the server refused the upgrade: status {}",
+            parsed.status
+        );
         return Err(ControlError::UnexpectedStatus(parsed.status));
     }
     println!("<- 101 Switching Protocols");
 
-    let mut response = [0u8; ts_noise::RESPONSE_LEN];
-    let already = (filled - parsed.header_len).min(ts_noise::RESPONSE_LEN);
+    let mut response = [0u8; tailfeather::noise::RESPONSE_LEN];
+    let already = (filled - parsed.header_len).min(tailfeather::noise::RESPONSE_LEN);
     response[..already].copy_from_slice(&buffer[parsed.header_len..parsed.header_len + already]);
-    if already < ts_noise::RESPONSE_LEN {
+    if already < tailfeather::noise::RESPONSE_LEN {
         stream.read_exact(&mut response[already..]).await?;
     }
     println!("<- noise response, {} bytes", response.len());
@@ -290,17 +292,17 @@ pub struct Ts2021<'r> {
     session: Session,
     /// Decrypted bytes read past the early payload. These are already HTTP/2
     /// and must be handed on rather than dropped.
-    pushback: heapless::Vec<u8, { ts_noise::MAX_PLAINTEXT }>,
+    pushback: heapless::Vec<u8, { tailfeather::noise::MAX_PLAINTEXT }>,
 }
 
 impl<'r> Ts2021<'r> {
     /// Read and decrypt one record.
     async fn read_record(&mut self, out: &mut [u8]) -> Result<usize, ControlError> {
-        let mut header = [0u8; ts_noise::HEADER_LEN];
+        let mut header = [0u8; tailfeather::noise::HEADER_LEN];
         self.stream.read_exact(&mut header).await?;
         let len = Session::ciphertext_len(&header)?;
 
-        let mut ciphertext = [0u8; ts_noise::MAX_MESSAGE];
+        let mut ciphertext = [0u8; tailfeather::noise::MAX_MESSAGE];
         self.stream.read_exact(&mut ciphertext[..len]).await?;
         Ok(self.session.open(&ciphertext[..len], out)?)
     }
@@ -318,8 +320,8 @@ impl<'r> Ts2021<'r> {
 /// The capture shows Headscale sending the nine-byte probe split across three
 /// records, so this must keep reading rather than deciding on the first one.
 async fn read_early_payload(session: &mut Ts2021<'_>) -> Result<(), ControlError> {
-    let mut reader = ts_noise::EarlyReader::new();
-    let mut plaintext = [0u8; ts_noise::MAX_PLAINTEXT];
+    let mut reader = tailfeather::noise::EarlyReader::new();
+    let mut plaintext = [0u8; tailfeather::noise::MAX_PLAINTEXT];
 
     while !reader.is_complete() {
         let len = session.read_record(&mut plaintext).await?;
@@ -336,7 +338,7 @@ async fn read_early_payload(session: &mut Ts2021<'_>) -> Result<(), ControlError
     }
 
     match reader.finish()? {
-        ts_noise::early::Early::Payload(payload) => {
+        tailfeather::noise::early::Early::Payload(payload) => {
             println!("<- early payload, {} bytes", payload.len());
             match core::str::from_utf8(payload) {
                 Ok(text) => println!("   {text}"),
@@ -347,16 +349,19 @@ async fn read_early_payload(session: &mut Ts2021<'_>) -> Result<(), ControlError
                 payload.len()
             );
         }
-        ts_noise::early::Early::PushBack(bytes) => {
+        tailfeather::noise::early::Early::PushBack(bytes) => {
             // Not an error: a server without an early payload starts HTTP/2
             // immediately, and these nine bytes are its first frame header.
-            println!("<- no early payload; first HTTP/2 header {}", HexBytes(bytes));
+            println!(
+                "<- no early payload; first HTTP/2 header {}",
+                HexBytes(bytes)
+            );
             evt!("{{\"event\":\"early\",\"present\":false}}");
             // Those nine bytes belong to HTTP/2. Dropping them would leave its
             // parser permanently one frame header short.
             // Those nine bytes belong to HTTP/2. Dropping them would leave its
             // parser permanently one frame header short.
-            let mut carried = heapless::Vec::<u8, { ts_noise::MAX_PLAINTEXT }>::new();
+            let mut carried = heapless::Vec::<u8, { tailfeather::noise::MAX_PLAINTEXT }>::new();
             let _ = carried.extend_from_slice(bytes);
             let _ = carried.extend_from_slice(&session.pushback);
             session.pushback = carried;
@@ -451,10 +456,11 @@ async fn register(
     rotate: bool,
 ) -> Result<(), ControlError> {
     let store = FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
-    let (mut identity, _) = ts_keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
-        ts_keys::store::IdentityError::Store(e) => ControlError::Store(e),
-        ts_keys::store::IdentityError::Format(e) => ControlError::Identity(e),
-    })?;
+    let (mut identity, _) =
+        tailfeather::keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
+            tailfeather::keys::store::IdentityError::Store(e) => ControlError::Store(e),
+            tailfeather::keys::store::IdentityError::Format(e) => ControlError::Identity(e),
+        })?;
 
     // Rotating replaces the node key while the machine key — the identity the
     // control plane authenticated — stays put. That separation is the whole
@@ -462,8 +468,12 @@ async fn register(
     // identity without becoming a new machine.
     let retired = rotate.then(|| identity.node.public());
     if rotate {
-        identity.node = ts_keys::NodePrivate::generate(&mut OsRng);
-        println!("rotating node key: {} -> {}", retired.unwrap(), identity.node.public());
+        identity.node = tailfeather::keys::NodePrivate::generate(&mut OsRng);
+        println!(
+            "rotating node key: {} -> {}",
+            retired.unwrap(),
+            identity.node.public()
+        );
     }
 
     let session = connect(reactor, state_dir, address, port).await?;
@@ -476,18 +486,18 @@ async fn register(
 
     let node_key = identity.node.public();
     let old_node_key = retired.as_ref();
-    let request = ts_control::RegisterRequest {
-        version: ts_control::CAPABILITY_VERSION,
+    let request = tailfeather::control::RegisterRequest {
+        version: tailfeather::control::CAPABILITY_VERSION,
         node_key: &node_key,
         old_node_key,
         auth_key,
-        hostinfo: ts_control::Hostinfo {
+        hostinfo: tailfeather::control::Hostinfo {
             // Supplied by the caller so that a conformance run can tag the nodes
             // it creates and delete exactly those afterwards. Defaults to the
             // plain product name on a real device.
             hostname,
             routable_ips: if exit_node {
-                &ts_control::EXIT_NODE_ROUTES
+                &tailfeather::control::EXIT_NODE_ROUTES
             } else {
                 &[]
             },
@@ -498,11 +508,21 @@ async fn register(
 
     let mut body = [0u8; 1024];
     let body = request.write(&mut body).map_err(ControlError::Json)?;
-    println!("-> POST {} ({} bytes)", ts_control::register::PATH, body.len());
+    println!(
+        "-> POST {} ({} bytes)",
+        tailfeather::control::register::PATH,
+        body.len()
+    );
 
     let mut response = [0u8; 4096];
     let (status, len) = http2
-        .request("POST", ts_control::register::PATH, host, body, &mut response)
+        .request(
+            "POST",
+            tailfeather::control::register::PATH,
+            host,
+            body,
+            &mut response,
+        )
         .await
         .map_err(ControlError::Http2)?;
 
@@ -513,14 +533,17 @@ async fn register(
         return Err(ControlError::UnexpectedStatus(status));
     }
 
-    let parsed = ts_control::RegisterResponse::parse(text);
+    let parsed = tailfeather::control::RegisterResponse::parse(text);
     if !parsed.is_success() {
         println!("   {text}");
         if !parsed.auth_url.is_empty() {
             // A headless node cannot follow a login URL, so this is a failure
             // rather than a step. It is what an expired or spent preauth key
             // looks like.
-            println!("!! the server wants an interactive login at {}", parsed.auth_url);
+            println!(
+                "!! the server wants an interactive login at {}",
+                parsed.auth_url
+            );
         }
         return Err(ControlError::Rejected);
     }
@@ -550,13 +573,7 @@ async fn register(
 /// compression? Every zstd decoder in Rust needs an allocator, so if the answer
 /// is no, the no-allocation property of this whole project is in question and
 /// the netmap parser cannot be written as planned.
-pub fn run_map(
-    state_dir: &str,
-    address: Ipv4Addr,
-    port: u16,
-    hostname: &str,
-    wanted: usize,
-) -> ! {
+pub fn run_map(state_dir: &str, address: Ipv4Addr, port: u16, hostname: &str, wanted: usize) -> ! {
     let clock = crate::time::Clock::start();
     let reactor = Reactor::new(clock);
 
@@ -580,12 +597,13 @@ async fn fetch_map(
     hostname: &str,
     wanted: usize,
     endpoints: &[&str],
-) -> Result<ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>, ControlError> {
+) -> Result<tailfeather::netmap::Netmap<{ tailfeather::netmap::MAX_PEERS }>, ControlError> {
     let store = FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
-    let (identity, _) = ts_keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
-        ts_keys::store::IdentityError::Store(e) => ControlError::Store(e),
-        ts_keys::store::IdentityError::Format(e) => ControlError::Identity(e),
-    })?;
+    let (identity, _) =
+        tailfeather::keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
+            tailfeather::keys::store::IdentityError::Store(e) => ControlError::Store(e),
+            tailfeather::keys::store::IdentityError::Format(e) => ControlError::Identity(e),
+        })?;
 
     let session = connect(reactor, state_dir, address, port).await?;
     let mut http2 = session.into_http2().await?;
@@ -593,11 +611,11 @@ async fn fetch_map(
     let mut host = [0u8; 32];
     let host = write_host(address, port, &mut host);
 
-    let request = ts_control::MapRequest {
-        version: ts_control::CAPABILITY_VERSION,
+    let request = tailfeather::control::MapRequest {
+        version: tailfeather::control::CAPABILITY_VERSION,
         node_key: &identity.node.public(),
         disco_key: &identity.disco.public(),
-        hostinfo: ts_control::Hostinfo {
+        hostinfo: tailfeather::control::Hostinfo {
             hostname,
             ..Default::default()
         },
@@ -613,23 +631,27 @@ async fn fetch_map(
 
     let mut body = [0u8; 1024];
     let body = request.write(&mut body).map_err(ControlError::Json)?;
-    println!("-> POST {} ({} bytes)", ts_control::map::PATH, body.len());
+    println!(
+        "-> POST {} ({} bytes)",
+        tailfeather::control::map::PATH,
+        body.len()
+    );
 
     // A map request must be a long poll: Headscale answers a non-streaming one
     // with an empty 200, treating it as an endpoint update.
     let stream_id = http2
-        .send_request("POST", ts_control::map::PATH, host, body)
+        .send_request("POST", tailfeather::control::map::PATH, host, body)
         .await
         .map_err(ControlError::Http2)?;
 
-    let mut netmap = ts_netmap::Netmap::<{ ts_netmap::MAX_PEERS }>::new();
-    let mut frames = ts_netmap::FrameReader::new();
+    let mut netmap = tailfeather::netmap::Netmap::<{ tailfeather::netmap::MAX_PEERS }>::new();
+    let mut frames = tailfeather::netmap::FrameReader::new();
     let mut chunk = [0u8; 16384];
     let mut applied = 0usize;
     let mut compressed_seen = false;
     let mut first_frame = 0usize;
 
-    let mut parser = ts_netmap::Parser::<{ ts_netmap::MAX_PEERS }>::new();
+    let mut parser = tailfeather::netmap::Parser::<{ tailfeather::netmap::MAX_PEERS }>::new();
 
     while applied < wanted {
         let (len, finished) = http2
@@ -646,14 +668,16 @@ async fn fetch_map(
             let (piece, consumed) = frames.next(input).map_err(ControlError::Netmap)?;
             input = &input[consumed..];
             match piece {
-                ts_netmap::frame::Chunk::Body(bytes) => {
+                tailfeather::netmap::frame::Chunk::Body(bytes) => {
                     if first_frame == 0 {
                         first_frame = bytes.len();
                         // Answering the phase gate: a zstd frame starts with
                         // 0xfd2fb528 little-endian, plain JSON with '{'.
                         compressed_seen = bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
                     }
-                    parser.push(&mut netmap, bytes).map_err(ControlError::Netmap)?;
+                    parser
+                        .push(&mut netmap, bytes)
+                        .map_err(ControlError::Netmap)?;
                     if frames.is_complete() {
                         frames.finish_response();
                         // One parser per response: the netmap is carried across
@@ -667,12 +691,12 @@ async fn fetch_map(
                         configure_peers(&identity, &netmap);
                     }
                 }
-                ts_netmap::frame::Chunk::End => {
+                tailfeather::netmap::frame::Chunk::End => {
                     applied += 1;
                     println!("<- keepalive (zero-length response)");
                 }
-                ts_netmap::frame::Chunk::Need if consumed == 0 => break,
-                ts_netmap::frame::Chunk::Need => {}
+                tailfeather::netmap::frame::Chunk::Need if consumed == 0 => break,
+                tailfeather::netmap::frame::Chunk::Need => {}
             }
         }
 
@@ -685,7 +709,11 @@ async fn fetch_map(
 }
 
 /// Print what one applied MapResponse left behind.
-fn report_netmap(netmap: &ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>, applied: usize, compressed: bool) {
+fn report_netmap(
+    netmap: &tailfeather::netmap::Netmap<{ tailfeather::netmap::MAX_PEERS }>,
+    applied: usize,
+    compressed: bool,
+) {
     println!(
         "<- map {applied}: {} peer(s), {} DERP region(s)",
         netmap.peers.len(),
@@ -717,7 +745,10 @@ fn report_netmap(netmap: &ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>, applied: 
     }
     for region in netmap.derp.iter() {
         for node in region.nodes.iter() {
-            println!("   derp region {} '{}' {}:{}", region.id, region.code, node.host_name, node.port);
+            println!(
+                "   derp region {} '{}' {}:{}",
+                region.id, region.code, node.host_name, node.port
+            );
             evt!(
                 "{{\"event\":\"derp\",\"region\":{},\"code\":\"{}\",\"host\":\"{}\",\"port\":{},\"stun\":{}}}",
                 region.id,
@@ -736,42 +767,57 @@ fn report_netmap(netmap: &ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>, applied: 
     );
 }
 
-/// Turn the netmap into a WireGuard peer table.
+/// Apply the netmap through the public `Node` boundary.
 ///
 /// The node key *is* the WireGuard key — that is what makes the netmap a data
 /// plane configuration rather than a directory. Each peer the server named
 /// becomes a peer of the device, set to initiate, so whichever side notices a
 /// missing session first starts the handshake.
 ///
-/// The device is built and reported rather than kept, because the tunnel itself
-/// is the next phase's work; what this proves is that a netmap contains
-/// everything needed to configure one.
-fn configure_peers(identity: &Identity, netmap: &ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>) {
-    let mut device: wg_core::Device<{ ts_netmap::MAX_PEERS }> =
-        wg_core::Device::new(identity.node.to_bytes());
-
-    let mut configured = 0usize;
-    let mut reachable = 0usize;
-    for peer in netmap.peers.iter() {
-        let Ok(id) = device.add_peer(*peer.node_key.as_bytes(), None) else {
-            println!("!! more peers than the device table holds");
-            break;
-        };
-        // Both sides of a mesh link are symmetric, unlike a gateway serving a
-        // client, so either may start the handshake.
-        let _ = device.set_initiating(id, true);
-        configured += 1;
-        if peer.direct_endpoint().is_some() {
-            reachable += 1;
+/// This uses the same exclusive staging-lease swap as firmware. The returned
+/// lease is the old live map and can be reused for the next streamed response.
+fn configure_peers(
+    identity: &Identity,
+    netmap: &tailfeather::netmap::Netmap<{ tailfeather::netmap::MAX_PEERS }>,
+) {
+    let mut node =
+        tailfeather::Node::<{ tailfeather::netmap::MAX_PEERS }>::factory_reset(identity.clone(), 1);
+    let generation = match node.poll(0) {
+        Ok(Some(tailfeather::NodeAction::PersistState(state))) => state.generation(),
+        _ => {
+            println!("!! node did not request initial persistence");
+            return;
         }
+    };
+    if node.persistence_result(generation, true).is_err() {
+        println!("!! node rejected persistence acknowledgement");
+        return;
     }
+
+    let mut staging = netmap.clone();
+    if node
+        .handle_control_event(tailfeather::ControlEvent::MapFinished {
+            lease: &mut staging,
+            result: Ok(()),
+        })
+        .is_err()
+    {
+        println!("!! node rejected netmap");
+        return;
+    }
+
+    let configured = node.netmap().peers.len();
+    let reachable = node
+        .netmap()
+        .peers
+        .iter()
+        .filter(|peer| peer.direct_endpoint().is_some())
+        .count();
 
     // The device's own key must be the node key the server knows, or peers
     // would encrypt to an identity this node cannot decrypt with.
-    let matches_netmap = device.public_key() == *identity.node.public().as_bytes();
-    println!(
-        "   configured {configured} wireguard peer(s), {reachable} with a direct endpoint"
-    );
+    let matches_netmap = node.identity().node.public() == identity.node.public();
+    println!("   configured {configured} wireguard peer(s), {reachable} with a direct endpoint");
     evt!(
         "{{\"event\":\"peers\",\"configured\":{configured},\"reachable\":{reachable},\"key_matches\":{matches_netmap}}}"
     );

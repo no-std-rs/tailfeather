@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "path": "health.json",
+      "origin": "locally generated synthetic fixture",
+      "versions": { "tailfeather-testkit": "0.1.0" },
+      "date": "2026-08-09",
+      "redistribution_basis": "project-authored under MIT OR Apache-2.0",
+      "sanitization": "contains no captures, identifiers, addresses, keys, or credentials",
+      "sha256": "c0b2cedfd8c94f54fc8f089589d07b2c3a238d5e18aae57453c57a6873cd8b79"
+    }
+  ]
+}

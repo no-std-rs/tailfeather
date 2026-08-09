@@ -14,11 +14,12 @@
 # # Why ECDSA
 #
 # `embedded-tls`'s certificate verifier is allocation-free for ECDSA chains. Its
-# RSA support pulls in `alloc`, which this project does not have, and
-# controlplane.tailscale.com serves an RSA-PSS-only chain. So a local ECDSA chain
-# is what can be verified honestly today; the hosted service needs an
-# allocation-free RSA verifier that does not yet exist here, and the check says
-# so rather than implying otherwise.
+# RSA support pulls in `alloc`, which this project does not have. The hosted
+# endpoint is dual-chain and serves ECDSA when the client offers it, so RSA is
+# not the hosted blocker. This local P-256 chain exercises the verifier's trust,
+# name, and validity checks; it does not stand in for a hosted result. The
+# hosted path is still blocked on the presented-chain anchor model and measured
+# certificate-buffer headroom described in `harness/src/tls.rs`.
 #
 #   tests/lab/tls.sh up      # generate a CA and certificate, start the proxy
 #   tests/lab/tls.sh down

@@ -41,7 +41,9 @@ fn start(env: &Env) -> Result<Session, String> {
         return Err(NOT_BUILT.into());
     };
     if env.target == Target::TailscaleSaas {
-        return Err("the hosted service is HTTPS-only and there is no TLS client yet".into());
+        return Err(
+            "this conformance path does not yet route hosted requests through verified TLS".into(),
+        );
     }
     let Some((host, port)) = &env.control_address else {
         return Err("no control server configured; start one with tests/lab/lab.sh up".into());
@@ -55,8 +57,13 @@ fn start(env: &Env) -> Result<Session, String> {
     let port = port.to_string();
 
     let first = harness.run(&[
-        "register", &state, host, &port, auth_key,
-        "--hostname", env.scope.hostname(),
+        "register",
+        &state,
+        host,
+        &port,
+        auth_key,
+        "--hostname",
+        env.scope.hostname(),
     ])?;
     let nodes_after_first = headscale::nodes()?;
 
@@ -64,8 +71,14 @@ fn start(env: &Env) -> Result<Session, String> {
     // authenticated. That is what makes this a re-registration rather than a
     // second node.
     let rotated = harness.run(&[
-        "register", &state, host, &port, auth_key, "--rotate",
-        "--hostname", env.scope.hostname(),
+        "register",
+        &state,
+        host,
+        &port,
+        auth_key,
+        "--rotate",
+        "--hostname",
+        env.scope.hostname(),
     ])?;
     let nodes_after_rotation = headscale::nodes()?;
 
@@ -220,7 +233,10 @@ pub fn reauth(env: &Env) -> Status {
             ));
         };
 
-        if session.rotated.event("registered").map(|e| e["rotated"].clone())
+        if session
+            .rotated
+            .event("registered")
+            .map(|e| e["rotated"].clone())
             != Some(Value::Bool(true))
         {
             return Status::Fail("the second run did not report a rotation".into());

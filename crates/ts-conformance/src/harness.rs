@@ -108,8 +108,7 @@ impl Run {
 impl Harness {
     /// Locate the built binary, if there is one.
     pub fn discover(repo_root: &Path) -> Option<Self> {
-        let path = repo_root
-            .join("harness/target/x86_64-unknown-linux-none/release/harness");
+        let path = repo_root.join("harness/target/x86_64-unknown-linux-none/release/harness");
         path.is_file().then_some(Self { path })
     }
 
@@ -143,6 +142,5 @@ impl Harness {
 }
 
 /// The message a check reports when the binary has not been built.
-pub const NOT_BUILT: &str =
-    "the no_std harness is not built; run 'cd harness && cargo build --release' \
+pub const NOT_BUILT: &str = "the no_std harness is not built; run 'cd harness && cargo build --release' \
      (scripts/conformance.sh does this)";

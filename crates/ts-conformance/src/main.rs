@@ -43,8 +43,8 @@ fn main() {
 ///
 /// That is not a theoretical ordering concern. It was observed: a failing run
 /// left six nodes behind, the extra peers pushed the netmap past
-/// `ts_netmap::MAX_PEERS`, and the next run failed harder and left six more. Six
-/// runs took the lab from 34/34 to 29/34 with 48 orphans.
+/// `tailfeather::netmap::MAX_PEERS`, and the next run failed harder and left six more. Repeated
+/// runs reduced the pass count while accumulating 48 orphans.
 fn run() -> Result<i32, String> {
     let options = Options::parse(std::env::args().skip(1))?;
 
@@ -106,7 +106,8 @@ impl Options {
                 "--json" => options.json = true,
                 "--expect" => {
                     options.expect = Some(PathBuf::from(
-                        args.next().ok_or("--expect needs a path\n\n".to_string() + USAGE)?,
+                        args.next()
+                            .ok_or("--expect needs a path\n\n".to_string() + USAGE)?,
                     ));
                 }
                 "--write-expect" => {

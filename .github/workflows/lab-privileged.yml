@@ -22,6 +22,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CONTAINER_RUNTIME: docker
+  TAILSCALE_VERSION: 1.94.2
 
 jobs:
   privileged:
@@ -41,8 +42,11 @@ jobs:
       # exchange is silent, so there is no way to check it against ourselves.
       - name: install tailscale
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          tailscaled --version
+          curl -fsSLO "https://pkgs.tailscale.com/stable/tailscale_${TAILSCALE_VERSION}_amd64.tgz"
+          tar -xzf "tailscale_${TAILSCALE_VERSION}_amd64.tgz"
+          sudo install -m 0755 "tailscale_${TAILSCALE_VERSION}_amd64/tailscale" /usr/local/bin/tailscale
+          sudo install -m 0755 "tailscale_${TAILSCALE_VERSION}_amd64/tailscaled" /usr/local/bin/tailscaled
+          test "$(tailscale version | awk 'NR==1 { print $1 }')" = "$TAILSCALE_VERSION"
 
       - name: start the lab
         run: tests/lab/lab.sh up

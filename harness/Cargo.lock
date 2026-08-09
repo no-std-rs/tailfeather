@@ -337,6 +337,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "p256",
+ "p384",
  "portable-atomic",
  "rand_core",
  "sha2",
@@ -413,13 +414,8 @@ dependencies = [
  "p256",
  "rand_core",
  "rustix",
- "ts-control",
- "ts-derp",
- "ts-disco",
- "ts-keys",
- "ts-netmap",
- "ts-noise",
- "wg-core",
+ "tailfeather",
+ "wirefeather",
  "x25519-dalek",
 ]
 
@@ -505,6 +501,18 @@ name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2",
+]
+
+[[package]]
+name = "p384"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe42f1670a52a47d448f14b6a5c61dd78fce51856e68edaa38f7ae3a46b8d6b6"
 dependencies = [
  "ecdsa",
  "elliptic-curve",
@@ -685,6 +693,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tailfeather"
+version = "0.1.0"
+dependencies = [
+ "crypto_box",
+ "embedded-io-async",
+ "heapless",
+ "micro-h2",
+ "subtle",
+ "wirefeather",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "time"
 version = "0.3.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -701,60 +723,6 @@ name = "time-core"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
-
-[[package]]
-name = "ts-control"
-version = "0.1.0"
-dependencies = [
- "heapless",
- "ts-keys",
- "ts-noise",
-]
-
-[[package]]
-name = "ts-derp"
-version = "0.1.0"
-dependencies = [
- "crypto_box",
- "heapless",
- "ts-keys",
-]
-
-[[package]]
-name = "ts-disco"
-version = "0.1.0"
-dependencies = [
- "crypto_box",
- "heapless",
- "ts-keys",
-]
-
-[[package]]
-name = "ts-keys"
-version = "0.1.0"
-dependencies = [
- "subtle",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "ts-netmap"
-version = "0.1.0"
-dependencies = [
- "heapless",
- "ts-keys",
-]
-
-[[package]]
-name = "ts-noise"
-version = "0.1.0"
-dependencies = [
- "ts-keys",
- "wg-core",
- "x25519-dalek",
- "zeroize",
-]
 
 [[package]]
 name = "typenum"
@@ -785,19 +753,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "wg-core"
-version = "0.1.0"
-dependencies = [
- "blake2",
- "chacha20poly1305",
- "heapless",
- "hmac",
- "subtle",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -810,6 +765,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "wirefeather"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "chacha20poly1305",
+ "heapless",
+ "hmac",
+ "subtle",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

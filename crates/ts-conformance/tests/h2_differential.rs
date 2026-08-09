@@ -180,9 +180,7 @@ impl Client {
 /// `respond` is given the request and returns the response body.
 fn serve(
     io: DuplexStream,
-    respond: impl Fn(http::Request<h2::RecvStream>) -> (http::Response<()>, Vec<Bytes>)
-    + Send
-    + 'static,
+    respond: impl Fn(http::Request<h2::RecvStream>) -> (http::Response<()>, Vec<Bytes>) + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut connection = h2::server::handshake(io)
@@ -251,7 +249,10 @@ async fn h2_accepts_our_preface_and_answers_our_request() {
     let server = serve(server_io, |request| {
         assert_eq!(request.method(), http::Method::POST);
         assert_eq!(request.uri().path(), "/machine/register");
-        (ok_response(), vec![Bytes::from_static(b"{\"MachineAuthorized\":true}")])
+        (
+            ok_response(),
+            vec![Bytes::from_static(b"{\"MachineAuthorized\":true}")],
+        )
     });
 
     let mut client = Client::start(client_io).await;
@@ -271,7 +272,10 @@ async fn h2_accepts_our_preface_and_answers_our_request() {
 #[tokio::test]
 async fn a_four_megabyte_response_is_not_stalled_by_flow_control() {
     const SIZE: usize = 4 * 1024 * 1024;
-    const _: () = assert!(SIZE > 64 * 65535, "smaller than this and the window never binds");
+    const _: () = assert!(
+        SIZE > 64 * 65535,
+        "smaller than this and the window never binds"
+    );
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let server = serve(server_io, |_| {
@@ -283,11 +287,7 @@ async fn a_four_megabyte_response_is_not_stalled_by_flow_control() {
 
     let mut client = Client::start(client_io).await;
     let stream = client.request("POST", "/machine/map", b"{}").await;
-    let (body, _) = with_timeout(
-        "the 4 MB transfer",
-        client.collect_body(stream),
-    )
-    .await;
+    let (body, _) = with_timeout("the 4 MB transfer", client.collect_body(stream)).await;
 
     assert_eq!(body.len(), SIZE, "the transfer stopped short");
     assert!(
@@ -315,8 +315,7 @@ async fn several_sequential_streams_each_exceed_the_default_window() {
     let mut client = Client::start(client_io).await;
     for round in 0..4 {
         let stream = client.request("POST", "/machine/map", b"{}").await;
-        let (body, _) =
-            with_timeout(&format!("round {round}"), client.collect_body(stream)).await;
+        let (body, _) = with_timeout(&format!("round {round}"), client.collect_body(stream)).await;
         assert_eq!(body.len(), SIZE, "round {round} stopped short");
         assert!(body.iter().all(|&b| b == 0x5a));
     }
@@ -359,7 +358,11 @@ async fn a_reset_from_h2_is_surfaced_with_its_code() {
     .expect("a reset arrived");
 
     // REFUSED_STREAM is 0x7 in RFC 7540's error code registry.
-    assert_eq!(code, u32::from(h2::Reason::REFUSED_STREAM), "the code we read");
+    assert_eq!(
+        code,
+        u32::from(h2::Reason::REFUSED_STREAM),
+        "the code we read"
+    );
     assert_eq!(code, 0x7, "REFUSED_STREAM is 7 on the wire");
 
     drop(client);
@@ -421,7 +424,10 @@ async fn response_headers_from_h2s_encoder_decode_correctly() {
     let mut seen: Vec<(String, String)> = Vec::new();
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "timed out reading headers");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out reading headers"
+        );
 
         // `next_frame` swallows the header callback, so drive one frame here
         // with a callback that records.
@@ -451,11 +457,7 @@ async fn response_headers_from_h2s_encoder_decode_correctly() {
         }
     }
 
-    let lookup = |name: &str| {
-        seen.iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.clone())
-    };
+    let lookup = |name: &str| seen.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
     assert_eq!(lookup(":status").as_deref(), Some("200"));
     assert_eq!(lookup("content-type").as_deref(), Some("application/json"));
     assert_eq!(

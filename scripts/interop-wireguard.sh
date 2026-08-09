@@ -3,7 +3,7 @@
 # Milestone M2, verified against the reference implementation.
 #
 # Stands up a real kernel WireGuard interface inside a network namespace and
-# points it at the `responder` example, which runs our `wg-core` on the host.
+# points it at the `responder` example, which runs our `wirefeather` on the host.
 # The kernel initiates, our code responds, and an in-tunnel ping proves the
 # whole path: handshake, transport keys, replay window, and encapsulation.
 #
@@ -14,7 +14,7 @@
 # Requires root (network namespaces and WireGuard interfaces both do).
 #
 # Three modes. The first two are responders, and must behave identically
-# because both are the same `wg-core`. The third reverses the roles: our code
+# because both are the same `wirefeather`. The third reverses the roles: our code
 # starts the handshake and the kernel answers, which is what a Tailscale node
 # does to its peers.
 #
@@ -63,7 +63,7 @@ case "$MODE" in
     example)
         sudo -u "$BUILD_USER" env HOME="$BUILD_HOME" "$CARGO" \
             build --release --manifest-path "$REPO_ROOT/Cargo.toml" \
-            --package wg-core --example responder
+            --package wirefeather --example responder
         RESPONDER="$REPO_ROOT/target/release/examples/responder"
         ;;
     harness|initiator)
@@ -182,7 +182,7 @@ if [[ "$MODE" == "initiator" ]]; then
         echo "FAIL: our initiation was never answered"
         exit 1
     fi
-    echo "PASS: kernel WireGuard accepted an initiation from wg-core"
+    echo "PASS: kernel WireGuard accepted an initiation from wirefeather"
 fi
 
 if [[ "$PING_OK" -ne 1 ]]; then

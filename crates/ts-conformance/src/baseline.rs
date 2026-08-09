@@ -41,10 +41,9 @@ pub struct Baseline {
 
 impl Baseline {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let document: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let document: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
 
         let checks = document["checks"]
             .as_object()
@@ -82,8 +81,7 @@ impl Baseline {
         });
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("{}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
         std::fs::write(path, format!("{document:#}\n"))
             .map_err(|e| format!("{}: {e}", path.display()))
@@ -183,7 +181,10 @@ impl Comparison {
 impl fmt::Display for Comparison {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.agrees() {
-            return writeln!(f, "matches the baseline: every check has its expected status");
+            return writeln!(
+                f,
+                "matches the baseline: every check has its expected status"
+            );
         }
 
         if self.target_mismatch() {
@@ -291,11 +292,10 @@ mod tests {
 
     #[test]
     fn an_unchanged_run_agrees() {
-        let comparison = baseline(&[("a", "pass"), ("b", "todo")])
-            .compare(&report(&[
-                ("a", Status::Pass(String::new())),
-                ("b", Status::Todo(String::new())),
-            ]));
+        let comparison = baseline(&[("a", "pass"), ("b", "todo")]).compare(&report(&[
+            ("a", Status::Pass(String::new())),
+            ("b", Status::Todo(String::new())),
+        ]));
         assert!(comparison.agrees());
     }
 
@@ -317,8 +317,10 @@ mod tests {
 
     #[test]
     fn a_failure_is_a_regression_and_carries_its_detail() {
-        let comparison = baseline(&[("a", "pass")])
-            .compare(&report(&[("a", Status::Fail("the tag did not verify".into()))]));
+        let comparison = baseline(&[("a", "pass")]).compare(&report(&[(
+            "a",
+            Status::Fail("the tag did not verify".into()),
+        )]));
         assert!(comparison.changed[0].is_regression());
         assert!(format!("{comparison}").contains("the tag did not verify"));
     }
@@ -327,8 +329,8 @@ mod tests {
     /// it stops describing what the suite does.
     #[test]
     fn an_improvement_is_reported_but_not_as_a_regression() {
-        let comparison = baseline(&[("a", "todo")])
-            .compare(&report(&[("a", Status::Pass(String::new()))]));
+        let comparison =
+            baseline(&[("a", "todo")]).compare(&report(&[("a", Status::Pass(String::new()))]));
         assert!(!comparison.agrees());
         assert!(!comparison.changed[0].is_regression());
         let text = format!("{comparison}");
@@ -354,11 +356,10 @@ mod tests {
 
     #[test]
     fn added_and_removed_checks_are_both_errors() {
-        let comparison = baseline(&[("a", "pass"), ("gone", "pass")])
-            .compare(&report(&[
-                ("a", Status::Pass(String::new())),
-                ("brand-new", Status::Pass(String::new())),
-            ]));
+        let comparison = baseline(&[("a", "pass"), ("gone", "pass")]).compare(&report(&[
+            ("a", Status::Pass(String::new())),
+            ("brand-new", Status::Pass(String::new())),
+        ]));
         assert!(!comparison.agrees());
         assert_eq!(comparison.missing, vec!["gone".to_string()]);
         assert_eq!(comparison.unexpected, vec!["brand-new".to_string()]);

@@ -20,9 +20,8 @@ serde_json = "1"
 # The no_std crates are linked directly for the vector-backed checks and for the
 # constants the live checks assert against. The live checks drive the harness
 # binary instead — see src/harness.rs for why both mechanisms exist.
-ts-netmap.workspace = true
-ts-noise.workspace  = true
-wg-core.workspace  = true
+tailfeather.workspace = true
+wirefeather.workspace = true
 
 [dev-dependencies]
 # Pinned exactly. `fixed_ephemeral_key_for_testing_only` is public in the source
@@ -60,6 +59,4 @@ tokio                  = { version = "1", features = ["macros", "rt-multi-thread
 fluke-hpack            = "0.3"
 hex                    = "0.4"
 micro-h2.workspace     = true
-ts-control.workspace   = true
-ts-keys.workspace      = true
 x25519-dalek.workspace = true

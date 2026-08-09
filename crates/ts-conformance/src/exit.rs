@@ -31,7 +31,9 @@ fn start(env: &Env) -> Result<Session, String> {
         return Err(NOT_BUILT.into());
     };
     if env.target == Target::TailscaleSaas {
-        return Err("the hosted service is HTTPS-only and there is no TLS client yet".into());
+        return Err(
+            "this conformance path does not yet route hosted requests through verified TLS".into(),
+        );
     }
     let (Some((host, port)), Some(auth_key)) = (&env.control_address, &env.preauth_key) else {
         return Err("no lab; start one with tests/lab/lab.sh up".into());
@@ -42,13 +44,23 @@ fn start(env: &Env) -> Result<Session, String> {
     let port = port.to_string();
 
     let run = harness.run(&[
-        "register", &state, host, &port, auth_key, "--exit-node",
-        "--hostname", env.scope.hostname(),
+        "register",
+        &state,
+        host,
+        &port,
+        auth_key,
+        "--exit-node",
+        "--hostname",
+        env.scope.hostname(),
     ])?;
     let Some(node_key) = run.event("registered").and_then(|e| e["node"].as_str()) else {
         return Err(format!("could not register: {}", run.tail()));
     };
-    if run.event("registered").and_then(|e| e["exit_node"].as_bool()) != Some(true) {
+    if run
+        .event("registered")
+        .and_then(|e| e["exit_node"].as_bool())
+        != Some(true)
+    {
         return Err("the harness did not report advertising exit routes".into());
     }
 

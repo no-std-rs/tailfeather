@@ -12,7 +12,7 @@
 
 use core::net::{Ipv4Addr, SocketAddrV4};
 
-use wg_core::{Action, Device};
+use wirefeather::{Action, Device};
 
 use crate::exec::{Either, Reactor, block_on, select};
 use crate::net::UdpSocket;
@@ -47,25 +47,21 @@ pub fn run_responder(config: Config) -> ! {
     evt!("{{\"event\":\"ready\",\"role\":\"responder\"}}");
 
     let mut datagram = [0u8; 2048];
-    let mut out = [0u8; wg_core::MAX_DATAGRAM_LEN];
-    let mut reply = [0u8; wg_core::MAX_DATAGRAM_LEN];
+    let mut out = [0u8; wirefeather::MAX_DATAGRAM_LEN];
+    let mut reply = [0u8; wirefeather::MAX_DATAGRAM_LEN];
     let mut endpoint: Option<SocketAddrV4> = None;
 
     block_on(&reactor, async {
         loop {
-            let received = match select(
-                socket.recv_from(&mut datagram),
-                reactor.sleep(TICK_MS),
-            )
-            .await
-            {
-                Either::First(Ok(received)) => Some(received),
-                Either::First(Err(e)) => {
-                    println!("!! recv: {e}");
-                    None
-                }
-                Either::Second(()) => None,
-            };
+            let received =
+                match select(socket.recv_from(&mut datagram), reactor.sleep(TICK_MS)).await {
+                    Either::First(Ok(received)) => Some(received),
+                    Either::First(Err(e)) => {
+                        println!("!! recv: {e}");
+                        None
+                    }
+                    Either::Second(()) => None,
+                };
 
             if let Some((len, from)) = received {
                 endpoint = Some(from);
@@ -79,7 +75,7 @@ pub fn run_responder(config: Config) -> ! {
                         println!("<- tunnelled packet, {} bytes", packet.len());
                         let echo = inner::icmp_echo_reply(packet, config.tunnel_ip, &mut reply);
                         if let Some(n) = echo {
-                            let mut sealed = [0u8; wg_core::MAX_DATAGRAM_LEN];
+                            let mut sealed = [0u8; wirefeather::MAX_DATAGRAM_LEN];
                             match device.encapsulate(peer, &reply[..n], clock.now(), &mut sealed) {
                                 Ok(Action::Send { data, .. }) => {
                                     let n = data.len();
@@ -91,7 +87,7 @@ pub fn run_responder(config: Config) -> ! {
                             }
                         }
                     }
-                    Ok(Action::None) => {}
+                    Ok(Action::None | Action::Authenticated { .. }) => {}
                     Err(e) => println!("!! {e}"),
                 }
             }
@@ -131,8 +127,8 @@ pub fn run_initiator(config: Config, peer_endpoint: SocketAddrV4) -> ! {
     evt!("{{\"event\":\"ready\",\"role\":\"initiator\"}}");
 
     let mut datagram = [0u8; 2048];
-    let mut out = [0u8; wg_core::MAX_DATAGRAM_LEN];
-    let mut reply = [0u8; wg_core::MAX_DATAGRAM_LEN];
+    let mut out = [0u8; wirefeather::MAX_DATAGRAM_LEN];
+    let mut reply = [0u8; wirefeather::MAX_DATAGRAM_LEN];
     let mut announced = false;
 
     block_on(&reactor, async {
@@ -168,19 +164,15 @@ pub fn run_initiator(config: Config, peer_endpoint: SocketAddrV4) -> ! {
                 evt!("{{\"event\":\"handshake\",\"role\":\"initiator\"}}");
             }
 
-            let received = match select(
-                socket.recv_from(&mut datagram),
-                reactor.sleep(TICK_MS),
-            )
-            .await
-            {
-                Either::First(Ok(received)) => Some(received),
-                Either::First(Err(e)) => {
-                    println!("!! recv: {e}");
-                    None
-                }
-                Either::Second(()) => None,
-            };
+            let received =
+                match select(socket.recv_from(&mut datagram), reactor.sleep(TICK_MS)).await {
+                    Either::First(Ok(received)) => Some(received),
+                    Either::First(Err(e)) => {
+                        println!("!! recv: {e}");
+                        None
+                    }
+                    Either::Second(()) => None,
+                };
 
             let Some((len, from)) = received else {
                 continue;
@@ -196,7 +188,7 @@ pub fn run_initiator(config: Config, peer_endpoint: SocketAddrV4) -> ! {
                     println!("<- tunnelled packet, {} bytes", packet.len());
                     let echo = inner::icmp_echo_reply(packet, config.tunnel_ip, &mut reply);
                     if let Some(n) = echo {
-                        let mut sealed = [0u8; wg_core::MAX_DATAGRAM_LEN];
+                        let mut sealed = [0u8; wirefeather::MAX_DATAGRAM_LEN];
                         match device.encapsulate(peer, &reply[..n], clock.now(), &mut sealed) {
                             Ok(Action::Send { data, .. }) => {
                                 let n = data.len();
@@ -208,7 +200,7 @@ pub fn run_initiator(config: Config, peer_endpoint: SocketAddrV4) -> ! {
                         }
                     }
                 }
-                Ok(Action::None) => {}
+                Ok(Action::None | Action::Authenticated { .. }) => {}
                 Err(e) => println!("!! {e}"),
             }
         }

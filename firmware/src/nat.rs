@@ -35,7 +35,7 @@ const UDP_HEADER_LEN: usize = 8;
 
 /// The largest inner payload we can forward: a full inner packet less its own
 /// IP and UDP headers.
-pub const MAX_PAYLOAD: usize = wg_core::budget::INNER_MTU - IPV4_HEADER_LEN - UDP_HEADER_LEN;
+pub const MAX_PAYLOAD: usize = wirefeather::budget::INNER_MTU - IPV4_HEADER_LEN - UDP_HEADER_LEN;
 
 /// One translated flow. The external port is implied by the slot index.
 #[derive(Clone, Copy)]
@@ -144,7 +144,7 @@ pub const TCP_IDLE_TIMEOUT_MS: u64 = 120_000;
 /// and is simply dropped, which presents as a connection that opens and then
 /// hangs the moment it carries real data. Clamping the option in the SYN stops
 /// that at the source instead.
-pub const MAX_MSS: u16 = (wg_core::budget::INNER_MTU - IPV4_HEADER_LEN - TCP_HEADER_LEN) as u16;
+pub const MAX_MSS: u16 = (wirefeather::budget::INNER_MTU - IPV4_HEADER_LEN - TCP_HEADER_LEN) as u16;
 
 const PROTO_TCP: u8 = 6;
 const TCP_HEADER_LEN: usize = 20;

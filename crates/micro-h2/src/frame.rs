@@ -12,7 +12,7 @@ use crate::Error;
 
 /// Every frame begins with nine bytes. That this is also the length of the
 /// ts2021 early-payload probe is what makes the two distinguishable; see
-/// `ts_noise::early`.
+/// `tailfeather::noise::early`.
 pub const HEADER_LEN: usize = 9;
 
 /// The largest frame every endpoint must accept, and the default until
@@ -208,7 +208,10 @@ mod tests {
         // RFC 7540 requires discarding, not failing: that is what lets the
         // protocol gain frame types without breaking older clients.
         let bytes = [0x00, 0x00, 0x00, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert_eq!(FrameHeader::parse(&bytes).unwrap().kind, FrameType::Unknown(0x63));
+        assert_eq!(
+            FrameHeader::parse(&bytes).unwrap().kind,
+            FrameType::Unknown(0x63)
+        );
     }
 
     #[test]
@@ -224,6 +227,9 @@ mod tests {
         // Without the flag the first byte is data, not a length.
         assert_eq!(strip_padding(&payload, 0).unwrap(), &payload);
         // Padding longer than the frame is a protocol error, not a wrap-around.
-        assert_eq!(strip_padding(&[0x09, b'h'], flags::PADDED), Err(Error::Protocol));
+        assert_eq!(
+            strip_padding(&[0x09, b'h'], flags::PADDED),
+            Err(Error::Protocol)
+        );
     }
 }

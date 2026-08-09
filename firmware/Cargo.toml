@@ -14,7 +14,8 @@ name = "esp-gateway-firmware"
 path = "./src/main.rs"
 
 [dependencies]
-wg-core = { path = "../crates/wg-core" }
+wirefeather = { path = "../crates/wirefeather" }
+tailfeather = { path = "../crates/tailfeather" }
 
 esp-hal = { version = "~1.1.0", features = ["esp32c6", "log-04", "unstable"] }
 
@@ -35,12 +36,14 @@ embassy-net = { version = "0.9.1", features = [
   # misbehaves.
   "auto-icmp-echo-reply",
   "dhcpv4",
+  "dns",
   "log",
   "medium-ethernet",
   # Forwarded TCP is translated packet by packet through a raw socket. smoltcp
   # suppresses its own RST for anything a raw socket consumes, which is what
   # makes this possible without a custom Driver.
   "raw",
+  "tcp",
   "udp",
 ] }
 esp-alloc = "0.10.0"

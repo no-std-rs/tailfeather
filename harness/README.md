@@ -17,8 +17,8 @@ sudo ../scripts/interop-wireguard.sh harness
 That stands up a real kernel WireGuard interface in a network namespace, points
 it at this binary, and requires a completed handshake and a successful in-tunnel
 ping. Running the same script without `harness` does the identical test against
-the `std` `responder` example in `wg-core`; both must pass, because both are the
-same `wg-core`.
+the `std` `responder` example in `wirefeather`; both must pass, because both are the
+same `wirefeather`.
 
 ## Layout
 
@@ -27,7 +27,7 @@ same `wg-core`.
   that need no allocator.
 - `inner.rs` — an ICMP echo responder, so the tunnel address answers `ping`.
 - `main.rs` — `_start`, argument parsing off the initial stack, and the receive
-  loop driving `wg_core::Device`.
+  loop driving `wirefeather::Device`.
 
 ## Two things that will bite anyone extending this
 
@@ -51,10 +51,12 @@ against, so `-Z build-std` must compile one. The firmware stays on stable.
 
 ## Status
 
-Today this proves milestone M2: a real WireGuard handshake and tunnelled ping
-against `wg-quick`. As `ts-control` and `micro-h2` arrive it will need an async
-executor and a TCP socket to register against a local Headscale; the syscall
-layer is deliberately structured so those slot in beside the UDP calls.
+The harness now includes the no-allocation reactor, TCP, atomic file storage,
+TLS, ts2021, HTTP/2, registration, streamed netmaps, disco, DERP, and both
+WireGuard roles. Netmaps are handed through the public `tailfeather::Node`
+transactional lease API before peers are reported. Live results still depend on
+the exact lab environment and baseline; a successful bare build alone is not an
+interoperability claim.
 
 Currently `inner.rs` duplicates the ICMP echo responder that the firmware also
 needs. Once there is a third consumer, or the firmware's copy diverges, it

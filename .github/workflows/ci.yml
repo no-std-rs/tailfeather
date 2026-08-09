@@ -23,6 +23,16 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  packages:
+    name: crate packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: dry-run and isolated consumers
+        run: ./scripts/package-check.sh
+
   host:
     name: host tests
     runs-on: ubuntu-latest
@@ -31,6 +41,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: formatting
+        run: |
+          cargo fmt --all -- --check
+          find harness/src firmware/src -type f -name '*.rs' -print0 | xargs -0 rustfmt --edition 2024 --check
+
       # The differential tests are the point of this job: snow, h2,
       # fluke-hpack and the pcap replay all run on the host with no lab.
       - name: cargo test
@@ -38,6 +53,20 @@ jobs:
 
       - name: doc tests
         run: cargo test --workspace --doc
+
+      - name: rustdoc
+        run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
+
+      - name: published fixture audit
+        run: ./scripts/fixture-audit.sh
+
+      - name: release evidence validator
+        run: |
+          python3 scripts/test-release-evidence.py
+          python3 scripts/test-trademark-review.py
+
+      - name: testkit JSON
+        run: cargo run -q -p tailfeather-testkit -- check --json --expect crates/tailfeather-testkit/expected.json
 
   lint:
     name: clippy
@@ -51,13 +80,6 @@ jobs:
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-
-      # No `cargo fmt --check` here, deliberately. This tree does not currently
-      # satisfy default rustfmt — the wrapping is hand-chosen in a lot of places,
-      # particularly around the byte-level constants and their explanations — so
-      # the gate would fail on its first run for reasons unrelated to any change.
-      # Adopting rustfmt means one large reformatting commit first; that is a
-      # decision to take deliberately rather than smuggle in with CI.
 
   bare-target:
     name: no_std, no alloc
@@ -85,6 +107,9 @@ jobs:
 
       - name: firmware builds for the device target
         run: cd firmware && cargo build --release
+
+      - name: numeric resource limits
+        run: ./scripts/resource-check.sh
 
   offline-matrix:
     name: offline matrix vs baseline

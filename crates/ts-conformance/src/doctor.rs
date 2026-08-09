@@ -244,7 +244,10 @@ mod tests {
         assert!(text.contains("no headscale-lab container"));
         assert!(text.contains("control.register"));
         // One banner, not one line per check.
-        assert!(text.lines().count() < 12, "the banner grew into a list:\n{text}");
+        assert!(
+            text.lines().count() < 12,
+            "the banner grew into a list:\n{text}"
+        );
     }
 
     /// tailscaled being absent and the reference simply not running are

@@ -26,7 +26,7 @@ fn control_get(env: &Env, path: &str) -> Result<http::Response, Status> {
     };
     if env.target == Target::TailscaleSaas {
         return Err(Status::Todo(
-            "the hosted service is HTTPS-only and this suite has no TLS client yet".into(),
+            "this conformance path does not yet route hosted requests through verified TLS".into(),
         ));
     }
     http::get(&format!("{base}{path}")).map_err(Status::Fail)
@@ -40,7 +40,8 @@ static CHECKS: &[Check] = &[
         description: "completes a WireGuard handshake as responder",
         run: |_| {
             Status::External(
-                "scripts/interop-wireguard.sh — real kernel WireGuard initiates and succeeds".into(),
+                "scripts/interop-wireguard.sh — real kernel WireGuard initiates and succeeds"
+                    .into(),
             )
         },
     },
@@ -54,16 +55,16 @@ static CHECKS: &[Check] = &[
         id: "wg.replay",
         area: Area::DataPlane,
         description: "rejects replayed and out-of-window counters",
-        run: |_| Status::External("wg-core unit tests, ladder verified against the kernel".into()),
+        run: |_| {
+            Status::External("wirefeather unit tests, ladder verified against the kernel".into())
+        },
     },
     Check {
         id: "wg.rekey",
         area: Area::DataPlane,
         description: "survives rekeying without dropping traffic",
         run: |_| {
-            Status::External(
-                "hardware soak: 300/300 packets across two rekeys at 120 s".into(),
-            )
+            Status::External("hardware soak: 300/300 packets across two rekeys at 120 s".into())
         },
     },
     Check {
@@ -73,7 +74,7 @@ static CHECKS: &[Check] = &[
         run: |_| {
             Status::External(
                 "scripts/interop-wireguard.sh initiator — kernel WireGuard, configured with no \
-                 endpoint so it cannot start one itself, accepted an initiation from wg-core and \
+                 endpoint so it cannot start one itself, accepted an initiation from wirefeather and \
                  answered the in-tunnel ping"
                     .into(),
             )
@@ -314,7 +315,9 @@ static CHECKS: &[Check] = &[
         area: Area::ExitNode,
         description: "forwards TCP, including TLS, out of the uplink",
         run: |_| {
-            Status::External("scripts/test-http.sh — HTTP and HTTPS complete through the device".into())
+            Status::External(
+                "scripts/test-http.sh — HTTP and HTTPS complete through the device".into(),
+            )
         },
     },
     Check {

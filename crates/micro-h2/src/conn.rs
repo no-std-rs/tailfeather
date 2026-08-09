@@ -125,7 +125,11 @@ impl Connection {
         // accepts a promise needs no state for one.
         let mut payload = [0u8; 18];
         write_setting(&mut payload[0..6], settings::ENABLE_PUSH, 0);
-        write_setting(&mut payload[6..12], settings::INITIAL_WINDOW_SIZE, RECEIVE_WINDOW);
+        write_setting(
+            &mut payload[6..12],
+            settings::INITIAL_WINDOW_SIZE,
+            RECEIVE_WINDOW,
+        );
         write_setting(
             &mut payload[12..18],
             settings::MAX_CONCURRENT_STREAMS,
@@ -182,7 +186,11 @@ impl Connection {
             return Err(Error::FrameTooLarge);
         }
 
-        let end_stream = if body.is_empty() { flags::END_STREAM } else { 0 };
+        let end_stream = if body.is_empty() {
+            flags::END_STREAM
+        } else {
+            0
+        };
         let mut len = frame::write_frame(
             FrameType::Headers,
             flags::END_HEADERS | end_stream,
@@ -310,7 +318,10 @@ impl Connection {
 
             FrameType::GoAway => {
                 // last-stream-id, then the error code.
-                let code = payload.get(4..8).and_then(read_u32).ok_or(Error::Protocol)?;
+                let code = payload
+                    .get(4..8)
+                    .and_then(read_u32)
+                    .ok_or(Error::Protocol)?;
                 Ok((Event::GoAway { code }, 0))
             }
 
@@ -524,18 +535,26 @@ mod tests {
         // ":status: 200" then ":method: GET", as two indexed fields.
         let first = frame_bytes(FrameType::Headers, 0, 1, &[0x88]);
         let (event, _) = connection.recv(&first, |_, _| {}, &mut out).unwrap();
-        assert_eq!(event, Event::Nothing, "an unterminated block yields nothing");
+        assert_eq!(
+            event,
+            Event::Nothing,
+            "an unterminated block yields nothing"
+        );
 
         let mut seen = heapless::Vec::<(heapless::String<32>, heapless::String<32>), 4>::new();
         let second = frame_bytes(FrameType::Continuation, flags::END_HEADERS, 1, &[0x82]);
         let (event, _) = connection
-            .recv(&second, |name, value| {
-                let mut n = heapless::String::new();
-                let mut v = heapless::String::new();
-                n.push_str(name).unwrap();
-                v.push_str(value).unwrap();
-                seen.push((n, v)).unwrap();
-            }, &mut out)
+            .recv(
+                &second,
+                |name, value| {
+                    let mut n = heapless::String::new();
+                    let mut v = heapless::String::new();
+                    n.push_str(name).unwrap();
+                    v.push_str(value).unwrap();
+                    seen.push((n, v)).unwrap();
+                },
+                &mut out,
+            )
             .unwrap();
 
         assert!(matches!(event, Event::Headers { stream: 1, .. }));
@@ -612,11 +631,15 @@ mod tests {
         );
         let mut status = heapless::String::<8>::new();
         connection
-            .recv(&headers, |name, value| {
-                if name == ":status" {
-                    status.push_str(value).unwrap();
-                }
-            }, &mut out)
+            .recv(
+                &headers,
+                |name, value| {
+                    if name == ":status" {
+                        status.push_str(value).unwrap();
+                    }
+                },
+                &mut out,
+            )
             .unwrap();
         assert_eq!(status.as_str(), "200");
     }

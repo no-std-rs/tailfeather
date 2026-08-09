@@ -1,19 +1,24 @@
-//! The WireGuard data path: a UDP socket on one side, [`wg_core::Device`] on
+//! The mesh data path: a UDP socket on one side, [`tailfeather::Node`] on
 //! the other, and source NAT out of the WiFi uplink for anything the tunnel
 //! wants to forward.
 //!
 //! Everything runs in one task. The cryptography is the bottleneck by a wide
 //! margin, so there is nothing to gain from processing packets concurrently,
-//! and a single task means [`wg_core::Device`] needs no locking.
+//! and a single actor means [`tailfeather::Node`] needs no locking.
 
-use embassy_futures::select::{Either4, select4, select_array};
+use core::net::{Ipv4Addr as CoreIpv4Addr, SocketAddr, SocketAddrV4};
+use embassy_futures::select::{Either4, select_array, select4};
 use embassy_net::raw::{IpProtocol, IpVersion, RawSocket};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpEndpoint, Ipv4Address, Stack, raw, udp};
 use embassy_time::{Duration, Timer};
 use log::{info, warn};
 use static_cell::StaticCell;
-use wg_core::{Action, Device, Instant, PeerId, Rng};
+
+use tailfeather::keys::{DiscoPrivate, Identity, MachinePrivate, NodePrivate, NodePublic};
+use tailfeather::netmap::{Netmap, Peer};
+use tailfeather::{ControlEvent, Node, NodeAction};
+use wirefeather::Rng;
 
 use crate::nat;
 
@@ -24,12 +29,13 @@ const LISTEN_PORT: u16 = 51820;
 /// ten-second scale, so a quarter second is ample resolution.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Point-to-point for now: one upstream peer, so one slot.
-const PEERS: usize = 1;
+/// The public node is sized for the release target even when static fallback
+/// configuration names only one peer.
+const PEERS: usize = 32;
 
 /// Enough for a handful of full-size datagrams to queue while the tunnel is
 /// busy with the ChaCha20 work of the previous one.
-const WG_BUFFER_LEN: usize = 8 * wg_core::MAX_DATAGRAM_LEN;
+const WG_BUFFER_LEN: usize = 8 * wirefeather::MAX_DATAGRAM_LEN;
 const WG_PACKETS: usize = 16;
 
 /// Per-NAT-socket buffering. Smaller than the tunnel's, because a forwarded
@@ -57,7 +63,8 @@ static NAT_TX_META: StaticCell<[[PacketMetadata; NAT_PACKETS]; nat::SLOTS]> = St
 static NAT_RX_BUFFER: StaticCell<[[u8; NAT_BUFFER_LEN]; nat::SLOTS]> = StaticCell::new();
 static NAT_TX_BUFFER: StaticCell<[[u8; NAT_BUFFER_LEN]; nat::SLOTS]> = StaticCell::new();
 
-static DEVICE: StaticCell<Device<PEERS>> = StaticCell::new();
+static NODE: StaticCell<Node<PEERS>> = StaticCell::new();
+static STAGING_NETMAP: StaticCell<Netmap<PEERS>> = StaticCell::new();
 static SCRATCH: StaticCell<Scratch> = StaticCell::new();
 
 /// The working buffers, kept out of the task's future so the executor's task
@@ -65,10 +72,8 @@ static SCRATCH: StaticCell<Scratch> = StaticCell::new();
 struct Scratch {
     /// A received outer datagram, or a received NAT reply payload.
     datagram: [u8; 2048],
-    /// Whatever `wg-core` is about to emit.
-    out: [u8; wg_core::MAX_DATAGRAM_LEN],
     /// An inner packet we have built and are about to encapsulate.
-    inner: [u8; wg_core::budget::INNER_MTU],
+    inner: [u8; wirefeather::budget::INNER_MTU],
 }
 
 /// The hardware RNG, which yields true random numbers here because the radio is
@@ -82,23 +87,46 @@ impl Rng for HwRng {
     }
 }
 
-fn now() -> Instant {
-    Instant(embassy_time::Instant::now().as_millis())
+fn now_ms() -> u64 {
+    embassy_time::Instant::now().as_millis()
 }
 
 #[embassy_executor::task]
 pub async fn tunnel(stack: Stack<'static>) -> ! {
-    let device = DEVICE.init(Device::new(crate::WG_PRIVATE_KEY));
-    // The peer an action applies to always comes back from `handle_udp`, so
-    // registration's return value is of no use here.
-    device
-        .add_peer(crate::WG_PEER_PUBLIC_KEY, None)
-        .expect("the peer table has room for the one configured peer");
+    let identity = Identity {
+        machine: MachinePrivate::from_bytes(crate::MACHINE_PRIVATE_KEY),
+        node: NodePrivate::from_bytes(crate::WG_PRIVATE_KEY),
+        disco: DiscoPrivate::from_bytes(crate::DISCO_PRIVATE_KEY),
+    };
+    let node = NODE.init(Node::factory_reset(identity, 1));
+    // Compile-time identities are immutable across reboot; acknowledge that
+    // durable source before allowing any future control connection.
+    let generation = match node.poll(0) {
+        Ok(Some(NodeAction::PersistState(state))) => state.generation(),
+        _ => panic!("a fresh node must request persistence"),
+    };
+    node.persistence_result(generation, true)
+        .expect("the initial durable identity generation matches");
+
+    // Static fallback configuration goes through the same transactional map
+    // lease used by the future streaming control task.
+    let staging = STAGING_NETMAP.init(Netmap::new());
+    staging
+        .peers
+        .upsert(Peer::new(
+            1,
+            NodePublic::from_bytes(crate::WG_PEER_PUBLIC_KEY),
+        ))
+        .expect("the 32-peer staging map has room");
+    node.handle_control_event(ControlEvent::MapFinished {
+        lease: staging,
+        result: Ok(()),
+    })
+    .expect("the static map is valid");
     let mut rng = HwRng(esp_hal::rng::Rng::new());
     let scratch = SCRATCH.init(Scratch {
         datagram: [0; 2048],
-        out: [0; wg_core::MAX_DATAGRAM_LEN],
-        inner: [0; wg_core::budget::INNER_MTU],
+        inner: [0; wirefeather::budget::INNER_MTU],
     });
 
     let mut wg_socket = UdpSocket::new(
@@ -110,10 +138,18 @@ pub async fn tunnel(stack: Stack<'static>) -> ! {
     );
     wg_socket.bind(LISTEN_PORT).expect("port 51820 is free");
 
-    let mut rx_meta = NAT_RX_META.init([[PacketMetadata::EMPTY; NAT_PACKETS]; nat::SLOTS]).iter_mut();
-    let mut tx_meta = NAT_TX_META.init([[PacketMetadata::EMPTY; NAT_PACKETS]; nat::SLOTS]).iter_mut();
-    let mut rx_buffer = NAT_RX_BUFFER.init([[0; NAT_BUFFER_LEN]; nat::SLOTS]).iter_mut();
-    let mut tx_buffer = NAT_TX_BUFFER.init([[0; NAT_BUFFER_LEN]; nat::SLOTS]).iter_mut();
+    let mut rx_meta = NAT_RX_META
+        .init([[PacketMetadata::EMPTY; NAT_PACKETS]; nat::SLOTS])
+        .iter_mut();
+    let mut tx_meta = NAT_TX_META
+        .init([[PacketMetadata::EMPTY; NAT_PACKETS]; nat::SLOTS])
+        .iter_mut();
+    let mut rx_buffer = NAT_RX_BUFFER
+        .init([[0; NAT_BUFFER_LEN]; nat::SLOTS])
+        .iter_mut();
+    let mut tx_buffer = NAT_TX_BUFFER
+        .init([[0; NAT_BUFFER_LEN]; nat::SLOTS])
+        .iter_mut();
     let mut nat_sockets: [UdpSocket; nat::SLOTS] = core::array::from_fn(|slot| {
         let mut socket = UdpSocket::new(
             stack,
@@ -151,11 +187,10 @@ pub async fn tunnel(stack: Stack<'static>) -> ! {
         .address()
         .octets();
 
-    info!("wireguard listening on :{LISTEN_PORT}, {} NAT slots", nat::SLOTS);
-
-    // We never initiate, so the peer's address is only ever learned from the
-    // traffic it sends, and it may change as its NAT mapping does.
-    let mut endpoint = None;
+    info!(
+        "wireguard listening on :{LISTEN_PORT}, {} NAT slots",
+        nat::SLOTS
+    );
 
     loop {
         // `wait_recv_ready` borrows immutably, so all the sockets can be waited
@@ -183,9 +218,8 @@ pub async fn tunnel(stack: Stack<'static>) -> ! {
         match ready {
             Ready::Tunnel => {
                 if let Ok((len, from)) = wg_socket.recv_from(&mut scratch.datagram).await {
-                    endpoint = Some(from);
                     handle_tunnel_datagram(
-                        device,
+                        node,
                         &mut rng,
                         scratch,
                         len,
@@ -202,33 +236,26 @@ pub async fn tunnel(stack: Stack<'static>) -> ! {
             }
             Ready::Nat(slot) => {
                 handle_nat_reply(
-                    device,
+                    node,
                     scratch,
                     slot,
                     &nat_sockets[slot],
                     &mut table,
                     &wg_socket,
-                    endpoint,
                 )
                 .await;
             }
             Ready::Raw => {
-                handle_raw_reply(
-                    device,
-                    scratch,
-                    &raw_socket,
-                    &mut tcp_table,
-                    &wg_socket,
-                    endpoint,
-                )
-                .await;
+                handle_raw_reply(node, scratch, &raw_socket, &mut tcp_table, &wg_socket).await;
             }
             Ready::Timers => {}
         }
 
-        while let Action::Send { data, .. } = device.poll_timers(now(), &mut scratch.out) {
-            let Some(to) = endpoint else { break };
-            send(&wg_socket, data, to).await;
+        while let Ok(Some(NodeAction::DirectTransmit {
+            endpoint, packet, ..
+        })) = node.poll_tunnel_timers(now_ms())
+        {
+            send_direct(&wg_socket, packet.as_slice(), endpoint).await;
         }
     }
 }
@@ -243,7 +270,7 @@ enum Ready {
 /// Decrypt one outer datagram and act on whatever was inside it.
 #[allow(clippy::too_many_arguments)]
 async fn handle_tunnel_datagram(
-    device: &mut Device<PEERS>,
+    node: &mut Node<PEERS>,
     rng: &mut HwRng,
     scratch: &mut Scratch,
     len: usize,
@@ -255,27 +282,33 @@ async fn handle_tunnel_datagram(
     tcp_table: &mut nat::TcpTable,
     our_ip: [u8; 4],
 ) {
-    let Scratch {
-        datagram,
-        out,
-        inner,
-    } = scratch;
+    let Scratch { datagram, inner } = scratch;
 
-    match device.handle_udp(&datagram[..len], now(), rng, out) {
-        Ok(Action::Send { data, .. }) => send(wg_socket, data, from).await,
-        Ok(Action::Receive { peer, packet }) => {
+    let source = match from.endpoint.addr {
+        embassy_net::IpAddress::Ipv4(address) => SocketAddr::V4(SocketAddrV4::new(
+            CoreIpv4Addr::from(address.octets()),
+            from.endpoint.port,
+        )),
+    };
+    match node.handle_direct_from(&datagram[..len], source, now_ms(), rng) {
+        Ok(Some(NodeAction::DirectTransmit {
+            endpoint, packet, ..
+        })) => send_direct(wg_socket, packet.as_slice(), endpoint).await,
+        Ok(Some(NodeAction::DeliveredIpv4 { peer, packet })) => {
+            let packet = packet.as_slice();
             // An echo request for our own tunnel address is answered here;
             // anything else is forwarded.
-            if let Some(reply_len) = crate::inner::icmp_echo_reply(packet, crate::WG_TUNNEL_IP, inner)
+            if let Some(reply_len) =
+                crate::inner::icmp_echo_reply(packet, crate::WG_TUNNEL_IP, inner)
             {
-                encapsulate_and_send(device, peer, &inner[..reply_len], out, wg_socket, from).await;
+                encapsulate_and_send(node, &peer, &inner[..reply_len], wg_socket).await;
             } else if let Some(flow) = nat::parse_udp4(packet) {
                 forward_out(nat_sockets, table, &flow).await;
             } else if let Some(info) = nat::parse_tcp4(packet) {
                 forward_tcp_out(raw_socket, tcp_table, inner, packet, &info, our_ip).await;
             }
         }
-        Ok(Action::None) => {}
+        Ok(_) => {}
         Err(e) => warn!("rx: {e}"),
     }
 }
@@ -353,14 +386,13 @@ async fn forward_tcp_out(
 
 /// Translate a TCP segment arriving from the uplink back into the tunnel.
 async fn handle_raw_reply(
-    device: &mut Device<PEERS>,
+    node: &mut Node<PEERS>,
     scratch: &mut Scratch,
     raw_socket: &RawSocket<'_>,
     tcp_table: &mut nat::TcpTable,
     wg_socket: &UdpSocket<'_>,
-    endpoint: Option<udp::UdpMetadata>,
 ) {
-    let Scratch { out, inner, .. } = scratch;
+    let Scratch { inner, .. } = scratch;
 
     let Ok(len) = raw_socket.recv(inner).await else {
         return;
@@ -384,7 +416,6 @@ async fn handle_raw_reply(
     let Some(flow) = tcp_table.get(slot) else {
         return;
     };
-    let Some(to) = endpoint else { return };
     let is_rst = info.is_rst;
     tcp_table.touch(slot, embassy_time::Instant::now().as_millis());
 
@@ -394,8 +425,11 @@ async fn handle_raw_reply(
         return;
     }
 
-    match device.encapsulate(PeerId(0), &inner[..len], now(), out) {
-        Ok(Action::Send { data, .. }) => send(wg_socket, data, to).await,
+    let peer = NodePublic::from_bytes(crate::WG_PEER_PUBLIC_KEY);
+    match node.encapsulate_ipv4(&peer, &inner[..len], now_ms()) {
+        Ok(Some(NodeAction::DirectTransmit {
+            endpoint, packet, ..
+        })) => send_direct(wg_socket, packet.as_slice(), endpoint).await,
         Ok(_) => {}
         Err(e) => warn!("encapsulate: {e}"),
     }
@@ -406,30 +440,21 @@ async fn handle_raw_reply(
 }
 
 /// Take a reply that arrived on a NAT socket and put it back into the tunnel.
-///
-/// `endpoint` is where the peer was last heard from. A reply can only arrive
-/// after the peer sent something, so in practice it is always known by now.
 #[allow(clippy::too_many_arguments)]
 async fn handle_nat_reply(
-    device: &mut Device<PEERS>,
+    node: &mut Node<PEERS>,
     scratch: &mut Scratch,
     slot: usize,
     socket: &UdpSocket<'_>,
     table: &mut nat::Table,
     wg_socket: &UdpSocket<'_>,
-    endpoint: Option<udp::UdpMetadata>,
 ) {
-    let Scratch {
-        datagram,
-        out,
-        inner,
-    } = scratch;
+    let Scratch { datagram, inner } = scratch;
 
     let Ok((len, _)) = socket.recv_from(datagram).await else {
         return;
     };
     let Some(flow) = table.get(slot) else { return };
-    let Some(to) = endpoint else { return };
     table.touch(slot, embassy_time::Instant::now().as_millis());
 
     // The client addressed the server, so the reply must appear to come from
@@ -448,22 +473,35 @@ async fn handle_nat_reply(
 
     // There is exactly one configured peer, and a NAT reply belongs to whoever
     // opened the flow, so it can only be that one.
-    encapsulate_and_send(device, PeerId(0), &inner[..inner_len], out, wg_socket, to).await;
+    let peer = NodePublic::from_bytes(crate::WG_PEER_PUBLIC_KEY);
+    encapsulate_and_send(node, &peer, &inner[..inner_len], wg_socket).await;
 }
 
 async fn encapsulate_and_send(
-    device: &mut Device<PEERS>,
-    peer: PeerId,
+    node: &mut Node<PEERS>,
+    peer: &NodePublic,
     packet: &[u8],
-    out: &mut [u8],
     socket: &UdpSocket<'_>,
-    to: udp::UdpMetadata,
 ) {
-    match device.encapsulate(peer, packet, now(), out) {
-        Ok(Action::Send { data, .. }) => send(socket, data, to).await,
+    match node.encapsulate_ipv4(peer, packet, now_ms()) {
+        Ok(Some(NodeAction::DirectTransmit {
+            endpoint, packet, ..
+        })) => send_direct(socket, packet.as_slice(), endpoint).await,
         Ok(_) => {}
         Err(e) => warn!("encapsulate: {e}"),
     }
+}
+
+async fn send_direct(socket: &UdpSocket<'_>, data: &[u8], endpoint: SocketAddr) {
+    let SocketAddr::V4(endpoint) = endpoint else {
+        warn!("IPv6 direct endpoints are not supported by this firmware");
+        return;
+    };
+    let endpoint = IpEndpoint::new(
+        Ipv4Address::from(endpoint.ip().octets()).into(),
+        endpoint.port(),
+    );
+    send(socket, data, endpoint.into()).await;
 }
 
 async fn send(socket: &UdpSocket<'_>, data: &[u8], to: udp::UdpMetadata) {

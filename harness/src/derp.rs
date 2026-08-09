@@ -10,16 +10,16 @@
 
 use core::net::Ipv4Addr;
 
-use ts_derp::{Client, Frame, frame};
-use ts_keys::{NodePrivate, NodePublic};
+use tailfeather::derp::{Client, Frame, frame};
+use tailfeather::keys::{NodePrivate, NodePublic};
 
+use crate::OsRng;
 use crate::control::ControlError;
 use crate::exec::{Either, Reactor, block_on, select};
 use crate::net::TcpStream;
 use crate::time::Clock;
-use crate::OsRng;
 
-impl ts_derp::client::Rng for OsRng {
+impl tailfeather::derp::client::Rng for OsRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         crate::rt::getrandom(dest);
     }
@@ -32,7 +32,10 @@ pub fn run(address: Ipv4Addr, port: u16, sender_dir: &str, receiver_dir: &str) -
     let clock = Clock::start();
     let reactor = Reactor::new(clock);
 
-    match block_on(&reactor, relay(&reactor, address, port, sender_dir, receiver_dir)) {
+    match block_on(
+        &reactor,
+        relay(&reactor, address, port, sender_dir, receiver_dir),
+    ) {
         Ok(()) => {
             evt!("{{\"event\":\"derp\",\"result\":\"ok\"}}");
             crate::rt::exit(0)
@@ -47,12 +50,12 @@ pub fn run(address: Ipv4Addr, port: u16, sender_dir: &str, receiver_dir: &str) -
 
 /// The node key a previous registration persisted.
 fn load_node_key(state_dir: &str) -> Result<NodePrivate, ControlError> {
-    let store = crate::store::FileStore::new(state_dir, "identity.bin")
-        .map_err(ControlError::Store)?;
+    let store =
+        crate::store::FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
     let (identity, is_new) =
-        ts_keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
-            ts_keys::store::IdentityError::Store(e) => ControlError::Store(e),
-            ts_keys::store::IdentityError::Format(e) => ControlError::Identity(e),
+        tailfeather::keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
+            tailfeather::keys::store::IdentityError::Store(e) => ControlError::Store(e),
+            tailfeather::keys::store::IdentityError::Format(e) => ControlError::Identity(e),
         })?;
     if is_new {
         // A key the server has never seen will be turned away, and the reason
@@ -81,7 +84,7 @@ async fn connect<'r>(
         .map_err(ControlError::Net)?;
 
     let mut request = [0u8; 256];
-    let request = ts_derp::client::write_upgrade_request(host, &mut request)
+    let request = tailfeather::derp::client::write_upgrade_request(host, &mut request)
         .map_err(ControlError::Derp)?;
     stream.write_all(request).await.map_err(ControlError::Net)?;
 
@@ -91,12 +94,15 @@ async fn connect<'r>(
     let mut buffer = [0u8; 1024];
     let mut filled = 0;
     let header_len = loop {
-        match ts_derp::client::parse_upgrade(&buffer[..filled]) {
+        match tailfeather::derp::client::parse_upgrade(&buffer[..filled]) {
             Ok(end) => break end,
-            Err(ts_derp::Error::Incomplete) => {}
+            Err(tailfeather::derp::Error::Incomplete) => {}
             Err(e) => return Err(ControlError::Derp(e)),
         }
-        filled += stream.read(&mut buffer[filled..]).await.map_err(ControlError::Net)?;
+        filled += stream
+            .read(&mut buffer[filled..])
+            .await
+            .map_err(ControlError::Net)?;
     };
 
     // Whatever followed the headers is the start of the server's key frame.
@@ -109,15 +115,13 @@ async fn connect<'r>(
     println!("   relay key {server}");
 
     let mut out = [0u8; 512];
-    let len = Client::write_client_info(
-        identity,
-        &identity.public(),
-        &server,
-        &mut OsRng,
-        &mut out,
-    )
-    .map_err(ControlError::Derp)?;
-    stream.write_all(&out[..len]).await.map_err(ControlError::Net)?;
+    let len =
+        Client::write_client_info(identity, &identity.public(), &server, &mut OsRng, &mut out)
+            .map_err(ControlError::Derp)?;
+    stream
+        .write_all(&out[..len])
+        .await
+        .map_err(ControlError::Net)?;
 
     let (frame, payload) = read_frame(&stream, &mut carried, 0).await?;
     let mut info = [0u8; 512];
@@ -156,7 +160,7 @@ async fn read_frame(
     let mut payload = heapless::Vec::new();
     payload
         .extend_from_slice(&buffer[frame::HEADER_LEN..total])
-        .map_err(|_| ControlError::Derp(ts_derp::Error::TooLarge))?;
+        .map_err(|_| ControlError::Derp(tailfeather::derp::Error::TooLarge))?;
     // Anything past this frame belongs to the next one.
     buffer.copy_within(total..filled, 0);
     Ok((parsed, payload))
@@ -204,21 +208,27 @@ async fn relay(
         .write_all(&out[..len])
         .await
         .map_err(ControlError::Net)?;
-    println!("-> {} bytes addressed to the receiver's node key", payload.len());
+    println!(
+        "-> {} bytes addressed to the receiver's node key",
+        payload.len()
+    );
 
     // The relay also sends keepalives and peer-presence frames, so this reads
     // until the packet arrives rather than assuming it is first.
     let mut buffer = [0u8; 1024];
     let deadline = reactor.clock_millis() + DELIVERY_MS;
     while reactor.clock_millis() < deadline {
-        let read = select(read_frame(&receiver.stream, &mut buffer, 0), reactor.sleep(DELIVERY_MS));
+        let read = select(
+            read_frame(&receiver.stream, &mut buffer, 0),
+            reactor.sleep(DELIVERY_MS),
+        );
         let (frame, body) = match read.await {
             Either::First(Ok(received)) => received,
             Either::First(Err(e)) => return Err(e),
             Either::Second(()) => break,
         };
 
-        if frame.kind != ts_derp::FrameType::RecvPacket {
+        if frame.kind != tailfeather::derp::FrameType::RecvPacket {
             println!("<- {:?} frame, {} bytes", frame.kind, frame.length);
             continue;
         }
@@ -227,13 +237,13 @@ async fn relay(
 
         if packet != payload {
             println!("!! the relayed bytes are not the ones sent");
-            return Err(ControlError::Derp(ts_derp::Error::Malformed));
+            return Err(ControlError::Derp(tailfeather::derp::Error::Malformed));
         }
         // The relay reports who sent it, which version 1 did not, and is what
         // lets a receiver attribute a packet without guessing.
         if source != sender.key {
             println!("!! the relay attributed the packet to the wrong sender");
-            return Err(ControlError::Derp(ts_derp::Error::Malformed));
+            return Err(ControlError::Derp(tailfeather::derp::Error::Malformed));
         }
         println!("relayed intact, attributed correctly");
         evt!(
@@ -244,5 +254,5 @@ async fn relay(
     }
 
     println!("!! the relay did not deliver the packet");
-    Err(ControlError::Derp(ts_derp::Error::Incomplete))
+    Err(ControlError::Derp(tailfeather::derp::Error::Incomplete))
 }

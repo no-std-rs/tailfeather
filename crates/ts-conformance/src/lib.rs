@@ -151,11 +151,7 @@ impl Status {
 
     fn detail(&self) -> &str {
         match self {
-            Self::Pass(d)
-            | Self::External(d)
-            | Self::Fail(d)
-            | Self::Todo(d)
-            | Self::Skip(d) => d,
+            Self::Pass(d) | Self::External(d) | Self::Fail(d) | Self::Todo(d) | Self::Skip(d) => d,
         }
     }
 }
@@ -194,17 +190,16 @@ pub struct Env {
     /// ends, including on the failure path.
     ///
     /// Without it the lab accumulates a node per run until the netmap exceeds
-    /// `ts_netmap::MAX_PEERS` and five checks start failing for reasons
+    /// `tailfeather::netmap::MAX_PEERS` and five checks start failing for reasons
     /// unrelated to the code. See [`runscope`].
     pub scope: runscope::RunScope,
 }
 
 impl Env {
-    /// Build the environment from the lab's state file, falling back to an
-    /// offline environment in which live checks skip and vector-backed checks
-    /// still run.
-    pub fn discover(repo_root: &std::path::Path) -> Self {
-        let mut env = Self {
+    /// A deterministic environment for unit tests and push CI. Stale local lab
+    /// state is deliberately ignored; live measurements are run by the CLI.
+    pub fn offline(repo_root: &std::path::Path) -> Self {
+        Self {
             target: Target::HeadscaleLab,
             control_url: None,
             preauth_key: None,
@@ -213,10 +208,17 @@ impl Env {
             tailscale_version: None,
             harness: harness::Harness::discover(repo_root),
             control_address: None,
-            doctor: doctor::Doctor::load(repo_root),
-            // Enabled below, once we know whether there is a lab to clean up.
+            doctor: None,
             scope: runscope::RunScope::new(false),
-        };
+        }
+    }
+
+    /// Build the environment from the lab's state file, falling back to an
+    /// offline environment in which live checks skip and vector-backed checks
+    /// still run.
+    pub fn discover(repo_root: &std::path::Path) -> Self {
+        let mut env = Self::offline(repo_root);
+        env.doctor = doctor::Doctor::load(repo_root);
 
         if let Ok(text) = std::fs::read_to_string(repo_root.join(".lab/lab.env")) {
             for line in text.lines() {
@@ -284,7 +286,9 @@ impl Env {
 
 /// Split `http://host:port` into the parts the harness takes as arguments.
 fn split_address(url: &str) -> Option<(String, u16)> {
-    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
     let authority = rest.split('/').next()?;
     let (host, port) = authority.rsplit_once(':')?;
     Some((host.to_string(), port.parse().ok()?))
@@ -390,8 +394,7 @@ impl Report {
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Tailscale/Headscale compatibility")
-        ?;
+        writeln!(f, "Tailscale/Headscale compatibility")?;
         writeln!(f, "  measured against: {}", self.target)?;
         if let Some(v) = &self.headscale_version {
             writeln!(f, "  headscale:        {v}")?;
@@ -412,8 +415,7 @@ impl fmt::Display for Report {
         areas.dedup();
 
         for area in areas {
-            let in_area: Vec<&Outcome> =
-                self.outcomes.iter().filter(|o| o.area == area).collect();
+            let in_area: Vec<&Outcome> = self.outcomes.iter().filter(|o| o.area == area).collect();
             let done = in_area.iter().filter(|o| o.status.is_compatible()).count();
             writeln!(f, "{} — {}/{}", area, done, in_area.len())?;
             for outcome in in_area {
@@ -439,7 +441,10 @@ impl fmt::Display for Report {
             self.counted(),
             self.percentage()
         )?;
-        writeln!(f, "PASS* means verified by a named artifact outside this process.")?;
+        writeln!(
+            f,
+            "PASS* means verified by a named artifact outside this process."
+        )?;
         let skipped = self.outcomes.len() - self.counted();
         if skipped > 0 {
             writeln!(f, "{skipped} check(s) skipped and excluded from the score.")?;

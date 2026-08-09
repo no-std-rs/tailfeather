@@ -141,7 +141,9 @@ impl Capture {
             let record = bytes.get(offset..offset + 16).ok_or(Error::Truncated)?;
             let captured = u32_at(&record[8..12]) as usize;
             offset += 16;
-            let frame = bytes.get(offset..offset + captured).ok_or(Error::Truncated)?;
+            let frame = bytes
+                .get(offset..offset + captured)
+                .ok_or(Error::Truncated)?;
             offset += captured;
             packets += 1;
 
@@ -171,7 +173,9 @@ impl Capture {
                     && seq != want
                 {
                     // wrapping_sub keeps this meaningful across the 2^32 wrap.
-                    stream.gaps.push((stream.bytes.len(), seq.wrapping_sub(want)));
+                    stream
+                        .gaps
+                        .push((stream.bytes.len(), seq.wrapping_sub(want)));
                 }
                 stream.bytes.extend_from_slice(&payload);
                 expected = Some(seq.wrapping_add(payload.len() as u32));

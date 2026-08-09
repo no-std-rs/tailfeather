@@ -2,7 +2,7 @@
 //!
 //! For now the gateway is only its own endpoint: it answers pings addressed to
 //! its tunnel address and drops everything else. Ported unchanged in behaviour
-//! from `wg-core`'s `responder` example, where it was tested against a real
+//! from `wirefeather`'s `responder` example, where it was tested against a real
 //! `ping`.
 
 /// The internet checksum of RFC 1071: the one's complement of the one's
