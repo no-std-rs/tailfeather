@@ -11,7 +11,7 @@
 //!
 //! After the `101` the connection is no longer HTTP: the Noise response follows
 //! immediately, then records. Every byte after the blank line belongs to
-//! [`crate::record`], which is why [`ResponseParser`] reports exactly where the
+//! [`crate::record`], which is why [`parse_response`] reports exactly where the
 //! headers ended rather than consuming what it happens to have been given.
 //!
 //! The request lines below are copied from the captured session, header for

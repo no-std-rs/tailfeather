@@ -57,17 +57,17 @@ capture workflow.
 
 | Path | Purpose |
 |---|---|
-| `crates/wg-core` | Sans-I/O WireGuard: handshakes, transport, replay protection, and timers |
-| `crates/ts-keys` | Machine, node, and disco identities plus persistence |
-| `crates/ts-noise` | ts2021 Noise IK transport and controlbase framing |
-| `crates/micro-h2` | Minimal bounded HTTP/2 client and HPACK decoder |
-| `crates/ts-control` | Registration, Hostinfo, and map requests |
-| `crates/ts-netmap` | Streaming full and delta `MapResponse` parser |
-| `crates/ts-disco` | NaCl-boxed path-discovery pings and pongs |
-| `crates/ts-derp` | DERP v2 relay client |
+| [`crates/wg-core`](crates/wg-core/README.md) | Sans-I/O WireGuard: handshakes, transport, replay protection, and timers |
+| [`crates/ts-keys`](crates/ts-keys/README.md) | Machine, node, and disco identities plus persistence |
+| [`crates/ts-noise`](crates/ts-noise/README.md) | ts2021 Noise IK transport and controlbase framing |
+| [`crates/micro-h2`](crates/micro-h2/README.md) | Minimal bounded HTTP/2 client and HPACK decoder |
+| [`crates/ts-control`](crates/ts-control/README.md) | Registration, Hostinfo, and map requests |
+| [`crates/ts-netmap`](crates/ts-netmap/README.md) | Streaming full and delta `MapResponse` parser |
+| [`crates/ts-disco`](crates/ts-disco/README.md) | NaCl-boxed path-discovery pings and pongs |
+| [`crates/ts-derp`](crates/ts-derp/README.md) | DERP v2 relay client |
 | `harness` | No-`std`, no-libc Linux runtime for reference interop |
 | `firmware` | ESP32-C6 WiFi, tunnel, NAT, and forwarding |
-| `tests` / `crates/ts-conformance` | Live lab, captured vectors, baselines, and compatibility matrix |
+| `tests` / [`crates/ts-conformance`](crates/ts-conformance/README.md) | Live lab, captured vectors, baselines, and compatibility matrix |
 
 The protocol crates know nothing about sockets. They operate on caller-owned
 buffers and use `embedded-io-async` or `embedded-nal-async` at the edges, so the

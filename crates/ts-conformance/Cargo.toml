@@ -1,6 +1,7 @@
 [package]
 name        = "ts-conformance"
 description = "Compatibility suite measuring this project against real Tailscale and Headscale"
+readme      = "README.md"
 publish     = false
 
 edition.workspace      = true

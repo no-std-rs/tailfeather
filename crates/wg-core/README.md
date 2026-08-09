@@ -25,29 +25,28 @@ match device.handle_udp(&datagram, Instant(now_millis), &mut rng, &mut out)? {
 
 ## Scope
 
-This is a **responder**: the peer always initiates. There is no rekey logic
-beyond letting a session expire, at which point the peer notices and starts a
-fresh handshake. The cookie/`mac2` denial-of-service mechanism is not
-implemented; a per-device handshake rate limit stands in for it, applied after
-the cheap `mac1` screen so that forged packets cannot spend the budget that
-protects the X25519 work. Replay protection *is* implemented in full, with a
-1024-packet sliding window.
+Both handshake roles are implemented. Peers begin in responder mode;
+`Device::set_initiating` enables active handshakes, retries, and rekeys for a
+mesh peer. Current and previous session slots keep packets in flight alive
+during a rekey.
 
-Implemented: Noise IKpsk2 responder handshake, ChaCha20-Poly1305 transport,
-sliding-window replay protection, passive keepalives, session expiry, and
-current/previous session slots so a rekey does not drop packets still in flight.
+Implemented: Noise IKpsk2 initiator and responder handshakes,
+ChaCha20-Poly1305 transport, a 1024-packet replay window, passive keepalives,
+handshake retries, rekeying, and session expiry.
 
-Not implemented: initiating handshakes, cookies, roaming logic (the caller owns
-endpoints), and anything above IP.
+Not implemented: cookies / `mac2`, roaming policy (the caller owns endpoints),
+socket I/O, or anything above IP. A device-wide handshake rate limit protects
+the expensive X25519 work after the cheap `mac1` screen.
 
 ## Verification
 
 The handshake is checked against the reference implementation, not only against
 itself. `scripts/interop-wireguard.sh` in the parent repository stands up a real
-kernel WireGuard interface in a network namespace, points it at the `responder`
-example, and requires both a completed handshake and a successful in-tunnel
-ping. The in-process tests in `src/tests.rs` then drive the same ladder the
-kernel accepted, so they run in CI without root.
+kernel WireGuard interface in a network namespace, points it at this crate, and
+requires both a completed handshake and a successful in-tunnel ping. Its
+`initiator` mode gives the kernel no endpoint, proving that this crate started
+the accepted handshake. The in-process tests in `src/tests.rs` drive the same
+ladder in CI without root.
 
 One finding worth recording, because it costs an afternoon otherwise: the Noise
 construction string is

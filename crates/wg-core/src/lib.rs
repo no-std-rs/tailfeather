@@ -129,7 +129,7 @@ pub enum Error {
     BufferTooSmall,
     /// The device's peer table is full.
     TooManyPeers,
-    /// A message type this responder-only implementation does not handle.
+    /// A message type this implementation does not handle.
     Unsupported,
 }
 

@@ -9,7 +9,7 @@
 //! the container it is nested in and the key that opened it.
 //!
 //! That makes the unknown case trivial and total. Anything not recognised
-//! becomes [`Context::Ignored`], and every container inside it is ignored too,
+//! becomes `Context::Ignored`, and every container inside it is ignored too,
 //! so whole subtrees — `Hostinfo`, `UserProfiles`, `PacketFilters`, `DNSConfig`
 //! — are skipped for the cost of a push and a pop. A server that adds a field
 //! costs nothing, which matters for a protocol that gains them regularly.

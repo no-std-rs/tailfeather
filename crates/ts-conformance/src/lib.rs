@@ -125,7 +125,7 @@ impl Status {
 
     /// A stable, machine-readable name for this status.
     ///
-    /// Distinct from [`Status::marker`], which is for humans and may be
+    /// Distinct from `Status::marker`, which is for humans and may be
     /// reworded. This one appears in `--json` output and in the committed
     /// baselines under `tests/expectations/`, so changing a string here
     /// invalidates every baseline file.

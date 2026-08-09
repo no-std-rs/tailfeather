@@ -12,7 +12,7 @@
 //! The code is *canonical*: sort the symbols by (length, symbol) and the codes
 //! are consecutive, shifting left at each length boundary. So the codes are
 //! implied by the lengths, and only the lengths are transcribed here — the rest
-//! is derived at compile time by [`tables`]. That removes 257 hand-copied
+//! is derived into lookup tables at compile time. That removes 257 hand-copied
 //! 32-bit constants, each of which could have been wrong in a way that only
 //! showed up on one rare character.
 //!
