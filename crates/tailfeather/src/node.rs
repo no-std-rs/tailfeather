@@ -306,7 +306,7 @@ struct PeerPath {
     direct: Option<SocketAddr>,
     direct_healthy: bool,
     /// Try a newly advertised endpoint once before falling back to DERP. A
-    /// direct-only peer keeps using its only candidate for handshake retries.
+    /// direct-only peer keeps using its only candidate for all traffic.
     direct_probe_pending: bool,
     home_derp: u16,
 }
@@ -593,12 +593,18 @@ impl<const PEERS: usize> Node<PEERS> {
         if probe_direct {
             path.direct_probe_pending = false;
         }
-        if let Some(endpoint) = path.direct.filter(|_| path.direct_healthy || probe_direct) {
+        if let Some(endpoint) = path
+            .direct
+            .filter(|_| path.direct_healthy || probe_direct || path.home_derp == 0)
+        {
             return Ok(NodeAction::DirectTransmit {
                 peer: key,
                 endpoint,
                 packet: SecretBuffer::try_from_slice(packet)?,
             });
+        }
+        if path.home_derp == 0 {
+            return Err(NodeError::InvalidState);
         }
         Ok(NodeAction::Derp(DerpCommand::Send {
             region: path.home_derp,
@@ -625,7 +631,8 @@ impl<const PEERS: usize> Node<PEERS> {
     }
 
     /// Mark a formerly working direct path unhealthy so subsequent packets use
-    /// the peer's home DERP until authenticated direct traffic is seen again.
+    /// the peer's home DERP, when one is advertised, until authenticated direct
+    /// traffic is seen again.
     pub fn mark_direct_unhealthy(&mut self, peer: &NodePublic) -> Result<(), NodeError> {
         let path = self
             .paths
@@ -1162,6 +1169,37 @@ mod tests {
                 Some(NodeAction::DirectTransmit { endpoint: sent, .. }) if sent == endpoint
             ));
         }
+    }
+
+    #[test]
+    fn an_unhealthy_direct_only_peer_keeps_sending_data_directly() {
+        let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+        let generation = match node.poll(0).unwrap().unwrap() {
+            NodeAction::PersistState(state) => state.generation(),
+            _ => unreachable!(),
+        };
+        node.persistence_result(generation, true).unwrap();
+
+        let key = NodePrivate::from_bytes([77; 32]).public();
+        let endpoint: SocketAddr = "192.0.2.10:41641".parse().unwrap();
+        let mut lease = Netmap::<2>::new();
+        let mut peer = Peer::new(7, key);
+        peer.endpoints.push(endpoint).unwrap();
+        lease.peers.upsert(peer).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+
+        node.paths[0].direct_healthy = true;
+        node.mark_direct_unhealthy(&key).unwrap();
+        let id = node.tunnel.peer_by_public_key(key.as_bytes()).unwrap();
+
+        assert!(matches!(
+            node.route_packet(id, &[4]).unwrap(),
+            NodeAction::DirectTransmit { endpoint: sent, .. } if sent == endpoint
+        ));
     }
 
     #[test]
