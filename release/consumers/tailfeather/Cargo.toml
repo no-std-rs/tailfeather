@@ -8,4 +8,4 @@ publish = false
 
 [dependencies]
 embedded-io-async = "0.7"
-tailfeather = "0.1.0"
+tailfeather = "0.0.1"

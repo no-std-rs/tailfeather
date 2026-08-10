@@ -8,4 +8,4 @@ publish = false
 
 [dependencies]
 serde_json = "1"
-tailfeather-testkit = "0.1.0"
+tailfeather-testkit = "0.0.1"

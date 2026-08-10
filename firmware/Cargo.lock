@@ -1449,7 +1449,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "micro-h2"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "heapless 0.9.3",
 ]
@@ -1918,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "tailfeather"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "crypto_box",
  "embedded-io-async 0.7.0",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "wirefeather"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake2",
  "chacha20poly1305",

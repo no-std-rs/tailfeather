@@ -22,7 +22,6 @@ edition      = "2024"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/pawelchcki/tailfeather"
 rust-version = "1.88"
-version      = "0.1.0"
 
 [workspace.dependencies]
 # --- crypto (all no_std, no-alloc) ---
@@ -37,9 +36,9 @@ zeroize           = { version = "1.8", default-features = false }
 heapless = "0.9"
 
 # --- internal ---
-micro-h2 = { path = "crates/micro-h2", version = "0.1.0" }
-tailfeather = { path = "crates/tailfeather", version = "0.1.0" }
-wirefeather = { path = "crates/wirefeather", version = "0.1.0" }
+micro-h2 = { path = "crates/micro-h2", version = "0.0.1" }
+tailfeather = { path = "crates/tailfeather", version = "0.0.1" }
+wirefeather = { path = "crates/wirefeather", version = "0.0.1" }
 
 # ChaCha20-Poly1305 is the throughput bottleneck of the whole tunnel and is
 # unusably slow when compiled without optimization, so optimize dependencies

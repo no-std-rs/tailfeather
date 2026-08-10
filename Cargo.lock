@@ -386,7 +386,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "micro-h2"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "heapless",
 ]
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "tailfeather"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "crypto_box",
  "embedded-io-async",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "tailfeather-testkit"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "ts-conformance"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "fluke-hpack",
@@ -839,7 +839,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "wirefeather"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake2",
  "chacha20poly1305",

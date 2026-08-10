@@ -4,7 +4,7 @@ Allocation-free Rust for a small Tailscale-compatible mesh node, plus an
 ESP32-C6 IPv4 exit gateway and a no-libc Linux interoperability harness.
 
 This is experimental protocol and embedded-systems software. It is not audited,
-not a general-purpose Tailscale client, and not ready to publish as `0.1.0` until
+not a general-purpose Tailscale client, and not claiming `0.1.0` stability until
 the external release gates below have current evidence.
 
 ## Quick start
