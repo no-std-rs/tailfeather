@@ -1,5 +1,9 @@
 # tailfeather in the browser
 
+Open **<https://no-std-rs.github.io/tailfeather/>** to run the browser client.
+Join your tailnet with the Tailscale sign-in link or an auth key, then choose
+a peer and open an SSH terminal.
+
 A web page that joins a Tailscale tailnet **as its own node** and opens tabbed
 SSH terminals to peers. Connections keep their own output and authentication
 prompts when switching tabs. Network details (node keys, endpoints, DERP map,
@@ -87,10 +91,17 @@ Homebrew's `/home/linuxbrew/.linuxbrew/opt/llvm@21/bin/clang`. It installs the
 ```sh
 cd web/client
 ./build.sh                 # -> web/dist (index.html, app.js, pkg/, vendor/)
+./build.sh --static        # static hosting without the Worker-only auth-key link
 cargo test                 # host tests: pure logic, and a relay-only data-plane loopback
 ```
 
 ## Run
+
+The `Publish web client` GitHub Actions workflow builds and tests the static
+client, then deploys `web/dist` to GitHub Pages on every push to `main`.
+It can also be run manually. Assets use relative URLs so the application works
+under the `/tailfeather/` project path. GitHub Pages serves the browser client;
+the Cloudflare Worker described below is optional.
 
 Any static server works if it serves `.wasm` as `application/wasm`:
 
@@ -142,6 +153,8 @@ npm ci && ./build.sh
 npm run test:e2e           # credential-free, against the real Tailscale service
 npm run test:e2e -- --local # browser/UI and local SSH checks without live DERP/control checks
 npm run test:links         # streaming URL and trusted Tailscale origin checks
+npm run test:pages         # after ./build.sh --static: app at /tailfeather/
+npm run test:pages -- https://no-std-rs.github.io/tailfeather/ --live
 ```
 
 `e2e/run.mjs` runs headless Chromium (playwright-core 1.60.0 = Chromium 1223,

@@ -9,6 +9,14 @@
 # into web/client/.tools on first use.
 set -euo pipefail
 
+static=false
+if [[ "${1:-}" == --static && $# == 1 ]]; then
+  static=true
+elif [[ $# != 0 ]]; then
+  echo "usage: $0 [--static]" >&2
+  exit 2
+fi
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dist="$(cd "$here/.." && pwd)/dist"
 cd "$here"
@@ -70,6 +78,16 @@ rm -rf "$dist"
 mkdir -p "$dist/pkg" "$dist/vendor"
 "$bindgen" --target web --no-typescript --out-dir "$dist/pkg" "$wasm"
 cp www/index.html www/*.js www/style.css "$dist/"
+if $static; then
+  # Static hosts have no Worker endpoint for minting one-time auth keys.
+  node --input-type=module - "$dist/index.html" <<'JS'
+import { readFileSync, writeFileSync } from "node:fs";
+const path = process.argv[2];
+const html = readFileSync(path, "utf8");
+writeFileSync(path, html.replace('id="worker-auth"', 'id="worker-auth" hidden'));
+JS
+fi
+touch "$dist/.nojekyll"
 cp node_modules/@xterm/xterm/lib/xterm.mjs node_modules/@xterm/xterm/lib/xterm.mjs.map \
    node_modules/@xterm/xterm/css/xterm.css \
    node_modules/@xterm/addon-fit/lib/addon-fit.mjs node_modules/@xterm/addon-fit/lib/addon-fit.mjs.map \

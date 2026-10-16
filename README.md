@@ -6,6 +6,9 @@ IPv4 exit gateway, and a static no-libc Linux interoperability harness.
 This is experimental protocol and embedded-systems software. It is not audited
 and is not a general-purpose Tailscale client.
 
+Try the [browser SSH client](https://no-std-rs.github.io/tailfeather/), or see
+[`web/README.md`](web/README.md) to build and host it yourself.
+
 ## Build and test
 
 Bazel 9.2.0 is selected by `.bazelversion`; Bzlmod pins Rust 1.95.0, LLVM
