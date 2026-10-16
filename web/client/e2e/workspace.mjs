@@ -17,6 +17,8 @@ export async function workspaceTest(context, url) {
   await waitText(first, "welcome to e2e-sshd");
   const second = await open("tester");
   await waitText(second, "welcome to e2e-sshd");
+  const titleFor = (id) => page.evaluate((id) => `${window.tailfeather.sessions.find((tab) => tab.id === id).label} · tailfeather`, id);
+  check(await page.title() === await titleFor(second), "browser title does not identify the selected SSH tab");
   await send(first, "echo FIRST_ONLY\r");
   await send(second, "echo SECOND_ONLY\r");
   await waitText(first, "FIRST_ONLY\r\n");
@@ -28,6 +30,7 @@ export async function workspaceTest(context, url) {
   }, [first, second]), "connection tabs mixed their output");
 
   await page.evaluate((id) => window.tailfeather.selectTab(id), first);
+  check(await page.title() === await titleFor(first), "browser title did not follow the selected SSH tab");
   await page.click("#drawer-toggle"); // Close the initially visible settings.
   await send(first, "links\r");
   await page.waitForFunction((id) =>
@@ -131,6 +134,23 @@ export async function workspaceTest(context, url) {
     delete document.documentElement.requestFullscreen;
   });
 
+  await page.evaluate(() => {
+    const handle = window.tailfeather.session;
+    const send = handle.send.bind(handle);
+    window.e2ePhysicalKeys = [];
+    window.e2eRestorePhysicalSend = () => { handle.send = send; };
+    handle.send = (bytes) => window.e2ePhysicalKeys.push([...bytes]);
+    window.tailfeather.terminal.focus();
+  });
+  await page.keyboard.press("Control+/");
+  const physicalKeys = await page.evaluate(() => window.e2ePhysicalKeys);
+  check(JSON.stringify(physicalKeys) === "[[31]]", `Ctrl+/ did not send exactly one Ctrl+_: ${JSON.stringify(physicalKeys)}`);
+  await page.evaluate(() => {
+    window.e2eRestorePhysicalSend();
+    delete window.e2eRestorePhysicalSend;
+    delete window.e2ePhysicalKeys;
+  });
+
   if (await page.evaluate(() => matchMedia("(pointer: coarse)").matches)) {
     await page.evaluate(() => {
       const handle = window.tailfeather.session;
@@ -141,11 +161,13 @@ export async function workspaceTest(context, url) {
     });
     await page.locator('[data-key="ctrl"]').tap();
     await page.evaluate(() => window.tailfeather.terminal.input("c"));
+    await page.locator('[data-key="ctrl"]').tap();
+    await page.evaluate(() => window.tailfeather.terminal.input("/"));
     await page.locator('[data-key="esc"]').tap();
     await page.locator('[data-key="tab"]').tap();
     await page.locator('[data-key="up"]').tap();
     const keys = await page.evaluate(() => window.e2eKeyInput);
-    check(JSON.stringify(keys) === JSON.stringify([[3], [27], [9], [27, 91, 65]]),
+    check(JSON.stringify(keys) === JSON.stringify([[3], [31], [27], [9], [27, 91, 65]]),
       `mobile helper keys produced unexpected bytes: ${JSON.stringify(keys)}`);
     await page.evaluate(() => document.activeElement.blur());
     await page.locator('[data-key="keyboard"]').tap();
@@ -191,6 +213,7 @@ export async function workspaceTest(context, url) {
   await page.evaluate((id) => window.tailfeather.closeTab(id), second);
   check(await page.evaluate((id) => window.tailfeather.sessions.length === 1 && window.tailfeather.activeTabId === id, first),
     "closing a tab failed to select the remaining connection");
+  check(await page.title() === await titleFor(first), "closing the selected tab did not restore the remaining tab's title");
 
   // Removing a middle duplicate must not give the next tab an existing name.
   const duplicate = await open("tester");

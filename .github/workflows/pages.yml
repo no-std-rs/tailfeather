@@ -46,6 +46,7 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm run test:links
+          npm run test:labels
           ./build.sh --static
       - name: Test browser client and Pages path
         working-directory: web/client

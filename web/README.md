@@ -131,6 +131,10 @@ node disconnects all its SSH sessions. Connection tabs share one browser node;
 the existing lock still prevents two separate browser tabs from running the
 same saved node identity.
 
+SSH tabs use `user@hostname` from the Tailscale peer map, with a fuller name or
+the IP to distinguish duplicate names. The browser title follows the selected
+SSH tab. Ctrl+/ sends Ctrl+_ to the terminal; on mobile, tap Ctrl and type `/`.
+
 HTTP(S) links are clickable in the terminal. **Links in this terminal** also
 lists the most recent 20 URLs as native links, so they can be tapped on mobile.
 A Tailscale SSH approval URL from a server banner or terminal output gets an
@@ -153,6 +157,7 @@ npm ci && ./build.sh
 npm run test:e2e           # credential-free, against the real Tailscale service
 npm run test:e2e -- --local # browser/UI and local SSH checks without live DERP/control checks
 npm run test:links         # streaming URL and trusted Tailscale origin checks
+npm run test:labels        # hostname selection and duplicate peer names
 npm run test:pages         # after ./build.sh --static: app at /tailfeather/
 npm run test:pages -- https://no-std-rs.github.io/tailfeather/ --live
 ```

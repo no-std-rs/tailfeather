@@ -12,11 +12,13 @@ import init, {
 import { Terminal } from "./vendor/xterm.mjs";
 import { FitAddon } from "./vendor/addon-fit.mjs";
 import { installTerminalLinks } from "./terminal-links.js";
+import { connectionLabel } from "./session-labels.js";
 
 const SETTINGS_KEY = "tailfeather.settings";
 const LOG_LINES = 600;
 const TERMINAL_TEXT_LIMIT = 65536;
 const NOTICE_MS = 12_000;
+const DEFAULT_TITLE = document.title;
 
 // The drawer docks beside the terminal from this width; below it, it covers
 // the workspace. Coarse pointers get the key row and larger targets.
@@ -181,6 +183,7 @@ function renderNetmap(json) {
     return;
   }
   api.netmap = netmap;
+  refreshTabLabels();
   const regions = new Map(netmap.derp.map((region) => [region.id, region]));
   const regionText = (id) => (id ? `${id}${regions.get(id) ? ` ${regions.get(id).code}` : ""}` : "—");
 
@@ -439,16 +442,7 @@ function findTab(id) {
 }
 
 function tabLabel(options) {
-  let where = options.ip;
-  if (options.url) {
-    try {
-      where = new URL(options.url).host;
-    } catch {
-      where = options.url;
-    }
-  }
-  const port = !options.url && options.port !== 22 ? `:${options.port}` : "";
-  const base = `${options.user || "?"}@${where || "?"}${port}`;
+  const base = connectionLabel(options, api.netmap?.peers);
   const used = new Set(tabs.filter((tab) => tab.baseLabel === base).map((tab) => tab.label));
   let suffix = 1;
   let label = base;
@@ -456,10 +450,27 @@ function tabLabel(options) {
   return { base, label };
 }
 
+function refreshTabLabels() {
+  const used = new Set();
+  for (const tab of tabs) {
+    const base = connectionLabel(tab.destination, api.netmap?.peers);
+    let label = tab.baseLabel === base ? tab.label : base;
+    let suffix = 1;
+    while (used.has(label)) label = `${base} (${++suffix})`;
+    used.add(label);
+    tab.baseLabel = base;
+    tab.label = label;
+    tab.name.textContent = label;
+    tab.close.setAttribute("aria-label", `Close ${label}`);
+    updateTab(tab);
+  }
+  updateControls();
+}
+
 // Each tab owns its terminal, decoder, SSH handle, prompt, output copy,
 // close reason and link controller. `disposed` makes every late callback of a
 // removed tab a no-op.
-function createTab({ base, label }) {
+function createTab({ base, label }, { ip, port, user, url }) {
   const id = `ssh-${++tabSeq}`;
 
   const pane = element("div", "pane");
@@ -500,6 +511,7 @@ function createTab({ base, label }) {
     id,
     baseLabel: base,
     label,
+    destination: { ip, port, user, url },
     pane,
     host,
     terminal,
@@ -514,6 +526,8 @@ function createTab({ base, label }) {
     disposed: false,
     item,
     button,
+    name,
+    close,
     state,
   };
   // What scripts see: no options, keys or passwords.
@@ -522,7 +536,7 @@ function createTab({ base, label }) {
       {},
       {
         id: { value: id, enumerable: true },
-        label: { value: label, enumerable: true },
+        label: { get: () => tab.label, enumerable: true },
         terminalText: { get: () => tab.text, enumerable: true },
         session: { get: () => tab.handle, enumerable: true },
         lastClose: { get: () => tab.lastClose, enumerable: true },
@@ -538,6 +552,13 @@ function createTab({ base, label }) {
     },
   });
   terminal.onData((data) => routeInput(tab, applyCtrl(data)));
+  terminal.attachCustomKeyEventHandler((event) => {
+    if (event.type !== "keydown" || !event.ctrlKey || event.altKey || event.metaKey || event.isComposing || event.key !== "/") return true;
+    event.preventDefault();
+    setCtrl(false);
+    routeInput(tab, "\u001f");
+    return false;
+  });
   button.addEventListener("click", () => selectTab(tab, { focus: "auto" }));
   close.addEventListener("click", () => {
     if (tab.handle && !confirm(`Close the connection to ${tab.label}?`)) return;
@@ -549,6 +570,7 @@ function createTab({ base, label }) {
   });
   resizer.observe(host);
   tabs.push(tab);
+  refreshTabLabels();
   return tab;
 }
 
@@ -562,6 +584,7 @@ function updateTab(tab) {
 function updateControls() {
   $("ssh-close").disabled = !activeTab?.handle;
   $("terminal-panel").classList.toggle("has-tabs", tabs.length > 0);
+  document.title = activeTab ? `${activeTab.label} · tailfeather` : DEFAULT_TITLE;
 }
 
 function selectTab(tab, { focus = false } = {}) {
@@ -643,7 +666,7 @@ function openTab(overrides = {}) {
     user: overrides.user ?? $("ssh-user").value.trim(),
     privateKey: overrides.privateKey ?? ($("ssh-key").value.trim() || undefined),
   };
-  const tab = createTab(tabLabel(options));
+  const tab = createTab(tabLabel(options), options);
   // Shown and fitted first, so the PTY starts at the terminal's real size.
   selectTab(tab, { focus: true });
   const live = () => !tab.disposed;

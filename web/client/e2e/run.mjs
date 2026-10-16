@@ -107,6 +107,45 @@ async function pageTest(context, url) {
   await page.close();
 }
 
+async function sessionLabelsTest(context, url) {
+  const { page, problems } = await openPage(context, url, "session-labels");
+  const initialTitle = await page.title();
+  await page.evaluate(() => {
+    const api = window.tailfeather;
+    api.netmap = { peers: [
+      { ip: "100.64.0.1", name: "workstation" },
+      { ip: "100.64.0.2", name: "server" },
+      { ip: "100.64.0.3", name: "server" },
+    ] };
+    // Test label rendering without opening a connection to a real tailnet.
+    api.client = { ssh: (_options, callbacks) => ({
+      resize() {}, send() {}, close() { callbacks.closed("test complete"); },
+    }) };
+    api.ssh({ user: "alice", ip: "100.64.0.1" });
+  });
+  check(await page.locator(".tab-label").textContent() === "alice@workstation", "SSH tab still shows an IP instead of its peer name");
+  check(await page.title() === "alice@workstation · tailfeather", "browser title still shows an IP instead of its peer name");
+  await page.evaluate(() => {
+    const api = window.tailfeather;
+    api.netmap.peers[0].name = "renamed-workstation";
+    api.ssh({ user: "root", ip: "100.64.0.2" });
+  });
+  const labels = await page.locator(".tab-label").allTextContents();
+  check(labels[0] === "alice@renamed-workstation", "an existing tab did not pick up the new peer name");
+  check(labels[1] === "root@server (100.64.0.2)", "a duplicate peer name lost its distinguishing IP");
+  await page.evaluate(() => window.tailfeather.selectTab(window.tailfeather.sessions[0].id));
+  check(await page.title() === "alice@renamed-workstation · tailfeather", "browser title did not follow a renamed SSH tab");
+  await page.evaluate(() => {
+    const api = window.tailfeather;
+    for (const tab of api.sessions) api.closeTab(tab.id);
+    api.client = null;
+  });
+  check(await page.title() === initialTitle, "closing every SSH tab did not restore the idle browser title");
+  check(problems.length === 0, problems.join("\n"));
+  console.log("  SSH and browser tabs use peer names, distinguish duplicates, and update after renaming");
+  await page.close();
+}
+
 async function terminalMatches(page, pattern, what, timeout = 20_000) {
   const deadline = Date.now() + timeout;
   for (;;) {
@@ -278,6 +317,7 @@ const browser = await launch();
 let failed = 0;
 for (const [name, test] of [
   ["page", pageTest],
+  ["session-labels", sessionLabelsTest],
   ["minted-key", mintedKeyTest],
   ["one-tab", oneTabTest],
   ["ssh-local", localSshTest],
