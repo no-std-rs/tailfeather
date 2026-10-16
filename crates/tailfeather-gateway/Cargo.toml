@@ -4,7 +4,13 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-publish = false
+publish = ["crates-io", "runnerless-capture"]
+
+description = "Allocation-free no_std IPv4 routing, NAT, and peer API for Tailfeather gateways"
+repository = "https://github.com/no-std-rs/tailfeather"
+readme = "README.md"
+keywords = ["tailscale", "nat", "no-std", "embedded"]
+categories = ["network-programming", "no-std", "embedded"]
 
 [dependencies]
 wirefeather = { path = "../wirefeather", version = "0.0.1" }

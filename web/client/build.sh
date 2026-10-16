@@ -93,4 +93,5 @@ cp node_modules/@xterm/xterm/lib/xterm.mjs node_modules/@xterm/xterm/lib/xterm.m
    node_modules/@xterm/addon-fit/lib/addon-fit.mjs node_modules/@xterm/addon-fit/lib/addon-fit.mjs.map \
    node_modules/@xterm/addon-web-links/lib/addon-web-links.mjs node_modules/@xterm/addon-web-links/lib/addon-web-links.mjs.map \
    "$dist/vendor/"
+python3 "$here/../../scripts/web-release.py" stamp "$dist"
 echo "built $dist ($(du -h "$dist/pkg/tailfeather_web_bg.wasm" | cut -f1) wasm)"

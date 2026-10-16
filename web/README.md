@@ -98,11 +98,23 @@ cargo test                 # host tests: pure logic, and a relay-only data-plane
 
 ## Run
 
-The `Publish web client` GitHub Actions workflow builds and tests the static
-client, then deploys `web/dist` to GitHub Pages on every push to `main`.
-It can also be run manually. Assets use relative URLs so the application works
-under the `/tailfeather/` project path. GitHub Pages serves the browser client;
-the Cloudflare Worker described below is optional.
+The `Publish web client` workflow builds and tests the static client. The normal
+URL follows published `tailfeather-vX.Y.Z` releases. Tested main builds and
+Runnerless's Tailfeather release PR update
+<https://no-std-rs.github.io/tailfeather/main/> and the downloadable
+[`tailfeather-main` prerelease](https://github.com/no-std-rs/tailfeather/releases/tag/tailfeather-main).
+Preview updates preserve the released site at the normal URL. Until the first
+release containing web assets, that URL retains the first tested bootstrap site.
+
+Each build includes `build.json` with its version, commit, and channel. Stable
+versions match the Tailfeather release; preview versions use
+`X.Y.Z-main.COMMIT`. A release PR is built without publication credentials,
+then the trusted main-branch publisher verifies its App author and current head
+before publication. Other PRs run the browser checks only.
+
+Assets use relative URLs so the application works under both Pages paths.
+GitHub Pages serves the browser client; the Cloudflare Worker described below
+is optional. See [`docs/releases.md`](../docs/releases.md) for retries and setup.
 
 Any static server works if it serves `.wasm` as `application/wasm`:
 

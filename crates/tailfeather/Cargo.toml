@@ -11,6 +11,8 @@ repository = "https://github.com/no-std-rs/tailfeather"
 rust-version = "1.88"
 version = "0.0.1"
 
+publish = ["crates-io", "runnerless-capture"]
+
 [features]
 default = []
 # Retain a bounded display name for each peer (MagicDNS short name, falling
