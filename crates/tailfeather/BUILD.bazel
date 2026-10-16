@@ -21,7 +21,7 @@ rust_library(
     name = "tailfeather_harness",
     srcs = glob(["src/**/*.rs"]),
     aliases = {
-        "//crates/micro-h2:micro_h2_harness": "micro_h2",
+        "@harness_deps//:micro-h2-0.2.0": "micro_h2",
         "//crates/wirefeather:wirefeather_harness": "wirefeather",
     },
     crate_name = "tailfeather",
@@ -29,7 +29,7 @@ rust_library(
     rustc_flags = ["-Cpanic=abort"],
     rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
     deps = [
-        "//crates/micro-h2:micro_h2_harness",
+        "@harness_deps//:micro-h2-0.2.0",
         "//crates/wirefeather:wirefeather_harness",
         "@harness_deps//:crypto_box-0.9.1",
         "@harness_deps//:crypto-bigint-0.5.5",
@@ -51,7 +51,7 @@ rust_library(
     name = "tailfeather_firmware",
     srcs = glob(["src/**/*.rs"]),
     aliases = {
-        "//crates/micro-h2:micro_h2_firmware": "micro_h2",
+        "@firmware_deps//:micro-h2-0.2.0": "micro_h2",
         "//crates/wirefeather:wirefeather_firmware": "wirefeather",
     },
     crate_name = "tailfeather",
@@ -59,7 +59,7 @@ rust_library(
     rustc_flags = ["-Cpanic=abort"],
     rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
     deps = [
-        "//crates/micro-h2:micro_h2_firmware",
+        "@firmware_deps//:micro-h2-0.2.0",
         "//crates/wirefeather:wirefeather_firmware",
         "@firmware_deps//:crypto_box-0.9.1",
         "@firmware_deps//:crypto-bigint-0.5.5",

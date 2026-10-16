@@ -46,6 +46,9 @@ static TCP_TX: StaticCell<[u8; TCP_TX_BUFFER]> = StaticCell::new();
 static TLS_READ: StaticCell<[u8; TLS_READ_BUFFER]> = StaticCell::new();
 static TLS_WRITE: StaticCell<[u8; TLS_WRITE_BUFFER]> = StaticCell::new();
 static H2_READ: StaticCell<[u8; H2_BUFFER]> = StaticCell::new();
+// Keep one HPACK/stream state slot across reconnects so async futures borrow
+// it instead of reserving multiple copies in the control task's static frame.
+static H2_CONNECTION: StaticCell<micro_h2::Connection> = StaticCell::new();
 static RSA_WORKSPACE: StaticCell<RsaWorkspace> = StaticCell::new();
 static RECOVERY: StaticCell<RecoveryConfig> = StaticCell::new();
 static MAP_STREAM: StaticCell<MapStream<PEERS>> = StaticCell::new();
@@ -74,10 +77,11 @@ fn set_trusted_time(unix_seconds: u64) {
 }
 
 type SecureStream<'a> = TlsConnection<'a, TcpSocket<'a>, Suite>;
-type SecureHttp2<'a> = Http2<SecureStream<'a>, &'a mut [u8; H2_BUFFER]>;
+type SecureHttp2<'a> =
+    Http2<SecureStream<'a>, &'a mut [u8; H2_BUFFER], &'a mut micro_h2::Connection>;
 
 #[cfg(feature = "test-insecure-control")]
-type PlainHttp2<'a> = Http2<TcpSocket<'a>>;
+type PlainHttp2<'a> = Http2<TcpSocket<'a>, &'a mut [u8; H2_BUFFER], &'a mut micro_h2::Connection>;
 
 enum Link<'a> {
     Secure(SecureHttp2<'a>),
@@ -497,6 +501,7 @@ struct Buffers {
     tls_read: &'static mut [u8; TLS_READ_BUFFER],
     tls_write: &'static mut [u8; TLS_WRITE_BUFFER],
     h2_read: &'static mut [u8; H2_BUFFER],
+    h2_connection: &'static mut micro_h2::Connection,
     rsa: &'static mut RsaWorkspace,
 }
 
@@ -558,6 +563,7 @@ async fn bootstrap<'a>(
         &mut *buffers.tls_read,
         &mut *buffers.tls_write,
         &mut *buffers.h2_read,
+        &mut *buffers.h2_connection,
         &mut *buffers.rsa,
     )
     .await?;
@@ -818,6 +824,7 @@ async fn recover_session<'a>(
         &mut *buffers.tls_read,
         &mut *buffers.tls_write,
         &mut *buffers.h2_read,
+        &mut *buffers.h2_connection,
         &mut *buffers.rsa,
     )
     .await?;
@@ -1346,6 +1353,7 @@ async fn open_link<'a>(
     tls_read: &'a mut [u8],
     tls_write: &'a mut [u8],
     h2_read: &'a mut [u8; H2_BUFFER],
+    h2_connection: &'a mut micro_h2::Connection,
     rsa: &'a mut RsaWorkspace,
 ) -> Result<Link<'a>, Failure> {
     info!(
@@ -1400,7 +1408,7 @@ async fn open_link<'a>(
             ControlStage::Http2Start.as_str()
         );
         let http2 = noise
-            .into_https2_with_buffer(h2_read)
+            .into_https2_with_storage(h2_read, h2_connection)
             .await
             .map_err(|error| transport_failure(ControlStage::Http2Start, error))?;
         info!(
@@ -1417,13 +1425,24 @@ async fn open_link<'a>(
             )
             .await
             .map_err(|error| plain_transport_failure(ControlStage::NoiseHandshake, error))?;
-            Ok(Link::Plain(noise.into_http2().await.map_err(|error| {
-                plain_transport_failure(ControlStage::Http2Start, error)
-            })?))
+            Ok(Link::Plain(
+                noise
+                    .into_http2_with_storage(h2_read, h2_connection)
+                    .await
+                    .map_err(|error| plain_transport_failure(ControlStage::Http2Start, error))?,
+            ))
         }
         #[cfg(not(feature = "test-insecure-control"))]
         {
-            let _ = (socket, authority, server_key, identity, rng, h2_read);
+            let _ = (
+                socket,
+                authority,
+                server_key,
+                identity,
+                rng,
+                h2_read,
+                h2_connection,
+            );
             Err(Failure::protocol(ControlStage::NoiseHandshake))
         }
     }
@@ -1464,6 +1483,7 @@ pub async fn run(
         tls_read: TLS_READ.init([0; TLS_READ_BUFFER]),
         tls_write: TLS_WRITE.init([0; TLS_WRITE_BUFFER]),
         h2_read: H2_READ.init([0; H2_BUFFER]),
+        h2_connection: H2_CONNECTION.init_with(micro_h2::Connection::new),
         rsa: RSA_WORKSPACE.init_with(RsaWorkspace::new),
     };
     let mut stun_buffers = StunBuffers {

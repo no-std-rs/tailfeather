@@ -61,7 +61,6 @@ before credentials enter the Rust action environment. See
 - `tailfeather`: bounded node, control, netmap, disco, DERP, keys, and state.
 - `tailfeather-gateway`: allocation-free IPv4 routing and fixed-capacity NAT.
 - `wirefeather`: allocation-free WireGuard-compatible handshake and transport.
-- `micro-h2`: bounded client HTTP/2 and HPACK.
 - `tailfeather-testkit`: std-only offline fixture and baseline checks.
 - `ts-conformance`: offline and live compatibility measurement.
 - `harness`: static `_start` executable using Linux syscalls without libc.
@@ -69,6 +68,10 @@ before credentials enter the Rust action environment. See
 - `web`: a browser Tailscale node with an SSH terminal, built on tailfeather
   compiled to WebAssembly (its own Cargo workspace; see
   [`web/README.md`](web/README.md)).
+
+HTTP/2 and HPACK come from the published
+[`micro-h2`](https://github.com/no-std-rs/micro-h2) crate, pinned to `0.2.0`
+in each Cargo workspace. Wirefeather remains part of this repository.
 
 All packages are internal (`publish = false`) and remain at version `0.0.1`;
 the version is retained because protocol host-info embeds it.

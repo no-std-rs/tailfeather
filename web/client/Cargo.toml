@@ -67,6 +67,5 @@ lto           = "fat"
 opt-level     = 3
 
 [patch.crates-io]
-micro-h2 = { path = "../../crates/micro-h2" }
 tailfeather = { path = "../../crates/tailfeather" }
 wirefeather = { path = "../../crates/wirefeather" }
