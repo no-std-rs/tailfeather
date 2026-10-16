@@ -1,0 +1,85 @@
+name: Prepare crate release for Runnerless
+
+on:
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crate-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  package:
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       startsWith(github.head_ref, 'release-please--branches--main--tracks--')) ||
+      ((github.event_name == 'release' || github.event_name == 'workflow_dispatch') &&
+       !github.event.release.prerelease &&
+       (startsWith(github.ref, 'refs/tags/wirefeather-v') ||
+        startsWith(github.ref, 'refs/tags/tailfeather-v') ||
+        startsWith(github.ref, 'refs/tags/tailfeather-gateway-v')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: 1.95.0
+      - name: Align the selected crate and its path dependencies
+        id: identity
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            python3 scripts/prepare-release.py --track "${GITHUB_HEAD_REF##*--tracks--}"
+          else
+            python3 scripts/prepare-release.py --tag "$GITHUB_REF_NAME"
+          fi
+      - name: Test and verify the selected public package
+        env:
+          RELEASE_PACKAGE: ${{ steps.identity.outputs.package }}
+        run: |
+          cargo test --locked --workspace --all-features
+          cargo package --locked --allow-dirty -p "$RELEASE_PACKAGE"
+      - name: Capture the upload against a local registry
+        env:
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          python3 scripts/package-registry-uploads.py "$RELEASE_TAG" dist/registry
+          cd dist/registry
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crate-upload
+          path: dist/registry
+          retention-days: 3
+
+  attach:
+    needs: package
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: crate-upload
+          path: dist/registry
+      - name: Attach verified packages for Runnerless publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.package.outputs.tag }}
+        run: |
+          cd dist/registry
+          sha256sum --check SHA256SUMS
+          gh release upload "$RELEASE_TAG" ./*.cargo-upload SHA256SUMS --repo "$GITHUB_REPOSITORY"

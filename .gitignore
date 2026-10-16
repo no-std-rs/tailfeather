@@ -25,3 +25,6 @@ web/client/node_modules
 web/client/.tools
 web/client/e2e/.profile
 web/dist
+
+# Python release tooling
+__pycache__/

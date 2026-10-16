@@ -73,7 +73,14 @@ HTTP/2 and HPACK come from the published
 [`micro-h2`](https://github.com/no-std-rs/micro-h2) crate, pinned to `0.2.0`
 in each Cargo workspace. Wirefeather remains part of this repository.
 
-All packages are internal (`publish = false`) and remain at version `0.0.1`;
-the version is retained because protocol host-info embeds it.
+Runnerless releases `wirefeather`, `tailfeather`, and `tailfeather-gateway`
+independently, with a version file and changelog in each crate. Testkit,
+conformance tools, and the applications stay internal. See
+[`docs/releases.md`](docs/releases.md) for the release PRs and publishing flow.
+
+The [normal web URL](https://no-std-rs.github.io/tailfeather/) follows stable
+Tailfeather releases; the [main preview](https://no-std-rs.github.io/tailfeather/main/)
+and [`tailfeather-main` prerelease](https://github.com/no-std-rs/tailfeather/releases/tag/tailfeather-main)
+follow tested main builds and Tailfeather release PRs.
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).

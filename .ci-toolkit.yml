@@ -1,0 +1,50 @@
+api_version: ci-toolkit/v1alpha1
+
+releases:
+  uses: toolkit.release-please@v1
+  tracks:
+    wirefeather:
+      component: wirefeather
+      version_file: crates/wirefeather/version.txt
+      changelog_path: crates/wirefeather/CHANGELOG.md
+      include_component_in_tag: true
+      include_v_in_tag: true
+      tag_separator: "-"
+      bump_minor_pre_major: true
+      paths:
+        - "crates/wirefeather/**"
+      exclude:
+        - "crates/wirefeather/version.txt"
+        - "crates/wirefeather/CHANGELOG.md"
+    tailfeather:
+      component: tailfeather
+      version_file: crates/tailfeather/version.txt
+      changelog_path: crates/tailfeather/CHANGELOG.md
+      include_component_in_tag: true
+      include_v_in_tag: true
+      tag_separator: "-"
+      bump_minor_pre_major: true
+      paths:
+        - "crates/tailfeather/**"
+        - "web/**"
+        - "firmware/**"
+        - "harness/**"
+      exclude:
+        - "crates/tailfeather/version.txt"
+        - "crates/tailfeather/CHANGELOG.md"
+    tailfeather-gateway:
+      component: tailfeather-gateway
+      version_file: crates/tailfeather-gateway/version.txt
+      changelog_path: crates/tailfeather-gateway/CHANGELOG.md
+      include_component_in_tag: true
+      include_v_in_tag: true
+      tag_separator: "-"
+      bump_minor_pre_major: true
+      paths:
+        - "crates/tailfeather-gateway/**"
+      exclude:
+        - "crates/tailfeather-gateway/version.txt"
+        - "crates/tailfeather-gateway/CHANGELOG.md"
+      bootstrap:
+        from_tag: tailfeather-v0.0.1
+        at_version: 0.0.1
