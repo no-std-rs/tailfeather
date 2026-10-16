@@ -7,7 +7,7 @@ categories = ["network-programming", "no-std", "embedded"]
 exclude = ["tests/"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pawelchcki/tailfeather"
+repository = "https://github.com/no-std-rs/tailfeather"
 rust-version = "1.88"
 version = "0.0.1"
 
