@@ -78,12 +78,12 @@ try {
   await page.waitForFunction(() => document.body.dataset.ready === "true", null, { timeout: 30_000 });
   console.log(`page ${url} (profile ${profile})`);
 
-  // Only the connect form's "Advanced" section is opened: in a sandboxed
-  // headless Chromium without fonts, rendering the private-key textarea can
-  // crash the renderer, and the key is not needed for Tailscale SSH.
+  // This script specifies a manual destination and account through SSH options.
   await page.evaluate(() => {
     document.querySelector("#connect-form details").open = true;
+    document.querySelector("#ssh-options").open = true;
   });
+  if (!await page.locator("#drawer").isVisible()) await page.click("#drawer-toggle");
   if (process.env.TS_AUTHKEY) {
     // Typed into the password field; never echoed. "Remember" stores it in
     // this profile's localStorage for later runs.

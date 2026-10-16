@@ -24,6 +24,7 @@ import { DIST, serve } from "./serve.mjs";
 import { check, launch, openPage, stripAnsi } from "./browser.mjs";
 import { startLocalSsh } from "./local-ssh.mjs";
 import { workspaceTest } from "./workspace.mjs";
+import { accountsTest } from "./accounts.mjs";
 
 const relay = process.env.RELAY ?? "";
 const derpRegion = process.env.DERP_REGION ?? "waw";
@@ -318,6 +319,8 @@ let failed = 0;
 for (const [name, test] of [
   ["page", pageTest],
   ["session-labels", sessionLabelsTest],
+  ["accounts", accountsTest],
+  ["accounts-mobile", accountsTest],
   ["minted-key", mintedKeyTest],
   ["one-tab", oneTabTest],
   ["ssh-local", localSshTest],
@@ -326,7 +329,7 @@ for (const [name, test] of [
   ["derp", derpTest],
   ["control", controlTest],
 ].filter(([name]) => !process.argv.includes("--local") || !["derp", "control"].includes(name))) {
-  const context = await browser.newContext(name === "workspace-mobile" ?
+  const context = await browser.newContext(name.endsWith("-mobile") ?
     { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true } : {});
   console.log(`${name}${relay ? ` (relay ${relay})` : ""}:`);
   try {

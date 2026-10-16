@@ -31,9 +31,6 @@
         <label class="peer">Peer
           <select id="peer-select" disabled><option value="">No peers yet</option></select>
         </label>
-        <label class="host">Host <input id="ssh-host" value="100.113.109.28" spellcheck="false" autocapitalize="off" autocorrect="off"></label>
-        <label class="user">User <input id="ssh-user" spellcheck="false" placeholder="user" autocapitalize="off" autocorrect="off"></label>
-        <label class="port">Port <input id="ssh-port" value="22" inputmode="numeric"></label>
         <button id="ssh-button" type="submit" disabled>Open terminal</button>
       </form>
 
@@ -114,6 +111,13 @@
 
       <details id="ssh-options">
         <summary>SSH options</summary>
+        <label>Device address
+          <input id="ssh-host" form="ssh-form" placeholder="100.64.0.1" spellcheck="false" autocapitalize="off" autocorrect="off">
+        </label>
+        <label>Account on this device
+          <input id="ssh-user" form="ssh-form" spellcheck="false" placeholder="Asked on first connection" autocapitalize="off" autocorrect="off">
+        </label>
+        <label>Port <input id="ssh-port" form="ssh-form" value="22" inputmode="numeric"></label>
         <label>Private key <small>(optional)</small>
           <textarea id="ssh-key" rows="4" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
         </label>
@@ -148,5 +152,19 @@
     </aside>
   </div>
 </div>
+<dialog id="ssh-account-dialog" aria-labelledby="ssh-account-title">
+  <form method="dialog">
+    <h2 id="ssh-account-title">Account on <span id="ssh-account-host"></span></h2>
+    <p>Tailscale handles authentication. Choose the local account to use on this device.</p>
+    <label>Account
+      <input id="ssh-account-name" required pattern=".*\S.*" autocomplete="username" spellcheck="false" autocapitalize="off" autocorrect="off">
+    </label>
+    <p id="ssh-account-remember"></p>
+    <div class="buttons">
+      <button id="ssh-account-cancel" type="button">Cancel</button>
+      <button value="connect" class="primary">Open terminal</button>
+    </div>
+  </form>
+</dialog>
 </body>
 </html>

@@ -12,7 +12,7 @@ import init, {
 import { Terminal } from "./vendor/xterm.mjs";
 import { FitAddon } from "./vendor/addon-fit.mjs";
 import { installTerminalLinks } from "./terminal-links.js";
-import { connectionLabel } from "./session-labels.js";
+import { connectionLabel, hostLabel } from "./session-labels.js";
 
 const SETTINGS_KEY = "tailfeather.settings";
 const LOG_LINES = 600;
@@ -60,6 +60,16 @@ window.tailfeather = api;
 
 // ---- settings ------------------------------------------------------------
 
+const sshAccounts = new Map();
+
+function accountKey(ip = $("ssh-host").value.trim(), port = Number.parseInt($("ssh-port").value, 10) || 22) {
+  return `${ip}:${port}`;
+}
+
+function syncAccountField() {
+  $("ssh-user").value = sshAccounts.get(accountKey()) || "";
+}
+
 function readSettings() {
   try {
     return JSON.parse(localStorage.getItem(SETTINGS_KEY) || "null");
@@ -79,6 +89,7 @@ function formSettings() {
     sshHost: $("ssh-host").value,
     sshPort: $("ssh-port").value,
     sshUser: $("ssh-user").value,
+    sshAccounts: Object.fromEntries(sshAccounts),
     sshKey: $("ssh-key").value,
   };
 }
@@ -111,6 +122,15 @@ function applySettings(settings) {
   // missing property means "keep the page default".
   for (const [key, id] of Object.entries(fields)) {
     if (typeof settings[key] === "string") $(id).value = settings[key];
+  }
+  if (settings.sshAccounts && typeof settings.sshAccounts === "object") {
+    for (const [key, value] of Object.entries(settings.sshAccounts)) {
+      if (typeof value === "string" && value.trim()) sshAccounts.set(key, value.trim());
+    }
+  }
+  // Retain the account from older profiles for their selected destination.
+  if ($("ssh-host").value.trim() && $("ssh-user").value.trim() && !sshAccounts.has(accountKey())) {
+    sshAccounts.set(accountKey(), $("ssh-user").value.trim());
   }
   if (typeof settings.ephemeral === "boolean") $("ephemeral").checked = settings.ephemeral;
   $("remember").checked = settings.remember !== false;
@@ -220,13 +240,8 @@ function renderNetmap(json) {
       button.addEventListener("click", () => {
         $("ssh-host").value = peer.ip;
         syncPeerPicker();
-        if ($("ssh-user").value) {
-          openFromUi();
-        } else {
-          setDrawer(false, { focus: false });
-          revealSshForm();
-          $("ssh-user").focus();
-        }
+        syncAccountField();
+        openFromUi();
       });
       actions.append(button);
     }
@@ -262,23 +277,24 @@ function renderPeerPicker(peers) {
     .filter((peer) => peer.ip)
     .sort((a, b) => Number(b.online) - Number(a.online) || (a.name || a.ip).localeCompare(b.name || b.ip));
   const key = JSON.stringify(usable.map((peer) => [peer.ip, peer.name, peer.online]));
+  const select = $("peer-select");
+  select.disabled = !api.netmap?.self?.ip;
   if (key === peerPickerKey) return;
   peerPickerKey = key;
-  const select = $("peer-select");
   const options = [new Option(usable.length ? "Pick a peer…" : "No peers", "")];
   for (const peer of usable) {
-    const name = peer.name || peer.ip;
-    options.push(new Option(`${name}${peer.online ? "" : " (offline)"} — ${peer.ip}`, peer.ip));
+    const name = hostLabel(peer.ip, peers);
+    options.push(new Option(`${name}${peer.online ? "" : " (offline)"}`, peer.ip));
   }
+  options.push(new Option("Enter another device address…", "manual"));
   select.replaceChildren(...options);
-  select.disabled = usable.length === 0;
   syncPeerPicker();
 }
 
 function syncPeerPicker() {
   const select = $("peer-select");
   const host = $("ssh-host").value.trim();
-  select.value = [...select.options].some((option) => option.value === host) ? host : "";
+  select.value = [...select.options].some((option) => option.value === host) ? host : host ? "manual" : "";
 }
 
 // ---- connect -------------------------------------------------------------
@@ -335,6 +351,7 @@ async function connect(overrides = {}) {
 }
 
 function stop() {
+  if ($("ssh-account-dialog").open) $("ssh-account-dialog").close("cancel");
   for (const tab of tabs) endSession(tab);
   if (api.client) api.client.stop();
   api.client = null;
@@ -350,6 +367,8 @@ function forget() {
   localStorage.removeItem(SETTINGS_KEY);
   $("auth-key").value = "";
   $("ssh-key").value = "";
+  $("ssh-user").value = "";
+  sshAccounts.clear();
   showAuthUrl("");
   log("Forgot this browser's node identity and saved settings.");
 }
@@ -402,7 +421,7 @@ const idle = (() => {
   pane.append(host);
   $("terminal").append(pane);
   const { terminal, fit } = makeTerminal(host, { cursorBlink: false, disableStdin: true });
-  terminal.write("\x1b[2mNo connection. Pick a peer or type a host and user, then Open terminal.\x1b[0m\r\n");
+  terminal.write("\x1b[2mChoose a peer above, then Open terminal.\x1b[0m\r\n");
   resizer.observe(host);
   return { pane, host, terminal, fit };
 })();
@@ -712,14 +731,43 @@ function openTab(overrides = {}) {
 
 // A form submit, peer button or picker: the user wants the terminal, so the
 // settings drawer and the transient form get out of the way.
-function openFromUi() {
+let choosingAccount = false;
+
+async function requestAccount(ip) {
+  const dialog = $("ssh-account-dialog");
+  $("ssh-account-host").textContent = hostLabel(ip, api.netmap?.peers);
+  $("ssh-account-name").value = "";
+  $("ssh-account-remember").textContent = $("remember").checked
+    ? "This browser will remember your choice for this device."
+    : "Your choice will be kept only until you close or reload this page.";
+  dialog.returnValue = "";
+  const closed = new Promise((resolve) => dialog.addEventListener("close", resolve, { once: true }));
+  dialog.showModal();
+  $("ssh-account-name").focus();
+  await closed;
+  return dialog.returnValue === "connect" ? $("ssh-account-name").value.trim() : null;
+}
+
+async function openFromUi() {
+  if (choosingAccount) return;
   clearNotice();
+  choosingAccount = true;
   try {
-    openTab();
+    const ip = $("ssh-host").value.trim();
+    const port = Number.parseInt($("ssh-port").value, 10) || 22;
+    if (!ip) throw new Error("Choose a peer, or enter its address in SSH options.");
+    const key = accountKey(ip, port);
+    const user = $("ssh-user").value.trim() || sshAccounts.get(key) || await requestAccount(ip);
+    if (!user) return;
+    sshAccounts.set(key, user);
+    if (accountKey() === key) $("ssh-user").value = user;
+    openTab({ ip, port, user });
   } catch (error) {
     log(`SSH: ${error.message ?? error}`);
     showNotice(`SSH: ${error.message ?? error}`);
     return;
+  } finally {
+    choosingAccount = false;
   }
   setDrawer(false, { focus: false });
   $("terminal-panel").classList.remove("form-open");
@@ -940,7 +988,7 @@ function toggleSshForm() {
     panel.classList.remove("form-open");
     return;
   }
-  ($("ssh-user").value ? $("ssh-host") : $("ssh-user")).focus();
+  $("peer-select").focus();
 }
 
 // Follow the visual viewport, which shrinks when a mobile keyboard opens
@@ -972,6 +1020,7 @@ window.addEventListener("resize", scheduleViewport);
 // it closes the drawer or the transient form, or leaves focus mode.
 function onEscape(event) {
   if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
+  if ($("ssh-account-dialog").open) return;
   const target = event.target instanceof Element ? event.target : null;
   if (target?.closest(".xterm")) return;
   const drawer = $("drawer");
@@ -1054,10 +1103,28 @@ function wireLayout(saved) {
   $("peer-select").addEventListener("change", () => {
     const ip = $("peer-select").value;
     if (!ip) return;
+    if (ip === "manual") {
+      setDrawer(true, { focus: false });
+      $("ssh-options").open = true;
+      $("ssh-host").focus();
+      return;
+    }
     $("ssh-host").value = ip;
-    if (!$("ssh-user").value) $("ssh-user").focus();
+    syncAccountField();
   });
-  $("ssh-host").addEventListener("input", syncPeerPicker);
+  $("ssh-host").addEventListener("input", () => {
+    syncPeerPicker();
+    syncAccountField();
+  });
+  $("ssh-account-cancel").addEventListener("click", () => $("ssh-account-dialog").close("cancel"));
+  $("ssh-port").addEventListener("input", syncAccountField);
+  $("ssh-user").addEventListener("input", () => {
+    const key = accountKey();
+    const user = $("ssh-user").value.trim();
+    if (user) sshAccounts.set(key, user);
+    else sshAccounts.delete(key);
+    saveSettings();
+  });
 }
 
 async function main() {

@@ -248,23 +248,36 @@ button svg {
 
 #ssh-form label { margin: 0; font-size: 12px; color: var(--muted); }
 #ssh-form label input, #ssh-form label select { margin-top: 2px; color: var(--text); font-size: 14px; }
-#ssh-form .peer { width: 220px; }
-#ssh-form .host { width: 150px; }
-#ssh-form .user { width: 130px; }
-#ssh-form .port { width: 70px; }
+#ssh-form .peer { flex: 1; min-width: 160px; max-width: 400px; }
 
 /* On a phone: a compact grid; once terminals exist the form folds away
    until "+" asks for it. */
 @media (max-width: 599px) {
   #ssh-form {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 4.5em;
+    grid-template-columns: minmax(0, 1fr) auto;
   }
-  #ssh-form .peer, #ssh-form .host, #ssh-form .user, #ssh-form .port { width: auto; min-width: 0; }
-  #ssh-form .peer, #ssh-button { grid-column: 1 / -1; }
+  #ssh-form .peer { width: auto; min-width: 0; }
   #ssh-form label input, #ssh-form label select { font-size: 16px; }
   #terminal-panel.has-tabs:not(.form-open) #ssh-form { display: none; }
 }
+
+dialog {
+  width: min(400px, calc(100vw - 32px));
+  max-height: calc(var(--vv-height, 100dvh) - 32px);
+  padding: 20px;
+  overflow: auto;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+dialog::backdrop { background: rgb(0 0 0 / 65%); }
+dialog form { display: grid; gap: 12px; }
+dialog h2 { margin: 0; font-size: 18px; overflow-wrap: anywhere; }
+dialog p { margin: 0; color: var(--muted); font-size: 14px; }
+dialog label { margin: 0; }
 
 #notice {
   flex: 0 0 auto;

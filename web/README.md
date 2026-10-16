@@ -2,7 +2,8 @@
 
 Open **<https://no-std-rs.github.io/tailfeather/>** to run the browser client.
 Join your tailnet with the Tailscale sign-in link or an auth key, then choose
-a peer and open an SSH terminal.
+a peer and open an SSH terminal. On first use, choose an account on that device;
+later connections reuse it automatically.
 
 A web page that joins a Tailscale tailnet **as its own node** and opens tabbed
 SSH terminals to peers. Connections keep their own output and authentication
@@ -112,7 +113,11 @@ node web/client/e2e/serve.mjs 8000        # or: cd web/dist && python3 -m http.s
 
 Fill in a hostname, optionally an auth key, and **Connect**. Without a key,
 open the login link that appears. When the netmap shows this node's address,
-pick a peer's **SSH** button (or type host and user) and **Open terminal**.
+pick a peer and **Open terminal**. Tailscale authenticates the connection, while
+the destination still needs a local OS account. The page asks for that account
+once per device and port, and reuses it on later connections. With **Remember**
+on, the choice survives a reload. Change it, or enter a manual address, port,
+or private key, under **SSH options** in the Tailnet drawer.
 
 The deployed site at <https://tailfeather-web.pawelchcki.workers.dev> has a third
 way in: <https://tailfeather-web.pawelchcki.workers.dev/connect>. That path is
