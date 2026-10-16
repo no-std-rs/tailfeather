@@ -83,6 +83,8 @@ pub fn fields(env: &Env) -> Status {
         "PeersChangedPatch",
         "PeersRemoved",
         "DERPMap",
+        "PacketFilters",
+        "DNSConfig",
     ];
     let skipped: Vec<&str> = names
         .iter()
@@ -140,7 +142,7 @@ pub fn delta(env: &Env) -> Status {
         Some(peer) => peer,
         None => return Status::Fail("the patch removed the peer it named".into()),
     };
-    if patched.online {
+    if patched.online() {
         return Status::Fail("the patch did not change the field it named".into());
     }
     if patched.endpoints.is_empty() {
@@ -291,6 +293,85 @@ pub fn derp_map(env: &Env) -> Status {
     ))
 }
 
+/// `DNSConfig`, which the parser skipped wholesale until this check existed.
+///
+/// The interesting field is the one that is *not* retained. `Routes` carries one
+/// member per reverse-DNS zone the tailnet claims — sixty-five in the captured
+/// lab response, and unbounded in principle — so a parser that gave it a table
+/// would have a table sized by the server. The captured payload is fed through
+/// the real parser and the map has to be traversed to completion without a
+/// capacity error, which is only true because it stays an ignored subtree.
+pub fn dns_config(env: &Env) -> Status {
+    let documents = match env.vector("map_response.json") {
+        Ok(value) => value,
+        Err(e) => return Status::Skip(e),
+    };
+    let routes = documents
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|response| response["DNSConfig"]["Routes"].as_object())
+        .map(serde_json::Map::len)
+        .max()
+        .unwrap_or(0);
+    if routes == 0 {
+        return Status::Fail(
+            "the captured map carries no DNSConfig.Routes map, so this check would prove \
+             nothing about the unbounded case it exists for"
+                .into(),
+        );
+    }
+
+    // A capacity error anywhere in the document surfaces here: `from_capture`
+    // propagates the first one the parser reports.
+    let (netmap, _) = match from_capture(env, 64) {
+        Ok(result) => result,
+        Err(e) => return Status::Fail(e),
+    };
+
+    let domains: Vec<&str> = netmap.dns.domains().collect();
+    if !domains.contains(&"lab.internal") {
+        return Status::Fail(format!(
+            "the tailnet's search domain was not parsed; got {domains:?}"
+        ));
+    }
+    let resolvers: Vec<&str> = netmap.dns.resolvers().collect();
+    if !resolvers.contains(&"1.1.1.1") {
+        return Status::Fail(format!(
+            "the tailnet's upstream resolver was not parsed; got {resolvers:?}"
+        ));
+    }
+    if netmap.dns.resolver_addresses().count() != resolvers.len() {
+        return Status::Fail(
+            "a published resolver address did not parse back into an address".into(),
+        );
+    }
+    if !netmap.dns.proxied {
+        return Status::Fail(
+            "the server asked for proxied DNS and the parser reported otherwise, which is \
+             the difference between the peer-API resolver being expected and being a \
+             surprise"
+                .into(),
+        );
+    }
+    if netmap.dns.truncated {
+        return Status::Fail(format!(
+            "the retained DNS configuration overflowed its bounds on a real Headscale \
+             payload: {} domain(s), {} resolver(s)",
+            domains.len(),
+            resolvers.len()
+        ));
+    }
+
+    Status::Pass(format!(
+        "a real Headscale DNSConfig parsed: domains {domains:?}, resolvers {resolvers:?}, \
+         Proxied={}. Its {routes}-entry Routes map was traversed to completion without a \
+         capacity error, because nothing retains it — a table sized by that map would be \
+         a table sized by the server.",
+        netmap.dns.proxied
+    ))
+}
+
 /// One live map run, shared by the checks that need the server rather than the
 /// capture.
 fn with_live(env: &Env, f: impl FnOnce(&Run) -> Status) -> Status {
@@ -322,7 +403,7 @@ fn start(env: &Env) -> Result<Run, String> {
     let port = port.to_string();
 
     // A map request only answers a registered node.
-    let registered = harness.run(&[
+    let registered = harness.register(&[
         "register",
         &state,
         host,

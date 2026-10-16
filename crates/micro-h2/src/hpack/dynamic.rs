@@ -29,7 +29,9 @@ use crate::hpack::static_table::DYNAMIC_BASE;
 /// independent cap. It exists because there is no allocator: `SETTINGS` can
 /// raise the byte budget beyond what a fixed array holds, and running out of
 /// slots must be a bounded eviction rather than a panic.
-pub const MAX_ENTRIES: usize = 64;
+/// A 256-byte advertised table can contain at most eight entries at HPACK's
+/// mandatory 32-byte per-entry overhead.
+pub const MAX_ENTRIES: usize = 8;
 
 /// The longest header name or value the table will store.
 ///

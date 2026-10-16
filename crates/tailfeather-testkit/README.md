@@ -1,6 +1,6 @@
 # tailfeather-testkit
 
-Std-only offline checks for `tailfeather`. The published package embeds only
+Std-only offline checks for `tailfeather`. The internal package embeds only
 synthetic, sanitized fixtures with recorded provenance and hashes.
 
 ```sh

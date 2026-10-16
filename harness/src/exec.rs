@@ -285,7 +285,59 @@ pub async fn select<A: Future, B: Future>(a: A, b: B) -> Either<A::Output, B::Ou
     .await
 }
 
+/// Poll four futures once each, beginning at `first` and wrapping around.
+///
+/// Callers that repeatedly wait on busy sources can advance `first` after each
+/// completion so that one continuously-ready source cannot starve the others.
+pub async fn select4<A: Future, B: Future, C: Future, D: Future>(
+    first: u8,
+    a: A,
+    b: B,
+    c: C,
+    d: D,
+) -> Either4<A::Output, B::Output, C::Output, D::Output> {
+    let mut a = core::pin::pin!(a);
+    let mut b = core::pin::pin!(b);
+    let mut c = core::pin::pin!(c);
+    let mut d = core::pin::pin!(d);
+    core::future::poll_fn(move |cx| {
+        for offset in 0..4 {
+            match (usize::from(first) + offset) % 4 {
+                0 => {
+                    if let Poll::Ready(value) = a.as_mut().poll(cx) {
+                        return Poll::Ready(Either4::First(value));
+                    }
+                }
+                1 => {
+                    if let Poll::Ready(value) = b.as_mut().poll(cx) {
+                        return Poll::Ready(Either4::Second(value));
+                    }
+                }
+                2 => {
+                    if let Poll::Ready(value) = c.as_mut().poll(cx) {
+                        return Poll::Ready(Either4::Third(value));
+                    }
+                }
+                _ => {
+                    if let Poll::Ready(value) = d.as_mut().poll(cx) {
+                        return Poll::Ready(Either4::Fourth(value));
+                    }
+                }
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 pub enum Either<A, B> {
     First(A),
     Second(B),
+}
+
+pub enum Either4<A, B, C, D> {
+    First(A),
+    Second(B),
+    Third(C),
+    Fourth(D),
 }

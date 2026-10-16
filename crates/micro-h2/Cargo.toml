@@ -1,15 +1,15 @@
 [package]
 name        = "micro-h2"
+version     = "0.0.1"
+edition     = "2024"
+rust-version = "1.88"
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/pawelchcki/tailfeather"
+publish     = false
 description = "A minimal no_std, allocation-free HTTP/2 client: framing, HPACK, and a bounded number of streams"
 readme      = "README.md"
 keywords    = ["http2", "hpack", "no-std", "embedded", "sans-io"]
 categories  = ["network-programming", "no-std", "web-programming::http-client"]
 
-edition.workspace      = true
-license.workspace      = true
-repository.workspace   = true
-rust-version.workspace = true
-version                = "0.0.1"
-
 [dependencies]
-heapless.workspace = true
+heapless = "0.9"

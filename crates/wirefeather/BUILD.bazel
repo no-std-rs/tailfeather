@@ -1,0 +1,95 @@
+load("@tailfeather_root_deps//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc", "rust_doc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(name = "rust_sources", srcs = glob(["src/**/*.rs"]))
+
+rust_library(
+    name = "wirefeather",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "wirefeather",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "wirefeather_harness",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "wirefeather",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort"],
+    deps = [
+        "@harness_deps//:blake2-0.10.6",
+        "@harness_deps//:chacha20poly1305-0.10.1",
+        "@harness_deps//:heapless-0.9.3",
+        "@harness_deps//:hmac-0.12.1",
+        "@harness_deps//:subtle-2.6.1",
+        "@harness_deps//:x25519-dalek-2.0.1",
+        "@harness_deps//:zeroize-1.9.0",
+    ],
+)
+
+rust_library(
+    name = "wirefeather_firmware",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "wirefeather",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort"],
+    deps = [
+        "@firmware_deps//:blake2-0.10.6",
+        "@firmware_deps//:chacha20poly1305-0.10.1",
+        "@firmware_deps//:heapless-0.9.3",
+        "@firmware_deps//:hmac-0.12.1",
+        "@firmware_deps//:subtle-2.6.1",
+        "@firmware_deps//:x25519-dalek-2.0.1",
+        "@firmware_deps//:zeroize-1.9.0",
+    ],
+)
+
+rust_test(
+    name = "unit_test",
+    aliases = aliases(),
+    crate = ":wirefeather",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_binary(
+    name = "responder",
+    srcs = ["examples/responder.rs"],
+    crate_name = "responder",
+    crate_root = "examples/responder.rs",
+    edition = "2024",
+    deps = [
+        ":wirefeather",
+        "@tailfeather_root_deps//:hex-0.4.3",
+    ],
+)
+
+rust_binary(
+    name = "responder_static",
+    srcs = ["examples/responder.rs"],
+    crate_name = "responder_static",
+    crate_root = "examples/responder.rs",
+    edition = "2024",
+    platform = "//platforms:x86_64_linux_musl",
+    deps = [
+        ":wirefeather",
+        "@tailfeather_root_deps//:hex-0.4.3",
+    ],
+)
+
+rust_doc_test(
+    name = "doc_test",
+    crate = ":wirefeather",
+)
+
+rust_doc(
+    name = "docs",
+    crate = ":wirefeather",
+    rustdoc_flags = ["-Dwarnings"],
+)

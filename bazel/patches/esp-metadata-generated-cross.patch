@@ -1,0 +1,19 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e966073..5a7c6f2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -98,6 +98,6 @@
+ ```
+ #![cfg_attr(docsrs, feature(doc_cfg))]
+-#![cfg_attr(not(feature = "build-script"), no_std)]
++#![cfg_attr(target_os = "none", no_std)]
+ #[cfg(feature = "esp32")]
+ include!("_generated_esp32.rs");
+ #[cfg(feature = "esp32c2")]
+@@ -117,5 +117,5 @@ include!("_generated_esp32h2.rs");
+ include!("_generated_esp32s2.rs");
+ #[cfg(feature = "esp32s3")]
+ include!("_generated_esp32s3.rs");
+-#[cfg(any(feature = "build-script", docsrs))]
++#[cfg(any(all(feature = "build-script", not(target_os = "none")), docsrs))]
+ include!("_build_script_utils.rs");

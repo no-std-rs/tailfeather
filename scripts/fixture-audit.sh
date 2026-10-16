@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FIXTURES="$ROOT/crates/tailfeather-testkit/fixtures"
+PYTHON="$1"
+FIXTURES="$(dirname "$2")"
 
-python3 - "$FIXTURES" <<'PY'
+"$PYTHON" - "$FIXTURES" <<'PY'
 import hashlib, json, pathlib, sys
 
 root = pathlib.Path(sys.argv[1])
@@ -22,5 +22,5 @@ for item in manifest["fixtures"]:
     listed.add(item["path"])
 embedded = {p.name for p in root.iterdir() if p.is_file() and p.name != "provenance.json"}
 assert embedded == listed, f"manifest mismatch: embedded={sorted(embedded)}, listed={sorted(listed)}"
-print(f"PASS: {len(listed)} published fixture(s) have complete provenance and matching SHA-256")
+print(f"PASS: {len(listed)} committed fixture(s) have complete provenance and matching SHA-256")
 PY

@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tailfeather-web",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "assets": {
+    "directory": "../dist",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "vars": {
+    "CONTROL_HOSTS": "controlplane.tailscale.com",
+    "DERP_HOST_PATTERN": "^derp\\d+[a-z]?\\.tailscale\\.com$",
+    "ALLOWED_ORIGINS": "",
+    "ACCESS_TEAM_DOMAIN": "chcki.cloudflareaccess.com",
+    "ACCESS_AUD": "6efea74a63edc2da5c577fdb2461e8b716bff2f9f0376432b74f8d92ecda8f10",
+    "AUTHKEY_OWNER_EMAIL": "pawelchcki@gmail.com"
+  }
+}

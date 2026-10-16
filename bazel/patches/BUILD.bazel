@@ -1,0 +1,9 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "esp-hal-esp32c6-ram-length.patch",
+    "esp-metadata-generated-cross.patch",
+    "llvm-musl-mirror.patch",
+    "rules_rs-build-script-link-deps.patch",
+    "rules_rs-zlib-ubuntu-snapshot.patch",
+])

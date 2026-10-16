@@ -126,6 +126,19 @@ impl Options {
 
 /// Walk up from the executable or the current directory to the repository root.
 fn repo_root() -> PathBuf {
+    if let Ok(path) = std::env::var("TS_CONFORMANCE_VECTORS") {
+        let path = PathBuf::from(path);
+        let vectors = if path.is_file() {
+            path.parent().unwrap()
+        } else {
+            path.as_path()
+        };
+        return vectors
+            .parent()
+            .and_then(|p| p.parent())
+            .map(PathBuf::from)
+            .unwrap_or_default();
+    }
     if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
         // crates/ts-conformance -> repository root
         return PathBuf::from(dir)
@@ -148,5 +161,14 @@ fn repo_root() -> PathBuf {
 
 /// Where the committed baselines live, for the error message and for tests.
 pub fn expectations_dir(repo_root: &Path) -> PathBuf {
-    repo_root.join("tests/expectations")
+    std::env::var_os("TS_CONFORMANCE_EXPECTATIONS")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_file() {
+                path.parent().unwrap().to_path_buf()
+            } else {
+                path
+            }
+        })
+        .unwrap_or_else(|| repo_root.join("tests/expectations"))
 }

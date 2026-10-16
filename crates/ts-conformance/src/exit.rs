@@ -11,8 +11,8 @@ use std::sync::OnceLock;
 use crate::harness::NOT_BUILT;
 use crate::{Env, Status, Target, headscale};
 
-/// Both default routes. A node offering only the IPv4 one is not an exit node
-/// as far as a client is concerned.
+/// Both routes are required for client-side exit-node discovery. The current
+/// data plane forwards IPv4 and intentionally blackholes IPv6 until implemented.
 const DEFAULT_ROUTES: [&str; 2] = ["0.0.0.0/0", "::/0"];
 
 struct Session {
@@ -43,7 +43,7 @@ fn start(env: &Env) -> Result<Session, String> {
     let state = state.to_string_lossy().into_owned();
     let port = port.to_string();
 
-    let run = harness.run(&[
+    let run = harness.register(&[
         "register",
         &state,
         host,
@@ -121,8 +121,8 @@ pub fn advertise(env: &Env) -> Status {
         "the no_std harness advertised {} in Hostinfo.RoutableIPs and the server listed \
          both as available on node {} while approving neither — a node cannot make \
          itself an exit. After `headscale nodes approve-routes` it serves both. The \
-         data plane behind this is already verified: exit.forward.udp and \
-         exit.forward.tcp on real hardware.",
+         IPv4 data plane is verified in this report by exit.forward.udp and \
+         exit.forward.tcp in the allocation-free namespace topology.",
         DEFAULT_ROUTES.join(" and "),
         session.node_id
     ))

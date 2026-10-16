@@ -9,8 +9,8 @@
 //! a vague intention.
 
 use crate::{
-    Area, Check, Env, Status, Target, derp, disco, exit, http, multipeer, netmap, register, tls,
-    ts2021,
+    Area, Check, Env, Status, Target, derp, disco, exit, http, multipeer, netmap, nostd_interop,
+    register, tls, ts2021,
 };
 
 pub fn all() -> &'static [Check] {
@@ -38,47 +38,31 @@ static CHECKS: &[Check] = &[
         id: "wg.handshake.responder",
         area: Area::DataPlane,
         description: "completes a WireGuard handshake as responder",
-        run: |_| {
-            Status::External(
-                "scripts/interop-wireguard.sh — real kernel WireGuard initiates and succeeds"
-                    .into(),
-            )
-        },
+        run: nostd_interop::responder,
     },
     Check {
         id: "wg.transport.roundtrip",
         area: Area::DataPlane,
         description: "encrypts and decrypts transport data",
-        run: |_| Status::External("scripts/interop-wireguard.sh — in-tunnel ping answered".into()),
+        run: nostd_interop::transport,
     },
     Check {
         id: "wg.replay",
         area: Area::DataPlane,
         description: "rejects replayed and out-of-window counters",
-        run: |_| {
-            Status::External("wirefeather unit tests, ladder verified against the kernel".into())
-        },
+        run: nostd_interop::replay,
     },
     Check {
         id: "wg.rekey",
         area: Area::DataPlane,
         description: "survives rekeying without dropping traffic",
-        run: |_| {
-            Status::External("hardware soak: 300/300 packets across two rekeys at 120 s".into())
-        },
+        run: nostd_interop::rekey,
     },
     Check {
         id: "wg.handshake.initiator",
         area: Area::DataPlane,
         description: "initiates a WireGuard handshake",
-        run: |_| {
-            Status::External(
-                "scripts/interop-wireguard.sh initiator — kernel WireGuard, configured with no \
-                 endpoint so it cannot start one itself, accepted an initiation from wirefeather and \
-                 answered the in-tunnel ping"
-                    .into(),
-            )
-        },
+        run: nostd_interop::initiator,
     },
     Check {
         id: "wg.multipeer",
@@ -280,6 +264,18 @@ static CHECKS: &[Check] = &[
         description: "relays through DERP when no direct path exists",
         run: derp::relay,
     },
+    Check {
+        id: "derp.keepalive",
+        area: Area::Derp,
+        description: "holds a relay session open across the server's idle keepalive",
+        run: derp::keepalive,
+    },
+    Check {
+        id: "derp.reconnect",
+        area: Area::Derp,
+        description: "reconnects under the same node key after the session drops",
+        run: derp::reconnect,
+    },
     // ------------------------------------------------------------------ disco
     Check {
         id: "disco.pong",
@@ -299,26 +295,43 @@ static CHECKS: &[Check] = &[
         description: "reports its own endpoints to the control plane",
         run: disco::endpoints,
     },
+    // -------------------------------------------------------------------- DNS
+    Check {
+        id: "dns.config.parse",
+        area: Area::Dns,
+        description: "reads the tailnet's DNSConfig, including its unbounded Routes map",
+        run: netmap::dns_config,
+    },
+    Check {
+        id: "dns.peerapi.doh",
+        area: Area::Dns,
+        description: "answers RFC 8484 DoH on the peer API, over a real tunnel",
+        run: nostd_interop::doh,
+    },
+    Check {
+        id: "dns.peerapi.acl",
+        area: Area::Dns,
+        description: "resolves through an RFC1918 resolver under an autogroup:internet grant",
+        run: nostd_interop::acl,
+    },
+    Check {
+        id: "dns.peerapi.concurrency",
+        area: Area::Dns,
+        description: "answers a full set of concurrent DoH clients without dropping one",
+        run: nostd_interop::concurrency,
+    },
     // -------------------------------------------------------------- exit node
     Check {
         id: "exit.forward.udp",
         area: Area::ExitNode,
         description: "forwards UDP out of the uplink from its own address",
-        run: |_| {
-            Status::External(
-                "scripts/bench-exit.sh — echo server observes the device's own address".into(),
-            )
-        },
+        run: nostd_interop::udp,
     },
     Check {
         id: "exit.forward.tcp",
         area: Area::ExitNode,
         description: "forwards TCP, including TLS, out of the uplink",
-        run: |_| {
-            Status::External(
-                "scripts/test-http.sh — HTTP and HTTPS complete through the device".into(),
-            )
-        },
+        run: nostd_interop::tcp,
     },
     Check {
         id: "exit.advertise",

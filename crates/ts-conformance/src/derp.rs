@@ -41,7 +41,7 @@ fn start(env: &Env) -> Result<Run, String> {
     for name in ["derp-a", "derp-b"] {
         let state = harness.scratch(name);
         let state = state.to_string_lossy().into_owned();
-        let run = harness.run(&[
+        let run = harness.register(&[
             "register",
             &state,
             host,
@@ -98,4 +98,77 @@ pub fn relay(env: &Env) -> Status {
          key against its node list — an unregistered one is refused outright.",
         relayed["bytes"].as_u64().unwrap_or(0)
     ))
+}
+
+/// The session survives an idle period longer than the server's keepalive.
+///
+/// What is asserted is survival and a second delivery, not that a `Ping` was
+/// observed. Headscale's embedded relay sends `KeepAlive` on an idle connection
+/// and a server-initiated `Ping` is not guaranteed, so requiring one would fail
+/// for a reason that says nothing about this client. The frames that did arrive
+/// are reported instead, which is what makes the length of the hold reviewable.
+pub fn keepalive(env: &Env) -> Status {
+    let run = match session(env) {
+        Ok(run) => run,
+        Err(reason) => return Status::Skip(reason.clone()),
+    };
+
+    let Some(held) = run.event("held") else {
+        return Status::Fail(format!(
+            "the session did not survive the idle hold: {}",
+            run.tail()
+        ));
+    };
+    if held["relayed"] != Value::Bool(true) {
+        return Status::Fail(
+            "the session outlived the hold but no longer relays, so the connection is open \
+             and useless"
+                .into(),
+        );
+    }
+    let seconds = held["seconds"].as_u64().unwrap_or(0);
+    if seconds == 0 {
+        return Status::Fail("the hold reported no elapsed time".into());
+    }
+
+    Status::Pass(format!(
+        "a registered DERP session sat idle for {seconds}s — past Headscale's keepalive \
+         interval — answering {} ping(s) and receiving {} keepalive(s) and {} other \
+         frame(s), then relayed a second packet successfully. The delivery is the claim; \
+         the counts say how much idling was actually crossed, since a silent server would \
+         make survival true but prove less.",
+        held["pings"].as_u64().unwrap_or(0),
+        held["keepalives"].as_u64().unwrap_or(0),
+        held["other"].as_u64().unwrap_or(0),
+    ))
+}
+
+/// A dropped connection can be replaced under the same registered node key.
+pub fn reconnect(env: &Env) -> Status {
+    let run = match session(env) {
+        Ok(run) => run,
+        Err(reason) => return Status::Skip(reason.clone()),
+    };
+
+    let Some(reconnected) = run.event("reconnected") else {
+        return Status::Fail(format!(
+            "the relay did not carry traffic after the receiver reconnected: {}",
+            run.tail()
+        ));
+    };
+    if reconnected["relayed"] != Value::Bool(true) {
+        return Status::Fail(
+            "the receiver reconnected but nothing was relayed to it afterwards".into(),
+        );
+    }
+
+    Status::Pass(
+        "the receiver's TCP connection was dropped and dialed again under the same \
+         registered node key, and the relay delivered to it. Two things could have failed \
+         and did not: the server re-admitting a key whose sealed hello it has already \
+         seen, and its key-to-connection mapping releasing the dead session rather than \
+         holding the key against a socket that no longer exists — which is what every \
+         real network blip asks of it."
+            .into(),
+    )
 }

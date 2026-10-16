@@ -1,16 +1,13 @@
-# Root workspace: the portable, independently publishable library crates.
+# Root workspace dependency metadata for the portable library crates.
 #
-# `firmware/` and `harness/` are deliberately NOT members. Each needs its own
-# `.cargo/config.toml` pinning a different compilation target
-# (riscv32imac-unknown-none-elf and x86_64-unknown-linux-none respectively), and
-# cargo applies target configuration per-invocation-directory across a whole
-# workspace. Keeping them as sibling workspaces that path-depend on `crates/*`
-# is what lets plain `cargo test` here run on the host.
+# `firmware/` and `harness/` are deliberately NOT members. Bazel resolves them
+# as independent Cargo metadata closures for their distinct target platforms.
 [workspace]
-exclude  = ["firmware", "harness"]
+exclude  = ["firmware", "harness", "web"]
 members  = [
   "crates/micro-h2",
   "crates/tailfeather",
+  "crates/tailfeather-gateway",
   "crates/tailfeather-testkit",
   "crates/ts-conformance",
   "crates/wirefeather",
@@ -29,7 +26,7 @@ blake2            = { version = "0.10", default-features = false }
 chacha20poly1305  = { version = "0.10", default-features = false }
 hmac              = { version = "0.12", default-features = false }
 subtle            = { version = "2.6", default-features = false }
-x25519-dalek      = { version = "2", default-features = false, features = ["static_secrets", "precomputed-tables", "zeroize"] }
+x25519-dalek      = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 zeroize           = { version = "1.8", default-features = false }
 
 # --- structure ---
@@ -38,6 +35,7 @@ heapless = "0.9"
 # --- internal ---
 micro-h2 = { path = "crates/micro-h2", version = "0.0.1" }
 tailfeather = { path = "crates/tailfeather", version = "0.0.1" }
+tailfeather-gateway = { path = "crates/tailfeather-gateway", version = "0.0.1" }
 wirefeather = { path = "crates/wirefeather", version = "0.0.1" }
 
 # ChaCha20-Poly1305 is the throughput bottleneck of the whole tunnel and is
@@ -50,3 +48,8 @@ opt-level = 3
 codegen-units = 1
 lto           = "fat"
 opt-level     = 3
+
+[patch.crates-io]
+micro-h2 = { path = "crates/micro-h2" }
+tailfeather = { path = "crates/tailfeather" }
+wirefeather = { path = "crates/wirefeather" }

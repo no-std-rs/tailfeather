@@ -1,0 +1,127 @@
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load(":deps.bzl", "third_party_deps")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.lock", "Cargo.toml"])
+
+filegroup(name = "rust_sources", srcs = glob(["src/**/*.rs"]))
+
+filegroup(name = "firmware_main_source", srcs = ["src/main.rs"])
+
+rust_binary(
+    name = "esp_gateway_firmware",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//crates/micro-h2:micro_h2_firmware": "micro_h2",
+        "//crates/tailfeather:tailfeather_firmware": "tailfeather",
+        "//crates/tailfeather-gateway:tailfeather_gateway_firmware": "tailfeather_gateway",
+        "//crates/wirefeather:wirefeather_firmware": "wirefeather",
+    },
+    crate_name = "esp_gateway_firmware",
+    edition = "2024",
+    platform = "//platforms:esp32c6",
+    rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
+    rustc_flags = [
+        "-Cforce-frame-pointers",
+        "-Cpanic=abort",
+        "-Clink-arg=-Tlinkall.x",
+    ],
+    deps = third_party_deps() + [
+        "//crates/micro-h2:micro_h2_firmware",
+        "//crates/tailfeather:tailfeather_firmware",
+        "//crates/tailfeather-gateway:tailfeather_gateway_firmware",
+        "//crates/wirefeather:wirefeather_firmware",
+    ],
+)
+
+rust_binary(
+    name = "esp_gateway_firmware_lab",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//crates/micro-h2:micro_h2_firmware": "micro_h2",
+        "//crates/tailfeather:tailfeather_firmware": "tailfeather",
+        "//crates/tailfeather-gateway:tailfeather_gateway_firmware": "tailfeather_gateway",
+        "//crates/wirefeather:wirefeather_firmware": "wirefeather",
+    },
+    crate_features = ["test-insecure-control"],
+    crate_name = "esp_gateway_firmware_lab",
+    edition = "2024",
+    platform = "//platforms:esp32c6",
+    rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
+    rustc_flags = [
+        "-Cforce-frame-pointers",
+        "-Cpanic=abort",
+        "-Clink-arg=-Tlinkall.x",
+    ],
+    tags = ["manual"],
+    deps = third_party_deps() + [
+        "//crates/micro-h2:micro_h2_firmware",
+        "//crates/tailfeather:tailfeather_firmware",
+        "//crates/tailfeather-gateway:tailfeather_gateway_firmware",
+        "//crates/wirefeather:wirefeather_firmware",
+    ],
+)
+
+# Clippy actions do not inherit the Rustc action environment. This equivalent
+# analysis target supplies inert values without changing the device artifact,
+# whose values still come exclusively from the selected Bazel configuration.
+rust_binary(
+    name = "esp_gateway_firmware_lint",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//crates/micro-h2:micro_h2_firmware": "micro_h2",
+        "//crates/tailfeather:tailfeather_firmware": "tailfeather",
+        "//crates/tailfeather-gateway:tailfeather_gateway_firmware": "tailfeather_gateway",
+        "//crates/wirefeather:wirefeather_firmware": "wirefeather",
+    },
+    crate_name = "esp_gateway_firmware",
+    edition = "2024",
+    platform = "//platforms:esp32c6",
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.0.1",
+        "TS_AUTH_KEY": "tskey-auth-buildbuddy-ci-placeholder",
+        "TS_BUILD_TIME_FLOOR": "1767225600",
+        "TS_CONTROL_CA_DER": "/dev/null",
+        "TS_CONTROL_URL": "https://controlplane.tailscale.com",
+        "TS_CONTROL_CA_DER_HEX": "",
+        "TS_HOSTNAME": "esp-gateway-ci",
+        "WIFI_PASSWORD": "buildbuddy-ci-placeholder",
+        "WIFI_SSID": "buildbuddy-ci-placeholder",
+    },
+    rustc_flags = [
+        "-Cforce-frame-pointers",
+        "-Cpanic=abort",
+        "-Clink-arg=-Tlinkall.x",
+    ],
+    tags = ["manual"],
+    deps = third_party_deps() + [
+        "//crates/micro-h2:micro_h2_firmware",
+        "//crates/tailfeather:tailfeather_firmware",
+        "//crates/tailfeather-gateway:tailfeather_gateway_firmware",
+        "//crates/wirefeather:wirefeather_firmware",
+    ],
+)
+
+alias(
+    name = "ci_image",
+    actual = ":esp_gateway_firmware",
+)
+
+alias(
+    name = "lab_image",
+    actual = ":esp_gateway_firmware_lab",
+)
+
+sh_binary(
+    name = "flash",
+    srcs = ["//scripts:flash-bazel.sh"],
+    tags = [
+        "local",
+        "manual",
+        "no-cache",
+        "no-remote",
+        "no-sandbox",
+    ],
+)

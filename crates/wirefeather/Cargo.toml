@@ -1,24 +1,24 @@
 [package]
 name        = "wirefeather"
+version     = "0.0.1"
+edition     = "2024"
+rust-version = "1.88"
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/pawelchcki/tailfeather"
+publish     = false
 description = "Sans-io, no_std, allocation-free WireGuard protocol core"
 readme      = "README.md"
 keywords    = ["wireguard", "vpn", "no-std", "embedded", "sans-io"]
 categories  = ["network-programming", "no-std", "cryptography"]
 
-edition.workspace      = true
-license.workspace      = true
-repository.workspace   = true
-rust-version.workspace = true
-version                = "0.0.1"
-
 [dependencies]
-blake2.workspace           = true
-chacha20poly1305.workspace = true
-heapless.workspace         = true
-hmac.workspace             = true
-subtle.workspace           = true
-x25519-dalek.workspace     = true
-zeroize.workspace          = true
+blake2            = { version = "0.10", default-features = false }
+chacha20poly1305  = { version = "0.10", default-features = false }
+heapless          = "0.9"
+hmac              = { version = "0.12", default-features = false }
+subtle            = { version = "2.6", default-features = false }
+x25519-dalek      = { version = "2", default-features = false, features = ["static_secrets", "precomputed-tables", "zeroize"] }
+zeroize           = { version = "1.8", default-features = false }
 
 [dev-dependencies]
 hex = "0.4"

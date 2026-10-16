@@ -23,9 +23,55 @@
 
 use core::arch::asm;
 
-use rustix::fd::BorrowedFd;
+use rustix::fd::{BorrowedFd, RawFd};
+use rustix::io::Errno;
 
 pub const STDOUT: i32 = 1;
+
+/// Mark placed on complete IPv4 packets emitted by the gateway's raw sockets.
+/// The namespace harness uses it to distinguish those packets from TCP resets
+/// and ICMP errors synthesized by the local kernel.
+pub const GATEWAY_MARK: u32 = 0x7466;
+
+/// Configure a raw IPv4 socket to accept caller-supplied IP headers and mark
+/// every packet it emits.
+///
+/// `rustix` intentionally does not expose these Linux-specific socket options.
+/// Keeping the syscall and pointer handling here leaves the socket abstraction
+/// and every packet-processing caller safe Rust.
+pub fn configure_raw_ipv4(fd: RawFd) -> Result<(), Errno> {
+    const SOL_IP: i32 = 0;
+    const IP_HDRINCL: i32 = 3;
+    const SOL_SOCKET: i32 = 1;
+    const SO_MARK: i32 = 36;
+
+    setsockopt_int(fd, SOL_IP, IP_HDRINCL, 1)?;
+    setsockopt_int(fd, SOL_SOCKET, SO_MARK, GATEWAY_MARK as i32)
+}
+
+fn setsockopt_int(fd: RawFd, level: i32, option: i32, value: i32) -> Result<(), Errno> {
+    const SYS_SETSOCKOPT: usize = 54;
+    let mut result = SYS_SETSOCKOPT as isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") result,
+            in("rdi") fd as usize,
+            in("rsi") level as usize,
+            in("rdx") option as usize,
+            in("r10") (&value as *const i32) as usize,
+            in("r8") core::mem::size_of::<i32>(),
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    if result < 0 {
+        Err(Errno::from_raw_os_error((-result) as i32))
+    } else {
+        Ok(())
+    }
+}
 
 /// End the process.
 ///

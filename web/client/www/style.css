@@ -1,0 +1,564 @@
+:root {
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --text: #1c2127;
+  --muted: #5f6b7a;
+  --line: #d9dde3;
+  --accent: #2b5fd9;
+  --good: #1f7a3f;
+  --bad: #b3261e;
+  --term: #101418;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --control: 32px;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216;
+    --panel: #171b21;
+    --text: #e3e7ec;
+    --muted: #97a3b1;
+    --line: #2a313a;
+    --accent: #7aa2ff;
+    --good: #5fc788;
+    --bad: #ff8a80;
+  }
+}
+
+/* Touch screens get 44px targets. */
+@media (pointer: coarse) {
+  :root { --control: 44px; }
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The app is exactly the visible viewport: app.js follows visualViewport so
+   an on-screen keyboard shrinks the terminal instead of covering it. */
+#app {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: var(--vv-top, 0px);
+  height: var(--vv-height, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding:
+    max(8px, env(safe-area-inset-top))
+    max(10px, env(safe-area-inset-right))
+    max(8px, env(safe-area-inset-bottom))
+    max(10px, env(safe-area-inset-left));
+}
+
+h1 { margin: 0; font-size: 17px; white-space: nowrap; }
+h1 span { color: var(--muted); font-weight: 400; }
+h2 { margin: 0; font-size: 15px; }
+h3 { margin: 16px 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+small { color: var(--muted); font-weight: 400; }
+
+/* ---- top bar ------------------------------------------------------------ */
+
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+#status {
+  min-width: 0;
+  margin: 0;
+  padding: 3px 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  font-size: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.topbar-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+#drawer-toggle[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+
+@media (max-width: 599px) {
+  h1 span { display: none; }
+}
+
+#auth {
+  flex: 0 0 auto;
+  max-height: 30%;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--panel);
+  word-break: break-all;
+}
+
+#auth a { color: var(--accent); }
+
+/* ---- controls ----------------------------------------------------------- */
+
+label {
+  display: block;
+  margin-bottom: 10px;
+  font-weight: 500;
+}
+
+label input, label textarea, label select {
+  display: block;
+  width: 100%;
+  margin-top: 3px;
+}
+
+label.check { display: flex; align-items: center; min-height: var(--control); font-weight: 400; }
+label.check input { width: auto; min-height: 0; margin: 0 8px 0 0; padding: 0; }
+
+input, textarea, button, select {
+  font: inherit;
+  color: inherit;
+}
+
+input, textarea, select {
+  min-height: var(--control);
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--bg);
+}
+
+textarea { font-family: var(--mono); font-size: 12px; resize: vertical; }
+
+details { margin: 4px 0 10px; }
+summary {
+  display: list-item;
+  min-height: var(--control);
+  padding: 4px 0;
+  cursor: pointer;
+  color: var(--muted);
+  line-height: calc(var(--control) - 8px);
+}
+
+.buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+
+button {
+  min-height: var(--control);
+  min-width: var(--control);
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--bg);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+button[type="submit"], button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--bad); }
+button:disabled { opacity: 0.5; cursor: default; }
+button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); color: #fff; }
+
+button svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Phones zoom into focused fields under 16px; xterm's hidden input too. */
+@media (pointer: coarse) {
+  input, textarea, select { font-size: 16px; }
+  label.check input { width: 22px; height: 22px; }
+  .xterm .xterm-helper-textarea { font-size: 16px !important; }
+}
+
+/* ---- workspace ---------------------------------------------------------- */
+
+#workspace {
+  position: relative;
+  display: flex;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.panel, #terminal-panel, #drawer {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+#terminal-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  padding: 8px;
+}
+
+#ssh-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 6px 10px;
+  /* Keep tabs and helper keys visible when a phone keyboard leaves little
+     room. The form scrolls so every field and Open terminal stay reachable. */
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+#ssh-form label { margin: 0; font-size: 12px; color: var(--muted); }
+#ssh-form label input, #ssh-form label select { margin-top: 2px; color: var(--text); font-size: 14px; }
+#ssh-form .peer { width: 220px; }
+#ssh-form .host { width: 150px; }
+#ssh-form .user { width: 130px; }
+#ssh-form .port { width: 70px; }
+
+/* On a phone: a compact grid; once terminals exist the form folds away
+   until "+" asks for it. */
+@media (max-width: 599px) {
+  #ssh-form {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 4.5em;
+  }
+  #ssh-form .peer, #ssh-form .host, #ssh-form .user, #ssh-form .port { width: auto; min-width: 0; }
+  #ssh-form .peer, #ssh-button { grid-column: 1 / -1; }
+  #ssh-form label input, #ssh-form label select { font-size: 16px; }
+  #terminal-panel.has-tabs:not(.form-open) #ssh-form { display: none; }
+}
+
+#notice {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--bad);
+  border-radius: 5px;
+  color: var(--bad);
+  word-break: break-word;
+}
+
+/* ---- tabs --------------------------------------------------------------- */
+
+#tabbar {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+#tabs {
+  position: relative;
+  display: flex;
+  gap: 4px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+}
+
+.tab {
+  display: flex;
+  flex: 0 0 auto;
+  max-width: min(15rem, 100%);
+  min-height: var(--control);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.tab.active { border-color: var(--accent); background: var(--panel); box-shadow: inset 0 -2px 0 var(--accent); }
+
+.tab button {
+  min-height: 0;
+  border: 0;
+  background: transparent;
+}
+
+.tab-select {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 4px 0 10px;
+}
+
+.tab-label {
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.tab:not(.live) .tab-label { color: var(--muted); }
+
+.dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.tab.live .dot { background: var(--good); }
+
+.tab-close { padding: 0 10px; color: var(--muted); font-size: 17px; line-height: 1; }
+.tab-close:hover { color: var(--bad); }
+
+.tab-actions {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.tab-actions button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+}
+
+/* Icons only where width is scarce; the text stays for screen readers. */
+@media (max-width: 899px) {
+  .tab-actions .label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .tab-actions button { padding: 0; }
+}
+
+/* ---- terminals ---------------------------------------------------------- */
+
+#terminal {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--term);
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Link and approval controls for one session, above its terminal. */
+.term-links {
+  flex: 0 0 auto;
+  max-height: 40%;
+  overflow: auto;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.term-links:empty { display: none; }
+
+.ssh-auth-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+  border-bottom: 1px solid var(--line);
+}
+
+.ssh-auth-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--control);
+  padding: 4px 10px;
+  border-radius: 5px;
+  background: var(--accent);
+  color: #fff;
+  text-decoration: none;
+}
+
+.ssh-auth-dismiss { margin-left: auto; padding: 0; }
+
+.ssh-link-list { margin: 0; padding: 0 10px; }
+.ssh-link-list ul { margin: 0 0 6px; padding: 0; list-style: none; }
+.ssh-link-list a {
+  display: block;
+  min-height: var(--control);
+  padding: 8px 0;
+  color: var(--accent);
+  font: 12px/1.4 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.xterm-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 4px 6px;
+}
+
+/* ---- key row (touch screens) -------------------------------------------- */
+
+#keybar {
+  display: none;
+  gap: 4px;
+  flex: 0 0 auto;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+@media (pointer: coarse) {
+  #keybar { display: flex; }
+}
+
+#keybar button {
+  flex: 1 0 var(--control);
+  padding: 0 6px;
+  font-family: var(--mono);
+  font-size: 15px;
+}
+
+@media (pointer: coarse) and (max-width: 430px) {
+  #keybar { gap: 0; }
+  #keybar button { border-radius: 0; }
+  #keybar button:first-child { border-radius: 5px 0 0 5px; }
+  #keybar button:last-child { border-radius: 0 5px 5px 0; }
+}
+
+/* ---- drawer: settings and diagnostics ------------------------------------ */
+
+#drawer {
+  flex: 0 0 min(400px, 42%);
+  min-width: 0;
+  padding: 0 14px 14px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Below 900px it covers the workspace instead of squeezing the terminal. */
+@media (max-width: 899px) {
+  #drawer {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    box-shadow: 0 8px 30px rgb(0 0 0 / 0.25);
+  }
+}
+
+.drawer-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 -14px 4px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+#drawer-title:focus { outline: none; }
+
+#connect h3 { margin-top: 10px; }
+#drawer > details > summary { font-weight: 600; color: var(--text); }
+
+#log {
+  height: 240px;
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font: 12px/1.4 var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.scroll { overflow-x: auto; }
+
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 4px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td { overflow-wrap: anywhere; }
+td.label { color: var(--muted); width: 110px; }
+td.mono { font-family: var(--mono); }
+td.small { font-size: 12px; }
+td.online { color: var(--good); }
+td.offline { color: var(--muted); }
+td button { padding: 2px 10px; }
+
+/* ---- focus mode: tabs, essential controls and the terminal --------------- */
+
+body.focus-mode #app {
+  gap: 4px;
+  padding:
+    env(safe-area-inset-top)
+    env(safe-area-inset-right)
+    env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+}
+
+body.focus-mode #topbar,
+body.focus-mode #drawer { display: none; }
+body.focus-mode #terminal-panel:not(.form-open) #ssh-form { display: none; }
+
+body.focus-mode #terminal-panel {
+  gap: 4px;
+  padding: 4px;
+  border: 0;
+  border-radius: 0;
+}
+
+body.focus-mode #terminal { border-radius: 0; }

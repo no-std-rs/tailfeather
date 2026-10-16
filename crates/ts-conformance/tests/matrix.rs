@@ -1,4 +1,4 @@
-//! Runs the compatibility matrix under `cargo test`.
+//! Runs the compatibility matrix under Bazel.
 //!
 //! The suite is not allowed to fail because work is unfinished — only because
 //! something that used to work has broken, or because a behaviour we claim is
@@ -11,6 +11,18 @@ use std::path::PathBuf;
 use ts_conformance::{Env, Report, Status};
 
 fn repo_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("TS_CONFORMANCE_VECTORS").map(PathBuf::from) {
+        let vectors = if path.is_file() {
+            path.parent().unwrap()
+        } else {
+            path.as_path()
+        };
+        return vectors
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .to_path_buf();
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -69,6 +81,167 @@ fn the_captured_vectors_are_usable() {
 }
 
 #[test]
+fn hosted_tls_captures_validate_and_fit_the_embedded_bounds() {
+    use base64::Engine as _;
+    use embedded_tls::{CertificateEntryRef, CertificateRef, TlsVerifier as _};
+    use sha2::Digest as _;
+    use tailfeather::control::tls::{
+        MAX_CERTIFICATE_BYTES, MAX_CHAIN_CERTIFICATES, TLS_READ_BUFFER, TLS_WRITE_BUFFER,
+        TrustVerifier,
+    };
+
+    struct EcdsaCaptureClock;
+    impl embedded_tls::TlsClock for EcdsaCaptureClock {
+        fn now() -> Option<u64> {
+            Some(1_785_585_600)
+        }
+    }
+    struct RsaCaptureClock;
+    impl embedded_tls::TlsClock for RsaCaptureClock {
+        fn now() -> Option<u64> {
+            Some(1_786_536_000)
+        }
+    }
+
+    let path = repo_root().join("tests/vectors/hosted_tls.json");
+    let document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let captures = [
+        (
+            &document,
+            "hosted-ecdsa-chain.pem",
+            1_785_585_600u64,
+            verify_capture::<EcdsaCaptureClock> as fn(&[Vec<u8>]),
+        ),
+        (
+            &document["rsa_capture"],
+            "hosted-rsa-chain.pem",
+            1_786_536_000u64,
+            verify_capture::<RsaCaptureClock> as fn(&[Vec<u8>]),
+        ),
+    ];
+
+    for (metadata, fixture, timestamp, verify) in captures {
+        let pem = std::fs::read_to_string(repo_root().join("tests/vectors").join(fixture)).unwrap();
+        let certificates = pem
+            .split("-----BEGIN CERTIFICATE-----")
+            .skip(1)
+            .map(|block| {
+                let encoded = block
+                    .split("-----END CERTIFICATE-----")
+                    .next()
+                    .unwrap()
+                    .lines()
+                    .map(str::trim)
+                    .collect::<String>();
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let chain = metadata["chain"]
+            .as_array()
+            .expect("hosted chain is an array");
+        assert_eq!(certificates.len(), chain.len());
+        let chain_bytes: usize = certificates.iter().map(Vec::len).sum();
+        let recorded_bytes: usize = chain
+            .iter()
+            .map(|certificate| certificate["der_bytes"].as_u64().unwrap() as usize)
+            .sum();
+        assert_eq!(chain_bytes, recorded_bytes);
+        assert!(chain.len() <= MAX_CHAIN_CERTIFICATES);
+        assert!(chain_bytes <= MAX_CERTIFICATE_BYTES);
+        for (certificate, metadata) in certificates.iter().zip(chain) {
+            assert_eq!(
+                hex::encode(sha2::Sha256::digest(certificate)),
+                metadata["sha256"].as_str().unwrap()
+            );
+        }
+        verify(&certificates);
+        verify_with_openssl(fixture, &certificates, timestamp);
+    }
+
+    const { assert!(TLS_READ_BUFFER >= 16 * 1024 + 256) };
+    const { assert!(TLS_WRITE_BUFFER == 2 * 1024) };
+    assert_eq!(
+        document["negotiated"]["peer_signature_type"],
+        "ecdsa_secp256r1_sha256"
+    );
+    assert_eq!(
+        document["rsa_capture"]["negotiated"]["peer_signature_type"],
+        "rsa_pss_rsae_sha256"
+    );
+
+    fn verify_capture<Clock: embedded_tls::TlsClock>(certificates: &[Vec<u8>]) {
+        let mut chain = CertificateRef::with_context(&[]);
+        for certificate in certificates {
+            chain.add(CertificateEntryRef::X509(certificate)).unwrap();
+        }
+        let mut workspace = tailfeather::control::tls::RsaWorkspace::new();
+        let mut verifier = TrustVerifier::<Clock>::new(None, &mut workspace);
+        verifier
+            .set_hostname_verification("controlplane.tailscale.com")
+            .unwrap();
+        verifier
+            .verify_certificate(&sha2::Sha256::new(), chain)
+            .unwrap();
+    }
+
+    fn verify_with_openssl(name: &str, certificates: &[Vec<u8>], timestamp: u64) {
+        use std::fmt::Write as _;
+
+        fn pem(certificate: &[u8]) -> String {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(certificate);
+            let mut result = String::from("-----BEGIN CERTIFICATE-----\n");
+            for line in encoded.as_bytes().chunks(64) {
+                writeln!(result, "{}", std::str::from_utf8(line).unwrap()).unwrap();
+            }
+            result.push_str("-----END CERTIFICATE-----\n");
+            result
+        }
+
+        let prefix = format!("tailfeather-{}-{}", std::process::id(), name);
+        let directory = std::env::temp_dir();
+        let leaf = directory.join(format!("{prefix}-leaf.pem"));
+        let intermediates = directory.join(format!("{prefix}-intermediates.pem"));
+        let root = directory.join(format!("{prefix}-root.pem"));
+        std::fs::write(&leaf, pem(&certificates[0])).unwrap();
+        std::fs::write(
+            &intermediates,
+            certificates[1..certificates.len() - 1]
+                .iter()
+                .map(|certificate| pem(certificate))
+                .collect::<String>(),
+        )
+        .unwrap();
+        std::fs::write(&root, pem(certificates.last().unwrap())).unwrap();
+        let openssl = std::env::var_os("TS_TEST_OPENSSL").unwrap_or_else(|| "openssl".into());
+        let status = std::process::Command::new(openssl)
+            .args([
+                "verify",
+                "-partial_chain",
+                "-attime",
+                &timestamp.to_string(),
+                "-purpose",
+                "sslserver",
+                "-verify_hostname",
+                "controlplane.tailscale.com",
+                "-CAfile",
+                root.to_str().unwrap(),
+                "-untrusted",
+                intermediates.to_str().unwrap(),
+                leaf.to_str().unwrap(),
+            ])
+            .status()
+            .expect("the pinned OpenSSL verifier must be runnable");
+        let _ = std::fs::remove_file(leaf);
+        let _ = std::fs::remove_file(intermediates);
+        let _ = std::fs::remove_file(root);
+        assert!(status.success(), "OpenSSL rejected {name}");
+    }
+}
+
+#[test]
 fn print_the_matrix() {
     // Not an assertion — this is how the report reaches anyone running the
     // suite with --nocapture.
@@ -110,7 +283,7 @@ fn the_committed_baselines_cover_every_check() {
             added.is_empty() && removed.is_empty(),
             "{} is out of date.\n  checks missing from it: {added:?}\n  \
              checks it names that no longer exist: {removed:?}\n  \
-             Regenerate with `cargo run -p ts-conformance -- --write-expect {}`",
+             Regenerate with `bazel run //crates/ts-conformance:conformance -- --write-expect {}`",
             path.display(),
             path.display(),
         );
@@ -119,7 +292,7 @@ fn the_committed_baselines_cover_every_check() {
         // nothing, so require that at least one check is expected to be a real
         // result. The offline baseline still has the vector-backed ones.
         assert!(
-            checks.values().any(|v| v == "pass" || v == "external"),
+            checks.values().any(|v| v == "pass"),
             "{} expects no check to pass at all",
             path.display()
         );
@@ -128,6 +301,35 @@ fn the_committed_baselines_cover_every_check() {
         found >= 2,
         "expected at least the offline and lab baselines"
     );
+}
+
+#[test]
+fn complete_headscale_baseline_is_all_pass_and_exactly_covers_inventory() {
+    let root = repo_root();
+    let path = root.join("tests/expectations/lab.json");
+    let document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let expected = document["checks"].as_object().unwrap();
+    assert_eq!(expected.len(), ts_conformance::checks::all().len());
+    for (id, status) in expected {
+        assert_eq!(status, "pass", "complete baseline permits {id}={status}");
+    }
+}
+
+#[test]
+fn check_ids_are_stable_and_unique() {
+    let mut ids = BTreeSet::new();
+    for check in ts_conformance::checks::all() {
+        assert!(!check.id.is_empty());
+        assert!(
+            check.id.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'_'
+            }),
+            "check id is not stable machine syntax: {}",
+            check.id
+        );
+        assert!(ids.insert(check.id), "duplicate check id: {}", check.id);
+    }
 }
 
 /// The doctor's "this disables these checks" lists name checks that exist.

@@ -12,7 +12,7 @@ grpc_listen_addr: 0.0.0.0:50443
 grpc_allow_insecure: false
 
 noise:
-  private_key_path: /var/lib/headscale/noise_private.key
+  private_key_path: /tmp/tailfeather-lab/headscale/noise_private.key
 
 prefixes:
   v4: 100.64.0.0/10
@@ -22,7 +22,7 @@ prefixes:
 database:
   type: sqlite
   sqlite:
-    path: /var/lib/headscale/db.sqlite
+    path: /tmp/tailfeather-lab/headscale/db.sqlite
 
 # Headscale refuses to start with an empty DERP map, and running its embedded
 # relay is better than pointing at Tailscale's anyway: the lab stays offline and
@@ -36,7 +36,7 @@ derp:
     region_code: lab
     region_name: Conformance Lab
     stun_listen_addr: 0.0.0.0:3478
-    private_key_path: /var/lib/headscale/derp_server_private.key
+    private_key_path: /tmp/tailfeather-lab/headscale/derp_server_private.key
     automatically_add_embedded_derp_region: true
   urls: []
   paths: []

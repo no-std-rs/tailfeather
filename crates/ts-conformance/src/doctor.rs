@@ -55,7 +55,10 @@ pub struct Gap {
 impl Doctor {
     /// Read `.lab/doctor.json`, if `lab.sh doctor` has been run.
     pub fn load(repo_root: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(repo_root.join(".lab/doctor.json")).ok()?;
+        let state = std::env::var_os("TS_CONFORMANCE_LAB_STATE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| repo_root.join(".lab"));
+        let text = std::fs::read_to_string(state.join("doctor.json")).ok()?;
         let document: serde_json::Value = serde_json::from_str(&text).ok()?;
         let flag = |key: &str| document[key].as_bool().unwrap_or(false);
         let text_of = |key: &str| {
@@ -109,6 +112,8 @@ impl Doctor {
                     "netmap.compression",
                     "netmap.to_peers",
                     "derp.relay",
+                    "derp.keepalive",
+                    "derp.reconnect",
                     "disco.pong",
                     "disco.ping",
                     "disco.endpoints",
@@ -119,7 +124,7 @@ impl Doctor {
         if !self.harness_built {
             gaps.push(Gap {
                 what: "the no_std harness is not built",
-                remedy: "cd harness && cargo build --release",
+                remedy: "bazel build //harness:harness",
                 // Every live check drives the harness; naming them all would
                 // repeat the list above, so this names the consequence.
                 disables: &[],
@@ -156,7 +161,18 @@ impl Doctor {
             gaps.push(Gap {
                 what: "no passwordless sudo",
                 remedy: "configure sudo, or run the interop scripts by hand",
-                disables: &["exit.forward.udp", "exit.forward.tcp"],
+                disables: &[
+                    "wg.handshake.responder",
+                    "wg.transport.roundtrip",
+                    "wg.replay",
+                    "wg.rekey",
+                    "wg.handshake.initiator",
+                    "exit.forward.udp",
+                    "exit.forward.tcp",
+                    "dns.peerapi.doh",
+                    "dns.peerapi.acl",
+                    "dns.peerapi.concurrency",
+                ],
             });
         }
         gaps

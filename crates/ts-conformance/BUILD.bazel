@@ -1,0 +1,145 @@
+load("@tailfeather_root_deps//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc", "rust_doc_test")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+RUNTIME_DATA = [
+    "//tests/expectations:expectations",
+    "//tests/expectations:offline.json",
+    "//tests/vectors:vectors",
+    "//tests/vectors:versions.json",
+]
+
+RUNTIME_ENV = {
+    "TS_CONFORMANCE_EXPECTATIONS": "$(rootpath //tests/expectations:offline.json)",
+    "TS_CONFORMANCE_VECTORS": "$(rootpath //tests/vectors:versions.json)",
+}
+
+rust_library(
+    name = "ts_conformance",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    aliases = aliases(),
+    crate_name = "ts_conformance",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "conformance",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    crate_name = "conformance",
+    crate_root = "src/main.rs",
+    data = RUNTIME_DATA + ["//harness:harness"],
+    edition = "2024",
+    env = RUNTIME_ENV | {
+        "TS_CONFORMANCE_HARNESS": "$(rootpath //harness:harness)",
+    },
+    deps = [":ts_conformance"] + all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "conformance_static",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    crate_name = "conformance_static",
+    crate_root = "src/main.rs",
+    data = RUNTIME_DATA,
+    edition = "2024",
+    env = RUNTIME_ENV,
+    platform = "//platforms:x86_64_linux_musl",
+    deps = [":ts_conformance"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_test",
+    aliases = aliases(),
+    crate = ":ts_conformance",
+    compile_data = ["//scripts:nostd-interop.sh"],
+    data = RUNTIME_DATA,
+    env = RUNTIME_ENV,
+    deps = all_crate_deps(normal_dev = True),
+)
+
+sh_binary(
+    name = "openssl_for_tests",
+    testonly = True,
+    srcs = ["//scripts:alpine-openssl.sh"],
+    data = [
+        "@alpine_minirootfs_3_21_7_x86_64//file",
+        "@apk_libcrypto3//file",
+        "@apk_libssl3//file",
+        "@apk_openssl//file",
+    ],
+)
+
+[
+    rust_test(
+        name = name + "_test",
+        srcs = ["tests/" + name + ".rs"],
+        aliases = aliases(),
+        crate_name = name,
+        crate_root = "tests/" + name + ".rs",
+        data = RUNTIME_DATA,
+        edition = "2024",
+        env = RUNTIME_ENV | ({"PATH": "/usr/bin:/bin"} if name == "matrix" else {}),
+        tags = ["no-remote"] if name == "matrix" else [],
+        deps = [":ts_conformance"] + all_crate_deps(normal = True, normal_dev = True),
+    )
+    for name in [
+        "control_json",
+        "h2_differential",
+        "hpack_differential",
+        "noise_vs_snow",
+        "pcap_replay",
+    ]
+]
+
+rust_test(
+    name = "matrix_test",
+    srcs = ["tests/matrix.rs"],
+    aliases = aliases(),
+    crate_name = "matrix",
+    crate_root = "tests/matrix.rs",
+    data = RUNTIME_DATA + [
+        ":openssl_for_tests",
+        "@alpine_minirootfs_3_21_7_x86_64//file",
+        "@apk_libcrypto3//file",
+        "@apk_libssl3//file",
+        "@apk_openssl//file",
+    ],
+    edition = "2024",
+    env = RUNTIME_ENV | {
+        "TS_TEST_ALPINE_ROOTFS": "$(rootpath @alpine_minirootfs_3_21_7_x86_64//file)",
+        "TS_TEST_LIBCRYPTO_APK": "$(rootpath @apk_libcrypto3//file)",
+        "TS_TEST_LIBSSL_APK": "$(rootpath @apk_libssl3//file)",
+        "TS_TEST_OPENSSL_APK": "$(rootpath @apk_openssl//file)",
+        "TS_TEST_OPENSSL": "$(rootpath :openssl_for_tests)",
+    },
+    deps = [":ts_conformance"] + all_crate_deps(normal = True, normal_dev = True),
+)
+
+rust_doc_test(
+    name = "doc_test",
+    crate = ":ts_conformance",
+)
+
+rust_doc(
+    name = "docs",
+    crate = ":ts_conformance",
+    rustdoc_flags = ["-Dwarnings"],
+)
+
+# Unlike `bazel test`, `bazel run` executes this wrapper locally after Bazel
+# builds the test binary. The output path is deliberately the source checkout.
+sh_binary(
+    name = "regenerate_noise_vectors",
+    testonly = True,
+    srcs = ["//scripts:regenerate-noise-vectors.sh"],
+    args = ["$(rootpath :noise_vs_snow_test)"],
+    data = [":noise_vs_snow_test"],
+)

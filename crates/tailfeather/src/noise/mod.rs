@@ -8,7 +8,7 @@
 //! # Sans-io
 //!
 //! Nothing here touches a socket. Functions take the bytes that arrived and
-//! write the bytes to send, so the same code runs under `cargo test` on the
+//! write the bytes to send, so the same code runs under Bazel tests on the
 //! host, on the harness's reactor, and later on embassy-net. It also means the
 //! whole protocol can be replayed against a captured session.
 //!
@@ -32,7 +32,7 @@ pub mod upgrade;
 
 pub use early::{EarlyReader, MAGIC as EARLY_MAGIC, PROBE_LEN};
 pub use ik::{Handshake, INITIATION_LEN, RESPONSE_LEN, initiate};
-pub use record::{HEADER_LEN, MAX_MESSAGE, MAX_PLAINTEXT, Session};
+pub use record::{HEADER_LEN, MAX_MESSAGE, MAX_PLAINTEXT, Session, TAG_LEN};
 
 /// The capability version this client advertises.
 ///

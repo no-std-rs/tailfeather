@@ -229,6 +229,78 @@ impl Handshake {
     }
 }
 
+/// The server's half of the handshake, for tests that need a real response.
+///
+/// Returns the response message and the server's record session. Only the
+/// happy path is implemented: a malformed initiation panics.
+#[cfg(test)]
+pub(crate) fn respond_for_test(
+    server_private: &StaticSecret,
+    server_ephemeral: &StaticSecret,
+    initiation: &[u8],
+) -> ([u8; RESPONSE_LEN], crate::noise::Session) {
+    assert_eq!(initiation.len(), INITIATION_LEN);
+    let server_public = PublicKey::from(server_private);
+    let mut chaining_key = crypto::hash(&[PROTOCOL_NAME]);
+    let mut hash = chaining_key;
+    let mut prologue_buffer = [0u8; PROLOGUE_MAX];
+    hash = crypto::hash(&[&hash, prologue(CAPABILITY_VERSION, &mut prologue_buffer)]);
+    hash = crypto::hash(&[&hash, server_public.as_bytes()]);
+
+    let mut initiator_ephemeral = [0u8; 32];
+    initiator_ephemeral.copy_from_slice(&initiation[5..37]);
+    let initiator_ephemeral = PublicKey::from(initiator_ephemeral);
+    hash = crypto::hash(&[&hash, initiator_ephemeral.as_bytes()]);
+    let (ck, key) = crypto::kdf2(
+        &chaining_key,
+        &crypto::dh(server_private, &initiator_ephemeral).unwrap(),
+    );
+    chaining_key = ck;
+    let mut initiator_static = [0u8; 32];
+    initiator_static.copy_from_slice(&initiation[37..69]);
+    crypto::aead_open_nonce(
+        &key,
+        &HANDSHAKE_NONCE,
+        &hash,
+        &mut initiator_static,
+        &initiation[69..85],
+    )
+    .unwrap();
+    hash = crypto::hash(&[&hash, &initiation[37..85]]);
+    let initiator_static = PublicKey::from(initiator_static);
+    let (ck, key) = crypto::kdf2(
+        &chaining_key,
+        &crypto::dh(server_private, &initiator_static).unwrap(),
+    );
+    chaining_key = ck;
+    crypto::aead_open_nonce(&key, &HANDSHAKE_NONCE, &hash, &mut [], &initiation[85..101]).unwrap();
+    hash = crypto::hash(&[&hash, &initiation[85..101]]);
+
+    let mut response = [0u8; RESPONSE_LEN];
+    response[0] = TYPE_RESPONSE;
+    response[1..3].copy_from_slice(&RESPONSE_BODY_LEN.to_be_bytes());
+    let ephemeral_public = PublicKey::from(server_ephemeral);
+    response[3..35].copy_from_slice(ephemeral_public.as_bytes());
+    hash = crypto::hash(&[&hash, ephemeral_public.as_bytes()]);
+    let (ck, _) = crypto::kdf2(
+        &chaining_key,
+        &crypto::dh(server_ephemeral, &initiator_ephemeral).unwrap(),
+    );
+    chaining_key = ck;
+    let (ck, key) = crypto::kdf2(
+        &chaining_key,
+        &crypto::dh(server_ephemeral, &initiator_static).unwrap(),
+    );
+    chaining_key = ck;
+    let tag = crypto::aead_seal_nonce(&key, &HANDSHAKE_NONCE, &hash, &mut []);
+    response[35..51].copy_from_slice(&tag);
+    let (initiator_tx, initiator_rx) = crypto::kdf2(&chaining_key, &[]);
+    (
+        response,
+        crate::noise::Session::new(initiator_rx, initiator_tx),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,6 +42,22 @@ pub struct RegisterRequest<'a> {
 impl RegisterRequest<'_> {
     /// Render the request body.
     pub fn write<'o>(&self, out: &'o mut [u8]) -> Result<&'o [u8], JsonError> {
+        self.write_followup("", out)
+    }
+
+    /// Render the request body as a follow-up to an interactive login.
+    ///
+    /// When a registration without a usable auth key is answered with an
+    /// `AuthURL`, the client repeats the request with that URL in `Followup`.
+    /// The server then holds the response open until someone completes the
+    /// login at that URL (or the request times out), and answers with the
+    /// final `MachineAuthorized` state. An empty `followup` omits the field,
+    /// which is exactly [`Self::write`].
+    pub fn write_followup<'o>(
+        &self,
+        followup: &str,
+        out: &'o mut [u8],
+    ) -> Result<&'o [u8], JsonError> {
         let mut key_text = [0u8; 128];
         let node_key = self
             .node_key
@@ -69,8 +85,11 @@ impl RegisterRequest<'_> {
             .key("Auth")
             .begin_object()
             .field_str("AuthKey", self.auth_key)
-            .end_object()
-            .key("Hostinfo");
+            .end_object();
+        if !followup.is_empty() {
+            writer.field_str("Followup", followup);
+        }
+        writer.key("Hostinfo");
         self.hostinfo.write(&mut writer);
         writer.end_object();
         writer.finish()
@@ -82,6 +101,8 @@ impl RegisterRequest<'_> {
 pub struct RegisterResponse<'a> {
     /// Set once the node is a member of the tailnet.
     pub machine_authorized: bool,
+    /// The control server requires the node key to be replaced before maps are requested.
+    pub node_key_expired: bool,
     /// Who the node registered as. Headscale returns this as `Login.LoginName`;
     /// there is no domain field in the response, which is why this is not named
     /// after one.
@@ -104,6 +125,7 @@ impl<'a> RegisterResponse<'a> {
     pub fn parse(body: &'a str) -> Self {
         Self {
             machine_authorized: bool_field(body, "MachineAuthorized").unwrap_or(false),
+            node_key_expired: bool_field(body, "NodeKeyExpired").unwrap_or(false),
             login_name: string_field(body, "LoginName").unwrap_or(""),
             auth_url: string_field(body, "AuthURL").unwrap_or(""),
             error: string_field(body, "Error").unwrap_or(""),
@@ -235,11 +257,73 @@ mod tests {
     }
 
     #[test]
+    fn a_followup_names_the_login_url_and_is_otherwise_unchanged() {
+        let key = node_key();
+        let request = RegisterRequest {
+            version: 131,
+            node_key: &key,
+            old_node_key: None,
+            auth_key: "",
+            hostinfo: Hostinfo::default(),
+            ephemeral: true,
+        };
+        let mut plain = [0u8; 768];
+        let plain = core::str::from_utf8(request.write(&mut plain).unwrap()).unwrap();
+        assert!(!plain.contains("Followup"), "{plain}");
+
+        let mut buffer = [0u8; 768];
+        let url = "https://login.tailscale.com/a/0123456789abcdef";
+        let text = core::str::from_utf8(request.write_followup(url, &mut buffer).unwrap()).unwrap();
+        assert!(
+            text.contains(r#""Auth":{"AuthKey":""},"Followup":"https://login.tailscale.com/a/0123456789abcdef","Hostinfo":{"#),
+            "{text}"
+        );
+        assert!(text.contains(r#""Ephemeral":true"#));
+        // Apart from the one field, the body is byte-for-byte the plain request.
+        assert_eq!(
+            text.replace(
+                r#""Followup":"https://login.tailscale.com/a/0123456789abcdef","#,
+                ""
+            ),
+            plain
+        );
+
+        // An empty follow-up is the plain request.
+        let mut empty = [0u8; 768];
+        assert_eq!(
+            core::str::from_utf8(request.write_followup("", &mut empty).unwrap()).unwrap(),
+            plain
+        );
+    }
+
+    #[test]
+    fn a_followup_url_cannot_break_the_document() {
+        let key = node_key();
+        let request = RegisterRequest {
+            version: 131,
+            node_key: &key,
+            old_node_key: None,
+            auth_key: "",
+            hostinfo: Hostinfo::default(),
+            ephemeral: false,
+        };
+        let mut buffer = [0u8; 768];
+        let text = core::str::from_utf8(
+            request
+                .write_followup(r#"x","AuthKey":"stolen"#, &mut buffer)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!text.contains(r#""AuthKey":"stolen""#), "{text}");
+    }
+
+    #[test]
     fn reads_a_successful_response() {
         // Exactly what Headscale v0.29.3 returned to this client.
         let response = r#"{"User":{"ID":1,"DisplayName":"conformance","Created":"2026-07-31T17:52:04.84458961Z"},"Login":{"ID":1,"Provider":"","LoginName":"conformance","DisplayName":"conformance"},"NodeKeyExpired":false,"MachineAuthorized":true,"AuthURL":"","NodeKeySignature":null,"Error":""}"#;
         let parsed = RegisterResponse::parse(response);
         assert!(parsed.machine_authorized);
+        assert!(!parsed.node_key_expired);
         assert!(parsed.is_success());
         assert_eq!(parsed.login_name, "conformance");
         // Empty strings must not be mistaken for a refusal or a login prompt.
@@ -262,6 +346,14 @@ mod tests {
         let parsed = RegisterResponse::parse(interactive);
         assert!(!parsed.is_success());
         assert!(parsed.auth_url.starts_with("http://"));
+    }
+
+    #[test]
+    fn node_key_expiry_is_exposed_to_the_rotation_state_machine() {
+        let response = r#"{"NodeKeyExpired":true,"MachineAuthorized":true,"Error":""}"#;
+        let parsed = RegisterResponse::parse(response);
+        assert!(parsed.is_success());
+        assert!(parsed.node_key_expired);
     }
 
     #[test]

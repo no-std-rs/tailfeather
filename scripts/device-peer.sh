@@ -65,12 +65,23 @@ set -a
 source "$ENV_FILE"
 set +a
 
-for var in LAPTOP_PRIVATE_KEY_B64 DEVICE_PUBLIC_KEY_B64; do
+for var in LAPTOP_PRIVATE_KEY_B64; do
     if [[ -z "${!var:-}" ]]; then
         echo "$var is not set in $ENV_FILE" >&2
         exit 1
     fi
 done
+
+if [[ -n "${DEVICE_PUBLIC_KEY_HEX:-}" ]]; then
+    [[ "$DEVICE_PUBLIC_KEY_HEX" =~ ^[0-9A-Fa-f]{64}$ ]] || {
+        echo "DEVICE_PUBLIC_KEY_HEX must be 32 bytes of hexadecimal" >&2
+        exit 1
+    }
+    DEVICE_PUBLIC_KEY_B64="$(printf '%s' "$DEVICE_PUBLIC_KEY_HEX" | xxd -r -p | base64 -w0)"
+elif [[ -z "${DEVICE_PUBLIC_KEY_B64:-}" ]]; then
+    echo "DEVICE_PUBLIC_KEY_HEX or DEVICE_PUBLIC_KEY_B64 is not set in $ENV_FILE" >&2
+    exit 1
+fi
 
 KEYFILE="$(mktemp)"
 chmod 600 "$KEYFILE"

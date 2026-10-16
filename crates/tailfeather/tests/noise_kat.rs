@@ -7,7 +7,7 @@
 //! the file and re-checks the agreement on every run.
 //!
 //! This file exists so that `tailfeather::noise` keeps that anchor without depending on
-//! `snow`. Running `cargo test -p tailfeather` alone still compares against bytes
+//! `snow`. Running the Tailfeather Bazel tests alone still compares against bytes
 //! this crate did not produce.
 //!
 //! If these fail, the handshake has changed. That is either a bug or a
@@ -15,7 +15,7 @@
 //! regenerated with:
 //!
 //! ```sh
-//! cargo test -p ts-conformance --test noise_vs_snow -- --ignored
+//! bazel run //crates/ts-conformance:regenerate_noise_vectors
 //! ```
 //!
 //! Regenerating without checking that `noise_vs_snow` still passes would replace
@@ -26,11 +26,20 @@ use tailfeather::noise::{CAPABILITY_VERSION, INITIATION_LEN, initiate};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 fn vectors() -> serde_json::Value {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/vectors/noise-ik.json"
-    );
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let base = std::env::var_os("TS_CONFORMANCE_VECTORS")
+        .map(std::path::PathBuf::from)
+        .map(|path| {
+            if path.is_file() {
+                path.parent().unwrap().to_path_buf()
+            } else {
+                path
+            }
+        })
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/vectors")
+        });
+    let path = base.join("noise-ik.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     serde_json::from_str(&text).expect("valid JSON")
 }
 

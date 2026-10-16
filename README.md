@@ -1,118 +1,73 @@
 # tailfeather
 
-Allocation-free Rust for a small Tailscale-compatible mesh node, plus an
-ESP32-C6 IPv4 exit gateway and a no-libc Linux interoperability harness.
+Allocation-free Rust for a small Tailscale-compatible mesh node, an ESP32-C6
+IPv4 exit gateway, and a static no-libc Linux interoperability harness.
 
-This is experimental protocol and embedded-systems software. It is not audited,
-not a general-purpose Tailscale client, and not claiming `0.1.0` stability until
-the external release gates below have current evidence.
+This is experimental protocol and embedded-systems software. It is not audited
+and is not a general-purpose Tailscale client.
 
-## Quick start
+## Build and test
 
-```sh
-cargo test --workspace --all-targets
-cargo run -p tailfeather-testkit -- check --json
-scripts/no-alloc-guard.sh
-```
-
-The harness and firmware are sibling workspaces because each pins a different
-bare target:
+Bazel 9.2.0 is selected by `.bazelversion`; Bzlmod pins Rust 1.95.0, LLVM
+0.8.16, `rules_python` 2.2.0, and `rules_rs` 0.0.102. Cargo manifests and
+lockfiles describe dependency closures only. Builds and tests never launch
+Cargo.
 
 ```sh
-(cd harness && cargo build --release)
-(cd firmware && cargo build --release)
+bb login
+bazel test //:format //:unit_tests
+bazel test //:artifact_contract_tests --config=optimized
+bazel build //:clippy //:docs //harness:harness //firmware:ci_image --config=optimized
+bazel test //:offline_conformance --test_output=all
 ```
 
-## What works now
+Ordinary actions use BuildBuddy Cloud RBE, the remote cache, and BES by default.
+They retain a local execution branch when the remote executor is unavailable.
+Use `--config=local` for deliberately local, cache-isolated work.
 
-| Environment | Current implementation |
-|---|---|
-| Portable crates | WireGuard initiator/responder, ts2021 Noise, bounded HTTP/2, registration messages, streaming netmaps, disco, DERP, and the cooperative `Node<PEERS>` API |
-| Linux harness | No libc, allocator, threads, or hidden runtime; drives live Headscale control, TLS, HTTP/2, registration, maps, disco, DERP, and both WireGuard roles. Netmaps are reconciled through `Node` |
-| ESP32-C6 | One `Node<32>` actor owns the tunnel state; Wi-Fi/DHCP, static fallback peer configuration through a transactional map lease, IPv4 UDP/TCP forwarding, and NAT build for the device |
-| Offline testkit | Published std-only synthetic-fixture checks with human, JSON, and exact-baseline output |
+The stable root targets are `//:format`, `//:clippy`, `//:docs`,
+`//:unit_tests`, `//:artifact_contract_tests`, `//:offline_conformance`, and
+`//:privileged_lab`. The principal artifacts are `//harness:harness` and
+`//firmware:ci_image`.
 
-The ESP firmware does **not** yet run the full hosted control/DERP task set,
-trusted-time bootstrap, two-slot flash store, or dynamic route installation.
-Hosted Tailscale, pinned Headscale, and the complete physical-device suite must
-therefore remain release blockers. The committed captures prove specific codec
-behaviour; they are not evidence that a current hosted run passed.
+## Privileged lab
 
-## Crates
+`bazel test //:privileged_lab` is routed only to the `linux-amd64-kvm`
+BuildBuddy pool. It is uncached and has no local fallback. The test boots one
+disposable 4-vCPU/2-GiB smolVM guest from checksum-pinned smolVM 1.7.4 and
+Alpine 3.21.7 inputs, installs an offline checksum-pinned APK overlay, starts
+Headscale 0.29.3 and Tailscale 1.94.2 with a real TUN device, enforces the full
+lab baseline, and runs all three kernel WireGuard modes. Missing KVM, TUN,
+namespace, veth, or kernel WireGuard support is a hard failure.
 
-| Package | Purpose | Runtime |
-|---|---|---|
-| [`tailfeather`](crates/tailfeather/README.md) | Public `Node` plus keys, Noise, control, netmap, disco, and DERP; reexports `wirefeather` as `tunnel` and `micro-h2` as `http2` | `no_std`, no allocation |
-| [`wirefeather`](crates/wirefeather/README.md) | Sans-I/O WireGuard-compatible handshake, transport, replay, and timers | `no_std`, no allocation |
-| [`micro-h2`](crates/micro-h2/README.md) | Bounded client-side HTTP/2 and HPACK | `no_std`, no allocation |
-| [`tailfeather-testkit`](crates/tailfeather-testkit/README.md) | Portable offline vectors, replay, reports, and CLI | `std` |
+## Firmware device workflow
 
-`ts-conformance` remains unpublished and owns privileged/live compatibility
-orchestration and repo-only captures.
-
-## Design constraints
-
-- `Node` owns identity, live netmap, tunnel sessions, paths, DERP choice,
-  registration state, and deadlines, but owns no transport, clock, executor,
-  RNG, or store.
-- Control and DERP sessions own their streams and emit decoded events. Node
-  actions explicitly request direct sends, control/DERP work, IPv4 delivery,
-  persistence, or status changes.
-- Maps are applied transactionally with one exclusively borrowed staging lease.
-  Unchanged peer keys retain tunnel sessions; removed or rotated keys do not.
-- Persistent blobs are versioned and zeroized, include the three identities and
-  nondecreasing trusted-time floor, and exclude auth keys, maps, and session
-  keys. A new identity is created only by explicit factory reset.
-- Project runtime code does not allocate. Fixed bounds are errors, never silent
-  truncation. The radio C blob alone has a 64 KiB heap.
-- The data plane is IPv4-only with a 1280-byte inner MTU. WireGuard cookies /
-  `mac2` are not implemented.
-
-## Verification and release gates
-
-Automatic checks cover formatting, workspace tests, clippy, rustdoc warnings,
-the no-allocation harness, firmware release builds, fixture provenance, resource
-limits, and package contents. The compatibility suite is pinned to Headscale
-v0.29.3 and tailscaled 1.94.2; its exact baselines are authoritative, not a
-handwritten pass count.
+`//firmware:ci_image` receives harmless placeholders and can run on RBE. Real
+credentials belong only in the gitignored `.env` file. Build and flash locally:
 
 ```sh
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
-scripts/conformance.sh
-scripts/release-gates.sh
+bazel run //firmware:flash --config=device
 ```
 
-A release also needs fresh same-commit evidence for hosted Tailscale, pinned
-Headscale, physical-device/adversarial tests, stack headroom, resource limits,
-cleanup, fixture audit, and both trademark reviews. Hosted integrated checks
-must be live `pass`; `todo`, `skip`, `fail`, or unlinked `external` results block
-release. Hosted map compression is a hard blocker unless the server accepts an
-uncompressed response.
+The device configuration disables the remote executor, cache, uploads, and BES
+before credentials enter the Rust action environment. See
+[`firmware/README.md`](firmware/README.md).
 
-The future publication order is `wirefeather`, `micro-h2`, `tailfeather`, then
-`tailfeather-testkit`. Nothing in this repository preparation publishes a crate
-or transfers the repository.
+## Components
 
-## Trademark and repository status
+- `tailfeather`: bounded node, control, netmap, disco, DERP, keys, and state.
+- `tailfeather-gateway`: allocation-free IPv4 routing and fixed-capacity NAT.
+- `wirefeather`: allocation-free WireGuard-compatible handshake and transport.
+- `micro-h2`: bounded client HTTP/2 and HPACK.
+- `tailfeather-testkit`: std-only offline fixture and baseline checks.
+- `ts-conformance`: offline and live compatibility measurement.
+- `harness`: static `_start` executable using Linux syscalls without libc.
+- `firmware`: ESP32-C6 application for `riscv32imac-unknown-none-elf`.
+- `web`: a browser Tailscale node with an SSH terminal, built on tailfeather
+  compiled to WebAssembly (its own Cargo workspace; see
+  [`web/README.md`](web/README.md)).
 
-The package name remains `wirefeather`. Publication is blocked until written
-authorization records the exact permitted descriptive WireGuard compatibility
-wording, acknowledgment, policy link, and non-affiliation disclaimer. Tailscale
-wording requires a separate review. WireGuard and Tailscale are marks of their
-respective owners; this project is not affiliated with or endorsed by either.
+All packages are internal (`publish = false`) and remain at version `0.0.1`;
+the version is retained because protocol host-info embeds it.
 
-Metadata intentionally retains the current repository URL. After the owner
-transfers it, update every package and documentation link to
-`https://github.com/no-std-rs/tailfeather`, verify links, and repeat all package
-checks.
-
-## References and license
-
-Protocol references include Tailscale's `controlbase`, `tailcfg.go`, and
-`disco.go`; Headscale's `hscontrol/noise.go` and `hscontrol/poll.go`; the Noise
-and WireGuard specifications; and RFC 7540/RFC 7541.
-
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
-option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).

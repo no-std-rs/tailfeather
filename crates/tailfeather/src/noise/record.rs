@@ -21,7 +21,7 @@
 //! capture shows the server's first records as `04 00 15`, `04 00 14`,
 //! `04 00 6f` — type 4, lengths 21, 20 and 111.
 
-use wirefeather::crypto::{self, Key, TAG_LEN};
+use wirefeather::crypto::{self, Key};
 use zeroize::Zeroizing;
 
 use crate::noise::Error;
@@ -34,6 +34,9 @@ pub const HEADER_LEN: usize = 3;
 
 /// The largest a whole record may be, header included.
 pub const MAX_MESSAGE: usize = 4096;
+
+/// Authentication tag appended to every encrypted record body.
+pub const TAG_LEN: usize = wirefeather::crypto::TAG_LEN;
 
 /// The largest plaintext one record can carry: the message, less the header and
 /// the tag.
@@ -162,6 +165,17 @@ impl Session {
         Ok(plaintext_len)
     }
 
+    /// Open one record whose ciphertext and tag were read into separate buffers.
+    pub(crate) fn open_parts(&mut self, plaintext: &mut [u8], tag: &[u8]) -> Result<usize, Error> {
+        if tag.len() != TAG_LEN {
+            return Err(Error::Malformed);
+        }
+        crypto::aead_open_nonce(&self.rx.key, &self.rx.nonce(), &[], plaintext, tag)
+            .map_err(|_| Error::Decryption)?;
+        self.rx.advance()?;
+        Ok(plaintext.len())
+    }
+
     /// How many records have been sent and received.
     pub fn counters(&self) -> (u64, u64) {
         (self.tx.counter, self.rx.counter)
@@ -198,10 +212,10 @@ mod tests {
         let len = server.seal(b"200 OK", &mut record).unwrap();
         let body = Session::ciphertext_len(&record[..HEADER_LEN]).unwrap();
         assert_eq!(len, HEADER_LEN + body);
-        let n = client
-            .open(&record[HEADER_LEN..HEADER_LEN + body], &mut plain)
-            .unwrap();
-        assert_eq!(&plain[..n], b"200 OK");
+        let body = &mut record[HEADER_LEN..HEADER_LEN + body];
+        let (plaintext, tag) = body.split_at_mut(body.len() - TAG_LEN);
+        let n = client.open_parts(plaintext, tag).unwrap();
+        assert_eq!(&record[HEADER_LEN..HEADER_LEN + n], b"200 OK");
     }
 
     /// The regression test for the whole point of this module.

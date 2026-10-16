@@ -311,7 +311,7 @@ fn eviction_keeps_our_table_in_step_with_theirs() {
 /// A decoder that ignored the update would keep resolving indices against
 /// entries the peer has already dropped.
 #[test]
-fn a_dynamic_table_size_update_shrinks_and_clears_the_table() {
+fn a_dynamic_table_size_update_stays_within_the_advertised_bound() {
     let mut theirs = TheirEncoder::new();
     let mut ours = Decoder::new(DEFAULT_TABLE_SIZE);
 
@@ -334,9 +334,15 @@ fn a_dynamic_table_size_update_shrinks_and_clears_the_table() {
     );
     assert_eq!(ours.table().size(), 0);
 
-    // 0x3f 0xe1 0x1f — the 4096 that a real peer restores it to.
-    our_decode(&mut ours, &[0x3f, 0xe1, 0x1f]);
+    // Restore the 256 bytes this constrained client advertised.
+    our_decode(&mut ours, &[0x3f, 0xe1, 0x01]);
     assert_eq!(ours.table().len(), 0);
+
+    // A peer cannot expand past our SETTINGS_HEADER_TABLE_SIZE.
+    assert_eq!(
+        ours.decode(&[0x3f, 0xe1, 0x1f], |_, _| {}),
+        Err(micro_h2::Error::Protocol)
+    );
 
     // And the table works again afterwards.
     let mut fresh = TheirEncoder::new();

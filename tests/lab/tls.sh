@@ -11,15 +11,14 @@
 # and adds TLS beside it, which is also closer to how the hosted service is
 # actually reached: TLS is a layer over the same protocol, not a different one.
 #
-# # Why ECDSA
+# # Why RSA
 #
-# `embedded-tls`'s certificate verifier is allocation-free for ECDSA chains. Its
-# RSA support pulls in `alloc`, which this project does not have. The hosted
-# endpoint is dual-chain and serves ECDSA when the client offers it, so RSA is
-# not the hosted blocker. This local P-256 chain exercises the verifier's trust,
-# name, and validity checks; it does not stand in for a hosted result. The
-# hosted path is still blocked on the presented-chain anchor model and measured
-# certificate-buffer headroom described in `harness/src/tls.rs`.
+# The hosted endpoint selected an RSA chain and RSA-PSS CertificateVerify on
+# 2026-08-12. This local RSA-2048 chain is signed with PKCS#1 v1.5, while the
+# TLS 1.3 client is forced to offer rsa_pss_rsae_sha256. One request therefore
+# covers both allocation-free RSA verification paths. It also exercises trust,
+# name, validity, CA constraints, and leaf usage. This proxy still does not
+# stand in for a same-commit hosted device run.
 #
 #   tests/lab/tls.sh up      # generate a CA and certificate, start the proxy
 #   tests/lab/tls.sh down
@@ -30,7 +29,7 @@ set -euo pipefail
 LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$LAB_DIR/../.." && pwd)"
 STATE_DIR="${LAB_STATE_DIR:-$REPO_ROOT/.lab}"
-CERT_DIR="$STATE_DIR/tls"
+CERT_DIR="$STATE_DIR/tls-rsa"
 
 BACKEND_PORT="${LAB_PORT:-8080}"
 TLS_PORT="${LAB_TLS_PORT:-8443}"
@@ -43,15 +42,20 @@ cmd_certs() {
         return
     fi
 
-    echo "== generating an ECDSA P-256 certificate chain"
+    echo "== generating an RSA-2048 certificate chain"
     # A CA, so the client verifies a chain rather than a self-signed leaf.
     # Verifying a self-signed certificate proves the parser works and nothing
     # about the part that matters.
-    openssl ecparam -name prime256v1 -genkey -noout -out "$CERT_DIR/ca.key" 2>/dev/null
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+        -out "$CERT_DIR/ca.key" 2>/dev/null
     openssl req -x509 -new -key "$CERT_DIR/ca.key" -sha256 -days 365 \
-        -subj "/CN=esp-gateway conformance CA" -out "$CERT_DIR/ca.crt" 2>/dev/null
+        -subj "/CN=esp-gateway conformance CA" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -out "$CERT_DIR/ca.crt" 2>/dev/null
 
-    openssl ecparam -name prime256v1 -genkey -noout -out "$CERT_DIR/server.key" 2>/dev/null
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+        -out "$CERT_DIR/server.key" 2>/dev/null
     openssl req -new -key "$CERT_DIR/server.key" \
         -subj "/CN=localhost" -out "$CERT_DIR/server.csr" 2>/dev/null
 
@@ -102,8 +106,9 @@ cmd_up() {
     # Prove it with an independent client before anything of ours touches it.
     echo "== openssl s_client sees:"
     echo | openssl s_client -connect "127.0.0.1:$TLS_PORT" \
-        -CAfile "$CERT_DIR/ca.crt" -servername localhost 2>/dev/null |
-        grep -E "Protocol|Cipher|Verify return code" | head -4
+        -CAfile "$CERT_DIR/ca.crt" -servername localhost \
+        -sigalgs rsa_pss_rsae_sha256 2>/dev/null |
+        grep -E "Protocol|Cipher|Peer signature|Verify return code" | head -5
 }
 
 cmd_down() {

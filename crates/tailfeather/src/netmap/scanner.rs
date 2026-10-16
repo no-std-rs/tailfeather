@@ -25,7 +25,7 @@
 //! peers and not the document length. Everything else is a state enum and a
 //! container stack bounded by nesting depth.
 
-use crate::netmap::{Error, MAX_STRING};
+use crate::netmap::{CapacityError, Error, MAX_STRING};
 
 /// How deeply a MapResponse may nest. The deepest real path is
 /// `DERPMap.Regions.<id>.Nodes[].<field>`, which is five.
@@ -103,6 +103,15 @@ impl Scanner {
             pending_surrogate: None,
             done: false,
         }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.state = State::Value;
+        self.stack.clear();
+        self.buffer.clear();
+        self.code_point = 0;
+        self.pending_surrogate = None;
+        self.done = false;
     }
 
     /// Whether the document has been closed.
@@ -378,7 +387,9 @@ impl Scanner {
     }
 
     fn open(&mut self, container: Container) -> Result<(), Error> {
-        self.stack.push(container).map_err(|_| Error::Full)?;
+        self.stack
+            .push(container)
+            .map_err(|_| Error::Full(CapacityError::ParserDepth))?;
         self.state = State::Value;
         Ok(())
     }
@@ -414,7 +425,9 @@ impl Scanner {
     /// Overflow is an error rather than a truncation: a silently shortened node
     /// key parses as nothing, and a shortened name is displayed as fact.
     fn push_byte(&mut self, byte: u8) -> Result<(), Error> {
-        self.buffer.push(byte).map_err(|_| Error::Full)
+        self.buffer
+            .push(byte)
+            .map_err(|_| Error::Full(CapacityError::String))
     }
 }
 
@@ -569,7 +582,7 @@ mod tests {
         let mut scanner = Scanner::new();
         assert_eq!(
             scanner.push(document.as_bytes(), |_| Ok(())),
-            Err(Error::Full)
+            Err(Error::Full(CapacityError::String))
         );
     }
 
@@ -582,7 +595,7 @@ mod tests {
         let mut scanner = Scanner::new();
         assert_eq!(
             scanner.push(document.as_bytes(), |_| Ok(())),
-            Err(Error::Full)
+            Err(Error::Full(CapacityError::ParserDepth))
         );
     }
 }

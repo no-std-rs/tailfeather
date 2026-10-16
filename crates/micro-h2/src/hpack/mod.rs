@@ -22,4 +22,6 @@ pub use dynamic::DynamicTable;
 
 /// The dynamic table size an endpoint assumes before any `SETTINGS` says
 /// otherwise (RFC 7540 section 6.5.2).
-pub const DEFAULT_TABLE_SIZE: usize = 4096;
+/// The receive-side table size advertised by this constrained client. HTTP/2
+/// peers must honor it, so the fixed decoder never needs the desktop default.
+pub const DEFAULT_TABLE_SIZE: usize = 256;

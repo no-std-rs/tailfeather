@@ -7,7 +7,7 @@ allocation-free, and independent of any socket API.
 own. You hand it received datagrams together with the current time and a source
 of randomness; it hands back `Action`s describing what to send or deliver. The
 same code therefore runs inside an Embassy task on a microcontroller and under
-`cargo test` on a laptop.
+Bazel tests on a laptop.
 
 ```rust
 use wirefeather::{Action, Device, Instant, Rng};

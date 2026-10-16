@@ -3,7 +3,16 @@ use std::path::PathBuf;
 
 #[test]
 fn every_embedded_fixture_has_complete_matching_provenance() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let root = std::env::var_os("TAILFEATHER_TESTKIT_FIXTURES")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_file() {
+                path.parent().unwrap().to_path_buf()
+            } else {
+                path
+            }
+        })
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures"));
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(root.join("provenance.json")).unwrap())
             .unwrap();

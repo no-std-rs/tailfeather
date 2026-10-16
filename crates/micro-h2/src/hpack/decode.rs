@@ -40,12 +40,14 @@ pub struct Header {
 /// server sent against an empty table.
 pub struct Decoder {
     table: DynamicTable,
+    max_capacity: usize,
 }
 
 impl Decoder {
     pub fn new(table_size: usize) -> Self {
         Self {
             table: DynamicTable::new(table_size),
+            max_capacity: table_size,
         }
     }
 
@@ -80,6 +82,9 @@ impl Decoder {
                 // rejecting a legal stream costs the connection.
                 let (size, rest) = decode_integer(input, 5)?;
                 input = rest;
+                if size as usize > self.max_capacity {
+                    return Err(Error::Protocol);
+                }
                 self.table.set_capacity(size as usize);
                 continue;
             }
@@ -305,6 +310,17 @@ mod tests {
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].as_str(), ":method: GET");
         assert_eq!(decoder.table().capacity(), 0);
+    }
+
+    #[test]
+    fn a_dynamic_table_update_cannot_exceed_the_advertised_bound() {
+        let mut decoder = Decoder::new(256);
+        // HPACK integer with a 5-bit prefix encodes a requested capacity of 512.
+        assert_eq!(
+            decoder.decode(&[0x3f, 0xe1, 0x03], |_, _| {}),
+            Err(Error::Protocol)
+        );
+        assert_eq!(decoder.table().capacity(), 256);
     }
 
     #[test]

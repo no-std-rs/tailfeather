@@ -33,7 +33,7 @@ pub const MAX_STREAMS: usize = 4;
 
 /// The largest header block this client will reassemble across `CONTINUATION`
 /// frames.
-pub const MAX_HEADER_BLOCK: usize = 4096;
+pub const MAX_HEADER_BLOCK: usize = 2048;
 
 /// What we advertise as our per-stream receive window, and what we top the
 /// connection window up to.
@@ -123,15 +123,20 @@ impl Connection {
 
         // Push is refused outright rather than handled: a client that never
         // accepts a promise needs no state for one.
-        let mut payload = [0u8; 18];
-        write_setting(&mut payload[0..6], settings::ENABLE_PUSH, 0);
+        let mut payload = [0u8; 24];
         write_setting(
-            &mut payload[6..12],
+            &mut payload[0..6],
+            settings::HEADER_TABLE_SIZE,
+            hpack::DEFAULT_TABLE_SIZE as u32,
+        );
+        write_setting(&mut payload[6..12], settings::ENABLE_PUSH, 0);
+        write_setting(
+            &mut payload[12..18],
             settings::INITIAL_WINDOW_SIZE,
             RECEIVE_WINDOW,
         );
         write_setting(
-            &mut payload[12..18],
+            &mut payload[18..24],
             settings::MAX_CONCURRENT_STREAMS,
             MAX_STREAMS as u32,
         );
@@ -340,6 +345,24 @@ impl Connection {
         }
     }
 
+    /// Complete a DATA frame whose payload was consumed incrementally by the
+    /// transport adapter.
+    ///
+    /// DATA does not affect HPACK state, so constrained adapters can stream a
+    /// large payload without retaining the complete frame. Flow-control credit
+    /// and stream closure still happen exactly once, after every payload byte
+    /// (including padding) has been authenticated and consumed.
+    pub fn finish_data(&mut self, header: FrameHeader, out: &mut [u8]) -> Result<usize, Error> {
+        if header.kind != FrameType::Data {
+            return Err(Error::Protocol);
+        }
+        let written = self.credit(header.stream, header.length as u32, out)?;
+        if header.has(flags::END_STREAM) {
+            self.close(header.stream);
+        }
+        Ok(written)
+    }
+
     /// Return flow-control credit for `length` bytes consumed on `stream`.
     fn credit(&mut self, stream: u32, length: u32, out: &mut [u8]) -> Result<usize, Error> {
         if length == 0 {
@@ -384,12 +407,10 @@ impl Connection {
             let value = u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
             match identifier {
                 settings::MAX_FRAME_SIZE => self.peer_max_frame = value as usize,
-                // The peer is telling us how large a dynamic table it will use
-                // when encoding, so our decoder must be willing to hold that
-                // much or indices will not resolve.
-                settings::HEADER_TABLE_SIZE => {
-                    self.decoder = Decoder::new(value as usize);
-                }
+                // This limits our encoder, which deliberately has no dynamic
+                // table. The receive decoder is governed by the 256-byte limit
+                // we advertised and must retain its connection-wide state.
+                settings::HEADER_TABLE_SIZE => {}
                 // Everything else governs what we may send, and our requests are
                 // too small for any of it to bind.
                 _ => {}
@@ -511,6 +532,25 @@ mod tests {
         let their_ack = frame_bytes(FrameType::Settings, flags::ACK, 0, &[]);
         let (_, written) = connection.recv(&their_ack, |_, _| {}, &mut out).unwrap();
         assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn peer_encoder_settings_do_not_reset_receive_hpack_state() {
+        let mut connection = Connection::new();
+        connection
+            .decoder
+            .decode(&[0x40, 0x01, b'x', 0x01, b'y'], |_, _| {})
+            .unwrap();
+        assert_eq!(connection.decoder.table().len(), 1);
+
+        let settings = frame_bytes(FrameType::Settings, 0, 0, &[0, 1, 0, 0, 0x10, 0]);
+        let mut out = [0u8; 64];
+        connection.recv(&settings, |_, _| {}, &mut out).unwrap();
+        assert_eq!(connection.decoder.table().len(), 1);
+        assert_eq!(
+            connection.decoder.table().capacity(),
+            hpack::DEFAULT_TABLE_SIZE
+        );
     }
 
     #[test]

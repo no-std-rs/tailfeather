@@ -57,7 +57,7 @@ struct Tables {
 }
 
 /// Built with a `const fn` so the arrays are in flash, not computed at startup.
-const TABLES: Tables = build();
+static TABLES: Tables = build();
 
 const fn build() -> Tables {
     let mut counts = [0u16; MAX_LENGTH + 1];

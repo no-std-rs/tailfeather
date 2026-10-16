@@ -9,7 +9,7 @@
 //! checks begin failing for a reason that has nothing to do with the code.
 //!
 //! That is not hypothetical. It happened while this module was being written:
-//! two consecutive `cargo test` runs introduced five failures and left 42
+//! two consecutive test runs introduced five failures and left 42
 //! registered nodes; `lab.sh prune` restored it. A suite whose result
 //! depends on how many times it has been run before is not measuring the code.
 //!
@@ -55,7 +55,7 @@ pub const PREFIX: &str = "esp-gateway";
 /// The suite memoizes its registration session in a `static OnceLock`, so
 /// whichever caller reaches it first registers the nodes that everyone else
 /// then makes claims about. Meanwhile `tests/matrix.rs` builds an [`Env`] per
-/// `#[test]`, and cargo runs those in parallel threads of one process. With a
+/// `#[test]`, and the test runner executes those in parallel threads. With a
 /// per-`Env` id, `control.hostinfo` compared the server's node name against
 /// *its* id while the node had been registered under a *different* test's —
 /// which is not hypothetical, it failed on the first run after this module

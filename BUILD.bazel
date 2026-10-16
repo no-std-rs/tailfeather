@@ -1,0 +1,208 @@
+load("@rules_rust//rust:defs.bzl", "rust_clippy", "rustfmt_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+])
+
+FIRST_PARTY_RUST_TARGETS = [
+    "//crates/micro-h2:micro_h2",
+    "//crates/tailfeather:tailfeather",
+    "//crates/tailfeather-gateway:tailfeather_gateway",
+    "//crates/tailfeather-testkit:tailfeather_testkit",
+    "//crates/tailfeather-testkit:tailfeather-testkit",
+    "//crates/ts-conformance:ts_conformance",
+    "//crates/ts-conformance:conformance",
+    "//crates/wirefeather:wirefeather",
+    "//crates/wirefeather:responder",
+]
+
+INTEGRATION_RUST_TEST_TARGETS = [
+    "//crates/tailfeather-testkit:fixtures_test",
+    "//crates/tailfeather:netmap_capture_test",
+    "//crates/tailfeather:noise_kat_test",
+    "//crates/ts-conformance:control_json_test",
+    "//crates/ts-conformance:h2_differential_test",
+    "//crates/ts-conformance:hpack_differential_test",
+    "//crates/ts-conformance:matrix_test",
+    "//crates/ts-conformance:noise_vs_snow_test",
+    "//crates/ts-conformance:pcap_replay_test",
+]
+
+CLIPPY_RUST_TARGETS = FIRST_PARTY_RUST_TARGETS + INTEGRATION_RUST_TEST_TARGETS + [
+    "//firmware:esp_gateway_firmware_lint",
+    "//harness:harness",
+]
+
+rustfmt_test(
+    name = "format",
+    targets = FIRST_PARTY_RUST_TARGETS + INTEGRATION_RUST_TEST_TARGETS + [
+        "//firmware:esp_gateway_firmware",
+        "//harness:harness",
+    ],
+)
+
+rust_clippy(
+    name = "clippy",
+    testonly = True,
+    deps = CLIPPY_RUST_TARGETS,
+)
+
+filegroup(
+    name = "docs",
+    srcs = [
+        "//crates/micro-h2:docs",
+        "//crates/tailfeather:docs",
+        "//crates/tailfeather-gateway:docs",
+        "//crates/tailfeather-testkit:docs",
+        "//crates/ts-conformance:docs",
+        "//crates/wirefeather:docs",
+    ],
+)
+
+test_suite(
+    name = "unit_tests",
+    tests = [
+        "//crates/micro-h2:unit_test",
+        "//crates/micro-h2:doc_test",
+        "//crates/tailfeather:unit_test",
+        "//crates/tailfeather:netmap_capture_test",
+        "//crates/tailfeather:noise_kat_test",
+        "//crates/tailfeather:doc_test",
+        "//crates/tailfeather-gateway:unit_test",
+        "//crates/tailfeather-gateway:doc_test",
+        "//crates/tailfeather-testkit:unit_test",
+        "//crates/tailfeather-testkit:fixtures_test",
+        "//crates/tailfeather-testkit:doc_test",
+        "//crates/ts-conformance:unit_test",
+        "//crates/ts-conformance:control_json_test",
+        "//crates/ts-conformance:h2_differential_test",
+        "//crates/ts-conformance:hpack_differential_test",
+        "//crates/ts-conformance:matrix_test",
+        "//crates/ts-conformance:noise_vs_snow_test",
+        "//crates/ts-conformance:pcap_replay_test",
+        "//crates/ts-conformance:doc_test",
+        "//crates/wirefeather:unit_test",
+        "//crates/wirefeather:doc_test",
+    ],
+)
+
+sh_test(
+    name = "harness_elf_contract",
+    srcs = ["//scripts:harness-artifact-contract.sh"],
+    args = [
+        "$(rootpath //harness:harness)",
+        "$(rootpath @llvm//tools:llvm-readelf)",
+        "$(rootpath @llvm//tools:llvm-nm)",
+    ],
+    data = [
+        "//harness:harness",
+        "@llvm//tools:llvm-readelf",
+        "@llvm//tools:llvm-nm",
+    ],
+    tags = ["artifact-contract"],
+)
+
+sh_test(
+    name = "no_allocation_source_contract",
+    srcs = ["//scripts:no-allocation-source-contract.sh"],
+    data = [
+        "//crates/micro-h2:rust_sources",
+        "//crates/tailfeather:rust_sources",
+        "//crates/tailfeather-gateway:rust_sources",
+        "//crates/wirefeather:rust_sources",
+        "//firmware:rust_sources",
+        "//harness:rust_sources",
+    ],
+    tags = ["artifact-contract"],
+)
+
+sh_test(
+    name = "firmware_resource_contract",
+    srcs = ["//scripts:firmware-resource-contract.sh"],
+    args = [
+        "$(rootpath //firmware:ci_image)",
+        "$(rootpath //firmware:firmware_main_source)",
+        "$(rootpath @llvm//tools:llvm-readelf)",
+        "$(rootpath @llvm//tools:llvm-size)",
+    ],
+    data = [
+        "//firmware:ci_image",
+        "//firmware:firmware_main_source",
+        "@llvm//tools:llvm-readelf",
+        "@llvm//tools:llvm-size",
+    ],
+    tags = ["artifact-contract"],
+)
+
+sh_test(
+    name = "fixture_audit",
+    srcs = ["//scripts:fixture-audit.sh"],
+    args = [
+        "$(rootpath @python_3_13//:python3)",
+        "$(rootpath //crates/tailfeather-testkit:fixtures/provenance.json)",
+    ],
+    data = [
+        "@python_3_13//:files",
+        "@python_3_13//:python3",
+        "//crates/tailfeather-testkit:fixtures",
+        "//crates/tailfeather-testkit:fixtures/provenance.json",
+    ],
+)
+
+sh_test(
+    name = "testkit_baseline",
+    srcs = ["//scripts:runfiles-exec.sh"],
+    args = [
+        "$(rootpath //crates/tailfeather-testkit:tailfeather-testkit)",
+        "check",
+        "--json",
+        "--expect",
+        "$(rootpath //crates/tailfeather-testkit:expected.json)",
+    ],
+    data = [
+        "//crates/tailfeather-testkit:expected.json",
+        "//crates/tailfeather-testkit:tailfeather-testkit",
+    ],
+)
+
+test_suite(
+    name = "artifact_contract_tests",
+    tests = [
+        ":firmware_resource_contract",
+        ":fixture_audit",
+        ":harness_elf_contract",
+        ":no_allocation_source_contract",
+        ":testkit_baseline",
+    ],
+)
+
+sh_test(
+    name = "offline_conformance",
+    srcs = ["//scripts:runfiles-exec.sh"],
+    args = [
+        "$(rootpath //crates/ts-conformance:conformance)",
+        "--expect",
+        "$(rootpath //tests/expectations:offline.json)",
+    ],
+    data = [
+        "//crates/ts-conformance:conformance",
+        "//harness:harness",
+        "//tests/expectations:offline.json",
+        "//tests/vectors:versions.json",
+    ],
+    env = {
+        "TS_CONFORMANCE_EXPECTATIONS": "$(rootpath //tests/expectations:offline.json)",
+        "TS_CONFORMANCE_HARNESS": "$(rootpath //harness:harness)",
+        "TS_CONFORMANCE_VECTORS": "$(rootpath //tests/vectors:versions.json)",
+        "TS_CONTROL_URL": "",
+    },
+)
+
+test_suite(
+    name = "privileged_lab",
+    tests = ["//tests/lab:privileged_lab"],
+)

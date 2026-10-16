@@ -56,7 +56,7 @@ fn start(env: &Env) -> Result<Session, String> {
     let state = state.to_string_lossy().into_owned();
     let port = port.to_string();
 
-    let first = harness.run(&[
+    let first = harness.register(&[
         "register",
         &state,
         host,
@@ -70,7 +70,7 @@ fn start(env: &Env) -> Result<Session, String> {
     // The same state directory, so the machine key is the one the server just
     // authenticated. That is what makes this a re-registration rather than a
     // second node.
-    let rotated = harness.run(&[
+    let rotated = harness.register(&[
         "register",
         &state,
         host,

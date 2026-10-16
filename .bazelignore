@@ -1,0 +1,3 @@
+# npm and Cargo trees for the browser client and relay. Bazel builds nothing
+# there, and node_modules can contain third-party BUILD files.
+web

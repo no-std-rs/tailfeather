@@ -105,7 +105,7 @@ fn start(env: &Env) -> Result<Run, String> {
     let state = state.to_string_lossy().into_owned();
     let port = port.to_string();
 
-    let registered = harness.run(&[
+    let registered = harness.register(&[
         "register",
         &state,
         host,

@@ -1,6 +1,6 @@
 //! Exercises the runtime itself, with no peer and no network.
 //!
-//! The library crates are covered by `cargo test` on the host. What that cannot
+//! The library crates are covered by Bazel tests on the host. What that cannot
 //! reach is this binary's own foundations — the reactor, the raw syscalls, the
 //! atomic file write — because none of them exist in a `std` build. So they get
 //! a self-test, run as a subcommand, that the conformance suite can invoke.
@@ -14,11 +14,200 @@ use core::net::Ipv4Addr;
 
 use rustix::fs::{Mode, OFlags};
 
-use crate::exec::{Either, Reactor, block_on, select};
+use crate::exec::{Either, Either4, Reactor, block_on, select, select4};
 use crate::net::{TcpListener, TcpStream, UdpSocket};
 use crate::rt;
 use crate::store::{FileStore, Path, StoreError};
 use crate::time::{Clock, monotonic_millis, tai64n};
+
+/// Verify that the allocation-free device rejects a replayed transport packet.
+pub fn wg() -> ! {
+    use wirefeather::{Action, Device, Error, Instant, MAX_DATAGRAM_LEN};
+
+    let now = Instant(1_000);
+    let mut initiator: Device<1> = Device::new([0x17; 32]);
+    let mut responder: Device<1> = Device::new([0x42; 32]);
+    let responder_peer = initiator.add_peer(responder.public_key(), None).unwrap();
+    let initiator_peer = responder.add_peer(initiator.public_key(), None).unwrap();
+
+    let mut initiation = [0u8; MAX_DATAGRAM_LEN];
+    let initiation_len = initiator
+        .start_handshake(
+            responder_peer,
+            now,
+            b"timestamp001",
+            &mut crate::OsRng,
+            &mut initiation,
+        )
+        .unwrap();
+    let mut response = [0u8; MAX_DATAGRAM_LEN];
+    let Action::Send { peer, data } = responder
+        .handle_udp(
+            &initiation[..initiation_len],
+            now,
+            &mut crate::OsRng,
+            &mut response,
+        )
+        .unwrap()
+    else {
+        panic!("handshake initiation did not produce a response");
+    };
+    assert_eq!(peer, initiator_peer);
+    let response_len = data.len();
+
+    let mut keepalive = [0u8; MAX_DATAGRAM_LEN];
+    let Action::Send { peer, data } = initiator
+        .handle_udp(
+            &response[..response_len],
+            now,
+            &mut crate::OsRng,
+            &mut keepalive,
+        )
+        .unwrap()
+    else {
+        panic!("handshake response did not produce a keepalive");
+    };
+    assert_eq!(peer, responder_peer);
+    let keepalive_len = data.len();
+
+    let mut plain = [0u8; MAX_DATAGRAM_LEN];
+    assert!(matches!(
+        responder.handle_udp(
+            &keepalive[..keepalive_len],
+            now,
+            &mut crate::OsRng,
+            &mut plain,
+        ),
+        Ok(Action::Authenticated { peer }) if peer == initiator_peer
+    ));
+
+    let mut packet = [0u8; 20];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+    let mut datagram = [0u8; MAX_DATAGRAM_LEN];
+    let Action::Send { peer, data } = initiator
+        .encapsulate(responder_peer, &packet, now, &mut datagram)
+        .unwrap()
+    else {
+        panic!("packet encapsulation produced no datagram");
+    };
+    assert_eq!(peer, responder_peer);
+    let datagram_len = data.len();
+
+    assert!(matches!(
+        responder.handle_udp(
+            &datagram[..datagram_len],
+            now,
+            &mut crate::OsRng,
+            &mut plain,
+        ),
+        Ok(Action::Receive { peer, packet: received })
+            if peer == initiator_peer && received == packet
+    ));
+    assert!(matches!(
+        responder.handle_udp(
+            &datagram[..datagram_len],
+            now,
+            &mut crate::OsRng,
+            &mut plain,
+        ),
+        Err(Error::Replay)
+    ));
+
+    // Keep one valid counter undelivered, advance the receive high-water mark
+    // by a full window, then prove that the old packet is rejected for age and
+    // not merely because an exact duplicate was already observed.
+    let mut stale = [0u8; MAX_DATAGRAM_LEN];
+    let Action::Send { peer, data } = initiator
+        .encapsulate(responder_peer, &packet, now, &mut stale)
+        .unwrap()
+    else {
+        panic!("stale packet encapsulation produced no datagram");
+    };
+    assert_eq!(peer, responder_peer);
+    let stale_len = data.len();
+
+    for _ in 0..wirefeather::budget::REPLAY_WINDOW_BITS {
+        let Action::Send { peer, data } = initiator
+            .encapsulate(responder_peer, &packet, now, &mut datagram)
+            .unwrap()
+        else {
+            panic!("window packet encapsulation produced no datagram");
+        };
+        assert_eq!(peer, responder_peer);
+        let len = data.len();
+        assert!(matches!(
+            responder.handle_udp(
+                &datagram[..len],
+                now,
+                &mut crate::OsRng,
+                &mut plain,
+            ),
+            Ok(Action::Receive { peer, packet: received })
+                if peer == initiator_peer && received == packet
+        ));
+    }
+    assert!(matches!(
+        responder.handle_udp(&stale[..stale_len], now, &mut crate::OsRng, &mut plain,),
+        Err(Error::Replay)
+    ));
+
+    evt!(
+        "{{\"event\":\"wg-selftest\",\"device_replay\":\"rejected\",\"out_of_window\":\"rejected\"}}"
+    );
+    crate::rt::exit(0)
+}
+
+/// Exercise the shared production packet core in the allocation-free link.
+pub fn gateway() -> ! {
+    let mut table = tailfeather_gateway::nat::Table::new();
+    for slot in 0..tailfeather_gateway::nat::SLOTS {
+        assert_eq!(
+            table.slot_for(
+                [100, 64, 0, slot as u8],
+                1000 + slot as u16,
+                [192, 0, 2, 1],
+                53,
+                0,
+            ),
+            Some(slot)
+        );
+    }
+    assert!(table.slot_for([1; 4], 1, [2; 4], 2, 1).is_none());
+    assert!(
+        table
+            .slot_for(
+                [1; 4],
+                1,
+                [2; 4],
+                2,
+                tailfeather_gateway::nat::IDLE_TIMEOUT_MS,
+            )
+            .is_some()
+    );
+
+    let challenge = b"gateway-core";
+    let mut packet = [0u8; 128];
+    let len = tailfeather_gateway::nat::build_udp4(
+        [100, 64, 0, 2],
+        1234,
+        [192, 0, 2, 2],
+        4321,
+        challenge,
+        &mut packet,
+    )
+    .expect("UDP packet buffer");
+    assert_eq!(
+        tailfeather_gateway::nat::parse_udp4(&packet[..len])
+            .expect("parse built UDP")
+            .payload,
+        challenge
+    );
+    packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+    assert!(tailfeather_gateway::nat::parse_udp4(&packet[..len]).is_none());
+    evt!("{{\"event\":\"gateway-selftest\",\"result\":\"pass\"}}");
+    crate::rt::exit(0)
+}
 
 pub fn run(state_dir: &str) -> ! {
     let mut failures = 0;
@@ -28,6 +217,10 @@ pub fn run(state_dir: &str) -> ! {
     failures += check(
         "select returns the branch that is ready",
         select_picks_ready(),
+    );
+    failures += check(
+        "four-way select rotates its first ready branch",
+        select4_rotates_ready(),
     );
     failures += check("a TCP stream connects and carries bytes", tcp_roundtrip());
     failures += check(
@@ -112,6 +305,33 @@ fn select_picks_ready() -> Result<(), &'static str> {
             Either::First(()) => Ok(()),
             Either::Second(()) => Err("the later deadline fired first"),
         }
+    })
+}
+
+fn select4_rotates_ready() -> Result<(), &'static str> {
+    let clock = Clock::start();
+    let reactor = Reactor::new(clock);
+    block_on(&reactor, async {
+        for first in 0..4 {
+            let selected = select4(
+                first,
+                core::future::ready(0),
+                core::future::ready(1),
+                core::future::ready(2),
+                core::future::ready(3),
+            )
+            .await;
+            let value = match selected {
+                Either4::First(value)
+                | Either4::Second(value)
+                | Either4::Third(value)
+                | Either4::Fourth(value) => value,
+            };
+            if value != first {
+                return Err("did not begin with the requested branch");
+            }
+        }
+        Ok(())
     })
 }
 

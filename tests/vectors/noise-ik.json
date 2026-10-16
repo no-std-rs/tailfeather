@@ -1,5 +1,5 @@
 {
-  "_comment": "Noise IK initiations for ts2021, byte-equal to snow 0.10.0's message 1 with the ts2021 5-byte header prefixed. Regenerate with `cargo test -p ts-conformance --test noise_vs_snow -- --ignored`.",
+  "_comment": "Noise IK initiations for ts2021, byte-equal to snow 0.10.0's message 1 with the ts2021 5-byte header prefixed. Regenerate with `bazel run //crates/ts-conformance:regenerate_noise_vectors`.",
   "capability_version": 131,
   "generated_by": "snow 0.10.0",
   "prologue": "Tailscale Control Protocol v131",

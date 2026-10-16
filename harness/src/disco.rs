@@ -13,7 +13,7 @@
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use tailfeather::disco::{Message, Ping, Pong};
-use tailfeather::keys::DiscoPublic;
+use tailfeather::keys::{DiscoPublic, NodePublic};
 
 use crate::OsRng;
 use crate::control::ControlError;
@@ -62,8 +62,34 @@ pub fn run(
 /// One candidate path to one peer.
 struct Candidate {
     endpoint: SocketAddrV4,
+    node: NodePublic,
     disco: DiscoPublic,
     tx_id: [u8; 12],
+}
+
+/// Attribute an authenticated ping to one candidate.
+///
+/// A disco key can be shared by more than one node. Use the node key carried by
+/// modern pings; only fall back to the disco key for legacy pings that omit it,
+/// and only when the disco key names exactly one candidate.
+fn candidate_for_ping(
+    candidates: &[Candidate],
+    disco: DiscoPublic,
+    node: Option<NodePublic>,
+) -> Option<usize> {
+    if let Some(node) = node {
+        return candidates
+            .iter()
+            .position(|candidate| candidate.disco == disco && candidate.node == node);
+    }
+
+    let mut matches = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.disco == disco)
+        .map(|(index, _)| index);
+    let index = matches.next()?;
+    matches.next().is_none().then_some(index)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -99,7 +125,7 @@ async fn exchange(
     println!("advertising endpoint {endpoint_text}");
     evt!("{{\"event\":\"endpoint\",\"advertised\":\"{endpoint_text}\"}}");
 
-    let netmap = crate::control::load_netmap(
+    let mut netmap = crate::control::load_netmap(
         reactor,
         state_dir,
         address,
@@ -134,17 +160,11 @@ async fn exchange(
         crate::rt::getrandom(&mut tx_id);
         let _ = candidates.push(Candidate {
             endpoint,
+            node: peer.node_key,
             disco,
             tx_id,
         });
     }
-
-    if candidates.is_empty() {
-        println!("!! no peer published both a disco key and a reachable endpoint");
-        evt!("{{\"event\":\"disco\",\"result\":\"no-candidates\"}}");
-        return Ok(());
-    }
-    println!("{} candidate path(s)", candidates.len());
 
     // The same socket the tunnel would use. A probe answered on a different
     // port proves a path WireGuard cannot take, because a NAT maps ports
@@ -155,9 +175,77 @@ async fn exchange(
     let mut pings = 0usize;
     let mut packet = [0u8; tailfeather::disco::MAX_PACKET];
     let mut plaintext = [0u8; tailfeather::disco::MAX_PACKET];
-    let deadline = clock.millis() + listen_ms;
+    let mut incoming = [0u8; wirefeather::MAX_DATAGRAM_LEN];
+    let started = clock.millis();
+    let deadline = started.saturating_add(listen_ms);
+    // Discovery is useful, but peer probes are the primary purpose of this
+    // exchange. Bound the entire DERP scan to one third of the caller's budget
+    // so unreachable DNS or STUN servers cannot consume the listen phase.
+    let stun_deadline = started.saturating_add(listen_ms / 3);
 
     let mut next_probe = 0u64;
+    let mut stun_region = 0usize;
+    let mut stun_best = None;
+    while clock.millis() < deadline
+        && !probe_stun(
+            reactor,
+            &socket,
+            &netmap,
+            clock,
+            stun_deadline,
+            &mut stun_region,
+            &mut stun_best,
+        )
+        .await
+    {
+        // STUN left the peer datagram queued after peeking at it. Service it,
+        // then resume discovery from the same DERP region.
+        let Ok(received) = socket.recv_from(&mut incoming).await else {
+            continue;
+        };
+        handle_incoming(
+            &socket,
+            &identity,
+            &our_disco,
+            candidates.as_mut_slice(),
+            &incoming,
+            received,
+            &mut packet,
+            &mut plaintext,
+            &mut pongs,
+            &mut pings,
+            &mut next_probe,
+        )
+        .await?;
+    }
+    if let Some((_, region, reflexive)) = stun_best
+        && apply_preferred_derp(&identity, &mut netmap, region)
+    {
+        let mut reflexive_text = heapless::String::<32>::new();
+        let _ = core::fmt::Write::write_fmt(&mut reflexive_text, format_args!("{reflexive}"));
+        let endpoints = [endpoint_text.as_str(), reflexive_text.as_str()];
+        let endpoint_count = if endpoints[0] == endpoints[1] { 1 } else { 2 };
+        crate::control::publish_endpoint_update(
+            reactor,
+            state_dir,
+            address,
+            port,
+            hostname,
+            region,
+            &endpoints[..endpoint_count],
+        )
+        .await?;
+        println!("STUN selected DERP region {region}, reflexive endpoint {reflexive}");
+        evt!("{{\"event\":\"stun\",\"region\":{region},\"endpoint\":\"{reflexive}\"}}");
+    }
+
+    if candidates.is_empty() {
+        println!("!! no peer published both a disco key and a reachable endpoint");
+        evt!("{{\"event\":\"disco\",\"result\":\"no-candidates\"}}");
+        return Ok(());
+    }
+    println!("{} candidate path(s)", candidates.len());
+
     while clock.millis() < deadline {
         if clock.millis() >= next_probe {
             next_probe = clock.millis() + PROBE_INTERVAL_MS;
@@ -181,7 +269,6 @@ async fn exchange(
             }
         }
 
-        let mut incoming = [0u8; tailfeather::disco::MAX_PACKET];
         let received = match select(
             socket.recv_from(&mut incoming),
             reactor.sleep(PROBE_INTERVAL_MS),
@@ -191,85 +278,20 @@ async fn exchange(
             Either::First(Ok(received)) => received,
             Either::First(Err(_)) | Either::Second(()) => continue,
         };
-        let (len, from) = received;
-
-        if !tailfeather::disco::is_disco(&incoming[..len]) {
-            // WireGuard traffic on the shared socket. Nothing here handles it;
-            // reporting it is how a demultiplexing mistake would show up.
-            println!("<- {len} bytes from {from}, not disco");
-            continue;
-        }
-
-        // The sender's key names which peer to expect. It is not proof of
-        // anything until the box opens under it.
-        let claimed = match tailfeather::disco::packet::sender_key(&incoming[..len]) {
-            Ok(key) => key,
-            Err(e) => {
-                println!("!! malformed disco packet: {e}");
-                continue;
-            }
-        };
-        let Some(candidate) = candidates.iter().find(|c| c.disco == claimed) else {
-            println!("<- disco from an unknown key {claimed}");
-            continue;
-        };
-
-        let opened = match tailfeather::disco::open(
-            &identity.disco,
-            &candidate.disco,
-            &incoming[..len],
+        handle_incoming(
+            &socket,
+            &identity,
+            &our_disco,
+            candidates.as_mut_slice(),
+            &incoming,
+            received,
+            &mut packet,
             &mut plaintext,
-        ) {
-            Ok(opened) => opened,
-            Err(e) => {
-                println!("!! disco box from {from}: {e}");
-                continue;
-            }
-        };
-
-        match Message::decode(&plaintext[..opened.len]) {
-            Ok(Message::Pong(pong)) => {
-                // The transaction id ties the answer to the probe, and so to
-                // the path it was sent on.
-                let expected = pong.tx_id == candidate.tx_id;
-                pongs += 1;
-                println!(
-                    "<- pong from {from}: it sees us at {} (txid {})",
-                    pong.src,
-                    if expected { "matches" } else { "UNEXPECTED" }
-                );
-                evt!(
-                    "{{\"event\":\"pong\",\"from\":\"{from}\",\"observed\":\"{}\",\"txid_matches\":{expected}}}",
-                    pong.src
-                );
-            }
-            Ok(Message::Ping(ping)) => {
-                pings += 1;
-                println!("<- ping from {from}, answering");
-                // The answer carries the address the ping arrived from, which
-                // is the only way the sender can learn its own public address.
-                let pong = Message::Pong(Pong {
-                    tx_id: ping.tx_id,
-                    src: SocketAddr::V4(from),
-                });
-                let plen = pong.encode(&mut plaintext).map_err(ControlError::Disco)?;
-                let total = tailfeather::disco::seal(
-                    &identity.disco,
-                    &our_disco,
-                    &claimed,
-                    &plaintext[..plen],
-                    &mut OsRng,
-                    &mut packet,
-                )
-                .map_err(ControlError::Disco)?;
-                let _ = socket.send_to(&packet[..total], &from).await;
-                evt!("{{\"event\":\"ping\",\"from\":\"{from}\"}}");
-            }
-            Ok(Message::CallMeMaybe(call)) => {
-                println!("<- call-me-maybe with {} endpoint(s)", call.endpoints.len());
-            }
-            Err(e) => println!("!! disco message from {from}: {e}"),
-        }
+            &mut pongs,
+            &mut pings,
+            &mut next_probe,
+        )
+        .await?;
     }
 
     println!("{pongs} pong(s) received, {pings} ping(s) answered");
@@ -278,4 +300,207 @@ async fn exchange(
         candidates.len()
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_incoming(
+    socket: &UdpSocket<'_>,
+    identity: &tailfeather::keys::Identity,
+    our_disco: &DiscoPublic,
+    candidates: &mut [Candidate],
+    incoming: &[u8],
+    received: (usize, SocketAddrV4),
+    packet: &mut [u8],
+    plaintext: &mut [u8],
+    pongs: &mut usize,
+    pings: &mut usize,
+    next_probe: &mut u64,
+) -> Result<(), ControlError> {
+    let (len, from) = received;
+    if !tailfeather::disco::is_disco(&incoming[..len]) {
+        println!("<- {len} bytes from {from}, not disco");
+        return Ok(());
+    }
+
+    let claimed = match tailfeather::disco::packet::sender_key(&incoming[..len]) {
+        Ok(key) => key,
+        Err(e) => {
+            println!("!! malformed disco packet: {e}");
+            return Ok(());
+        }
+    };
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.disco == claimed)
+    {
+        println!("<- disco from an unknown key {claimed}");
+        return Ok(());
+    }
+
+    let opened =
+        match tailfeather::disco::open(&identity.disco, &claimed, &incoming[..len], plaintext) {
+            Ok(opened) => opened,
+            Err(e) => {
+                println!("!! disco box from {from}: {e}");
+                return Ok(());
+            }
+        };
+
+    match Message::decode(&plaintext[..opened.len]) {
+        Ok(Message::Pong(pong)) => {
+            let expected = candidates
+                .iter()
+                .any(|candidate| candidate.disco == claimed && candidate.tx_id == pong.tx_id);
+            *pongs += 1;
+            println!(
+                "<- pong from {from}: it sees us at {} (txid {})",
+                pong.src,
+                if expected { "matches" } else { "UNEXPECTED" }
+            );
+            evt!(
+                "{{\"event\":\"pong\",\"from\":\"{from}\",\"observed\":\"{}\",\"txid_matches\":{expected}}}",
+                pong.src
+            );
+        }
+        Ok(Message::Ping(ping)) => {
+            *pings += 1;
+            println!("<- ping from {from}, answering");
+            if let Some(index) = candidate_for_ping(candidates, claimed, ping.node_key)
+                && candidates[index].endpoint != from
+            {
+                println!(
+                    "   authenticated path for {} moved {} -> {from}",
+                    candidates[index].node, candidates[index].endpoint
+                );
+                candidates[index].endpoint = from;
+                *next_probe = 0;
+            }
+
+            let pong = Message::Pong(Pong {
+                tx_id: ping.tx_id,
+                src: SocketAddr::V4(from),
+            });
+            let plen = pong.encode(plaintext).map_err(ControlError::Disco)?;
+            let total = tailfeather::disco::seal(
+                &identity.disco,
+                our_disco,
+                &claimed,
+                &plaintext[..plen],
+                &mut OsRng,
+                packet,
+            )
+            .map_err(ControlError::Disco)?;
+            let _ = socket.send_to(&packet[..total], &from).await;
+            evt!("{{\"event\":\"ping\",\"from\":\"{from}\"}}");
+        }
+        Ok(Message::CallMeMaybe(call)) => {
+            println!("<- call-me-maybe with {} endpoint(s)", call.endpoints.len());
+        }
+        Err(e) => println!("!! disco message from {from}: {e}"),
+    }
+    Ok(())
+}
+
+async fn probe_stun(
+    reactor: &Reactor,
+    socket: &UdpSocket<'_>,
+    netmap: &tailfeather::netmap::Netmap<{ tailfeather::netmap::MAX_PEERS }>,
+    clock: Clock,
+    scan_deadline: u64,
+    next_region: &mut usize,
+    best: &mut Option<(u64, u16, SocketAddrV4)>,
+) -> bool {
+    const TIMEOUT_MS: u64 = 400;
+    let mut response = [0u8; wirefeather::MAX_DATAGRAM_LEN];
+    while let Some(region) = netmap.derp.iter().nth(*next_region) {
+        let remaining = scan_deadline.saturating_sub(clock.millis());
+        if remaining == 0 {
+            return true;
+        }
+        let Some(relay) = region.nodes.iter().find(|node| node.stun_port != 0) else {
+            *next_region += 1;
+            continue;
+        };
+        let Some(address) =
+            crate::dns::resolve_v4(reactor, relay.host_name.as_str(), remaining).await
+        else {
+            *next_region += 1;
+            continue;
+        };
+        let server = SocketAddrV4::new(address, relay.stun_port);
+        let mut transaction = [0; tailfeather::stun::TRANSACTION_ID_LEN];
+        crate::rt::getrandom(&mut transaction);
+        let request = tailfeather::stun::request(transaction);
+        let started = clock.millis();
+        if socket.send_to(&request, &server).await.is_err() {
+            *next_region += 1;
+            continue;
+        }
+        let deadline = started.saturating_add(TIMEOUT_MS).min(scan_deadline);
+        let reflexive = loop {
+            let remaining = deadline.saturating_sub(clock.millis());
+            if remaining == 0 {
+                break None;
+            }
+            // Do not steal peer traffic from the exchange loop. Peeking lets
+            // this phase consume only the active STUN server's packets; any
+            // disco or WireGuard datagram stays queued and preempts the rest
+            // of discovery so the peer can be serviced immediately.
+            match select(socket.peek_from(&mut response), reactor.sleep(remaining)).await {
+                Either::First(Ok((len, source))) if source == server => {
+                    let parsed = tailfeather::stun::response(&response[..len], transaction);
+                    // No other task reads this socket, so the datagram just
+                    // inspected is still at the head of the queue.
+                    if socket.recv_from(&mut response).await.is_err() {
+                        break None;
+                    }
+                    match parsed {
+                        Ok((address, port)) => {
+                            break Some(SocketAddrV4::new(Ipv4Addr::from(address), port));
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                Either::First(Ok(_)) => return false,
+                Either::First(Err(_)) | Either::Second(()) => break None,
+            }
+        };
+        if let Some(reflexive) = reflexive {
+            let elapsed = clock.millis().saturating_sub(started);
+            if best.is_none_or(|current| elapsed < current.0) {
+                *best = Some((elapsed, region.id, reflexive));
+            }
+        }
+        *next_region += 1;
+    }
+    true
+}
+
+fn apply_preferred_derp(
+    identity: &tailfeather::keys::Identity,
+    netmap: &mut tailfeather::netmap::Netmap<{ tailfeather::netmap::MAX_PEERS }>,
+    region: u16,
+) -> bool {
+    let mut node =
+        tailfeather::Node::<{ tailfeather::netmap::MAX_PEERS }>::factory_reset(identity.clone(), 1);
+    let generation = match node.poll(0) {
+        Ok(Some(tailfeather::NodeAction::PersistState(state))) => state.generation(),
+        _ => return false,
+    };
+    if node.persistence_result(generation, true).is_err() {
+        return false;
+    }
+    let mut staging = netmap.clone();
+    if node
+        .handle_control_event(tailfeather::ControlEvent::MapFinished {
+            lease: &mut staging,
+            result: Ok(()),
+        })
+        .is_err()
+        || node.prefer_derp(region).is_err()
+    {
+        return false;
+    }
+    netmap.home_derp = node.netmap().home_derp;
+    true
 }

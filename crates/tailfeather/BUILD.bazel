@@ -1,0 +1,122 @@
+load("@tailfeather_root_deps//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc", "rust_doc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(name = "rust_sources", srcs = glob(["src/**/*.rs"]))
+
+rust_library(
+    name = "tailfeather",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tailfeather",
+    edition = "2024",
+    rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
+    deps = all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "tailfeather_harness",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//crates/micro-h2:micro_h2_harness": "micro_h2",
+        "//crates/wirefeather:wirefeather_harness": "wirefeather",
+    },
+    crate_name = "tailfeather",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort"],
+    rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
+    deps = [
+        "//crates/micro-h2:micro_h2_harness",
+        "//crates/wirefeather:wirefeather_harness",
+        "@harness_deps//:crypto_box-0.9.1",
+        "@harness_deps//:crypto-bigint-0.5.5",
+        "@harness_deps//:critical-section-1.2.0",
+        "@harness_deps//:embedded-io-async-0.7.0",
+        "@harness_deps//:embedded-tls-0.19.0",
+        "@harness_deps//:heapless-0.9.3",
+        "@harness_deps//:p256-0.13.2",
+        "@harness_deps//:p384-0.13.1",
+        "@harness_deps//:sha2-0.10.9",
+        "@harness_deps//:smoltcp-0.13.1",
+        "@harness_deps//:subtle-2.6.1",
+        "@harness_deps//:x25519-dalek-2.0.1",
+        "@harness_deps//:zeroize-1.9.0",
+    ],
+)
+
+rust_library(
+    name = "tailfeather_firmware",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//crates/micro-h2:micro_h2_firmware": "micro_h2",
+        "//crates/wirefeather:wirefeather_firmware": "wirefeather",
+    },
+    crate_name = "tailfeather",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort"],
+    rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
+    deps = [
+        "//crates/micro-h2:micro_h2_firmware",
+        "//crates/wirefeather:wirefeather_firmware",
+        "@firmware_deps//:crypto_box-0.9.1",
+        "@firmware_deps//:crypto-bigint-0.5.5",
+        "@firmware_deps//:critical-section-1.2.0",
+        "@firmware_deps//:embedded-io-async-0.7.0",
+        "@firmware_deps//:embedded-tls-0.19.0",
+        "@firmware_deps//:heapless-0.9.3",
+        "@firmware_deps//:p256-0.13.2",
+        "@firmware_deps//:p384-0.13.1",
+        "@firmware_deps//:sha2-0.10.9",
+        "@firmware_deps//:smoltcp-0.13.1",
+        "@firmware_deps//:subtle-2.6.1",
+        "@firmware_deps//:x25519-dalek-2.0.1",
+        "@firmware_deps//:zeroize-1.9.0",
+    ],
+)
+
+rust_test(
+    name = "unit_test",
+    aliases = aliases(),
+    crate = ":tailfeather",
+    compile_data = ["//tests/vectors:vectors"],
+    deps = all_crate_deps(normal_dev = True),
+    # The RSA differential corpus intentionally uses the host OpenSSL binary
+    # as an independent oracle. The pinned RBE image does not contain it.
+    env = {"PATH": "/usr/bin:/bin"},
+    tags = ["no-remote"],
+)
+
+[
+    rust_test(
+        name = name + "_test",
+        srcs = ["tests/" + name + ".rs"],
+        aliases = aliases(),
+        crate_name = name,
+        crate_root = "tests/" + name + ".rs",
+        data = [
+            "//tests/vectors:vectors",
+            "//tests/vectors:versions.json",
+        ],
+        edition = "2024",
+        env = {"TS_CONFORMANCE_VECTORS": "$(rootpath //tests/vectors:versions.json)"},
+        deps = [":tailfeather"] + all_crate_deps(normal = True, normal_dev = True),
+    )
+    for name in [
+        "netmap_capture",
+        "noise_kat",
+    ]
+]
+
+rust_doc_test(
+    name = "doc_test",
+    crate = ":tailfeather",
+)
+
+rust_doc(
+    name = "docs",
+    crate = ":tailfeather",
+    rustdoc_flags = ["-Dwarnings"],
+)

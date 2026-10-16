@@ -1,0 +1,19 @@
+{
+  "name": "tailfeather-web-relay",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Cloudflare Worker: WebSocket relay to Tailscale control/DERP and static host for the tailfeather web client",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "dev": "node scripts/wrangler.mjs dev",
+    "check": "node scripts/wrangler.mjs check",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.120.1"
+  }
+}

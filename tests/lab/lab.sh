@@ -39,7 +39,7 @@ RUNTIME="${CONTAINER_RUNTIME:-podman}"
 # failures look like our bugs — the suite would be comparing today's code to
 # yesterday's ground truth with nothing saying so. The digest is recorded in
 # tests/vectors/versions.json and checked by `lab.sh doctor`.
-IMAGE="${HEADSCALE_IMAGE:-docker.io/headscale/headscale:v0.29.3}"
+IMAGE="${HEADSCALE_IMAGE:-docker.io/headscale/headscale:v0.29.3@sha256:0e7f1c6e4ce6c2a2a001103ecd3fa645a045adf30ac8a5234fe037b43000cd72}"
 PORT="${LAB_PORT:-8080}"
 SERVER_URL="http://127.0.0.1:$PORT"
 USER_NAME=conformance
@@ -195,7 +195,7 @@ cmd_doctor() {
 
     command -v tailscaled >/dev/null 2>&1 && have_tailscaled=true || true
     [[ -S "$TS_SOCKET" ]] && have_reference=true || true
-    [[ -x "$REPO_ROOT/harness/target/x86_64-unknown-linux-none/release/harness" ]] &&
+    [[ -n "${TS_CONFORMANCE_HARNESS:-}" && -x "${TS_CONFORMANCE_HARNESS:-}" ]] &&
         have_harness=true || true
     sudo -n true 2>/dev/null && have_root=true || true
 
@@ -223,7 +223,7 @@ JSON
     printf '  %-22s %s\n' "headscale" "$($have_container && echo "yes ($headscale_version)" || echo "no — $reason")"
     printf '  %-22s %s\n' "tailscaled installed" "$($have_tailscaled && echo yes || echo "no — the disco and DERP checks need a reference client")"
     printf '  %-22s %s\n' "reference client" "$($have_reference && echo yes || echo "no — run '$0 reference'")"
-    printf '  %-22s %s\n' "harness built" "$($have_harness && echo yes || echo "no — run 'cd harness && cargo build --release'")"
+    printf '  %-22s %s\n' "harness built" "$($have_harness && echo yes || echo "no — run 'bazel build //harness:harness'")"
     printf '  %-22s %s\n' "passwordless sudo" "$($have_root && echo yes || echo "no — the exit-node and interop checks need it")"
     printf '  %-22s %s\n' "TLS front" "$($have_tls_front && echo yes || echo "no — run 'tests/lab/tls.sh up'")"
     echo
@@ -235,8 +235,13 @@ cmd_reference() {
     # shellcheck disable=SC1090
     source "$STATE_DIR/lab.env"
 
-    if [[ ! -x /usr/sbin/tailscaled && ! -x /usr/bin/tailscaled ]]; then
+    local tailscaled_bin tailscale_bin
+    if ! tailscaled_bin="$(command -v tailscaled)"; then
         echo "tailscaled not found; the reference client is what gives us ground truth" >&2
+        exit 1
+    fi
+    if ! tailscale_bin="$(command -v tailscale)"; then
+        echo "tailscale not found; it is needed to configure the reference client" >&2
         exit 1
     fi
 
@@ -246,7 +251,7 @@ cmd_reference() {
     # the ground truth our netmap parser is checked against — the wire bytes
     # are inside Noise, so this is the only way to see what the server actually
     # said without reimplementing the very thing under test.
-    sudo TS_DEBUG_MAP=1 tailscaled \
+    sudo TS_DEBUG_MAP=1 "$tailscaled_bin" \
         --tun=userspace-networking \
         --socket="$TS_SOCKET" \
         --statedir="$STATE_DIR/ts-state" \
@@ -255,14 +260,14 @@ cmd_reference() {
     sleep 3
 
     echo "== registering it against the lab"
-    sudo tailscale --socket="$TS_SOCKET" up \
+    sudo "$tailscale_bin" --socket="$TS_SOCKET" up \
         --login-server="$HEADSCALE_URL" \
         --authkey="$HEADSCALE_PREAUTH_KEY" \
         --hostname=reference-client \
         --accept-routes=false
 
     echo "== reference client is up"
-    sudo tailscale --socket="$TS_SOCKET" status || true
+    sudo "$tailscale_bin" --socket="$TS_SOCKET" status || true
 }
 
 cmd_reference_stop() {
@@ -282,6 +287,7 @@ cmd_status() {
         [[ -f "$STATE_DIR/lab.env" ]] && cat "$STATE_DIR/lab.env"
     else
         echo "lab is not running"
+        return 1
     fi
 }
 

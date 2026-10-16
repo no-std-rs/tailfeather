@@ -20,13 +20,29 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+// Platform adapters must implement these exact trait/crate instances. Public
+// reexports prevent Bazel module consumers from accidentally linking a second
+// Cargo-universe copy whose types (and feature set) differ.
+pub use critical_section;
+pub use embedded_io_async;
+pub use embedded_tls;
+
+#[cfg(test)]
+extern crate std;
+
 pub mod control;
 pub mod derp;
 pub mod disco;
 pub mod keys;
+pub mod local_tcp;
 pub mod netmap;
 pub mod node;
 pub mod noise;
+pub mod state;
+pub mod stun;
+pub mod time;
+
+mod unicode_normalization;
 
 pub use micro_h2 as http2;
 pub use node::{

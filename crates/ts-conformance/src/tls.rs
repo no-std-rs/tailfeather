@@ -14,12 +14,10 @@
 //! # And what is not being claimed
 //!
 //! A pass here is against the lab's TLS front, and says nothing about the hosted
-//! service. It used to say something stronger and false — that
-//! `controlplane.tailscale.com` serves an RSA-PSS-only chain and is therefore
-//! unreachable without an allocation-free RSA verifier. Measured, it is
-//! dual-chain and serves ECDSA to a client offering ECDSA sigalgs; see
-//! `tests/vectors/hosted_tls.json` and the module comment in
-//! `harness/src/tls.rs` for what actually stands in the way.
+//! service. The front uses an RSA certificate chain and TLS 1.3 RSA-PSS
+//! CertificateVerify so the same allocation-free verifier used by firmware is
+//! exercised end to end. The independently validated hosted captures live in
+//! `tests/vectors/hosted_tls.json`.
 //!
 //! The distinction still matters for this check: the lab's front is one server
 //! with one chain, and a hosted result has to be measured rather than inferred
@@ -57,16 +55,17 @@ fn start(env: &Env) -> Result<Session, String> {
     };
     if env.target == Target::TailscaleSaas {
         return Err(
-            "no hosted TLS run yet. Not for the reason this check used to give: \
-             controlplane.tailscale.com serves ECDSA to a client offering ECDSA \
-             sigalgs (measured, tests/vectors/hosted_tls.json), and embedded-tls \
-             already offers the P-256 group its IPv4 frontend requires. P-384 \
-             chain verification is enabled. What remains is an anchor model that \
-             can stop before the topmost presented certificate and measured \
-             certificate-buffer headroom above the 3411-byte chain. See \
-             harness/src/tls.rs"
+            "this repository conformance command does not provision hosted credentials or \
+             devices. The shared verifier supports the measured ECDSA and RSA chains, \
+             stops at embedded ISRG Root X2 or Root YR, and its record/certificate bounds are checked \
+             against tests/vectors/hosted_tls.json. A hosted result still requires the \
+             separate same-commit device acceptance run"
                 .into(),
         );
+    }
+
+    if env.control_url.is_none() {
+        return Err("no live lab control server behind the TLS front".into());
     }
 
     if !env.doctor.as_ref().is_some_and(|doctor| doctor.tls_front) {
@@ -74,7 +73,7 @@ fn start(env: &Env) -> Result<Session, String> {
     }
 
     let root = lab_root(env);
-    let ca = root.join(".lab/tls/ca.der");
+    let ca = root.join(".lab/tls-rsa/ca.der");
     if !ca.exists() {
         return Err("no TLS front; start one with tests/lab/tls.sh up".into());
     }
@@ -102,6 +101,10 @@ fn start(env: &Env) -> Result<Session, String> {
 
 /// A self-signed CA that signed nothing, for the negative case.
 fn make_unrelated_ca(path: &std::path::Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
     let key = path.with_extension("key");
     let run = |args: &[&str]| -> Result<(), String> {
         let output = std::process::Command::new("openssl")
@@ -192,9 +195,8 @@ pub fn tls(env: &Env) -> Status {
         "TLS 1.3 against a real server with the chain verified against a pinned anchor \
          and the hostname checked; the control plane's key came back over it ({}…). A \
          chain leading elsewhere and a certificate for another name were both refused. \
-         This is the lab's front, not the hosted service: hosted serves a four-entry \
-         chain whose intermediates are ecdsa-with-SHA384, which needs embedded-tls's \
-         p384 feature and an anchor set rather than a single pinned root.",
+         This is the lab's front, not the hosted service; hosted acceptance is a separate \
+         same-commit device run.",
         &key[..21]
     ))
 }

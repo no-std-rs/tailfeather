@@ -21,10 +21,8 @@
 //!
 //! # Statuses
 //!
-//! [`Status::Pass`] means this run verified the behaviour. [`Status::External`]
-//! means a reference-backed artifact outside this process verified it — the
-//! root-requiring interop scripts — and names it. Those two are the only ones
-//! that count as compatible. [`Status::Todo`] is unbuilt work,
+//! [`Status::Pass`] means this run verified the behaviour. Compatibility is
+//! never inferred from prose or a separately produced artifact. [`Status::Todo`] is unbuilt work,
 //! [`Status::Fail`] is a real defect, and [`Status::Skip`] means the check
 //! could not run, which is never counted as success.
 
@@ -39,6 +37,7 @@ pub mod headscale;
 pub mod http;
 pub mod multipeer;
 pub mod netmap;
+pub mod nostd_interop;
 pub mod pcap;
 pub mod register;
 pub mod runscope;
@@ -80,6 +79,7 @@ pub enum Area {
     Netmap,
     Derp,
     Disco,
+    Dns,
     ExitNode,
     Transport,
 }
@@ -93,6 +93,7 @@ impl fmt::Display for Area {
             Self::Netmap => "netmap",
             Self::Derp => "DERP",
             Self::Disco => "disco",
+            Self::Dns => "DNS",
             Self::ExitNode => "exit node",
             Self::Transport => "transport (TLS/HTTP2)",
         })
@@ -104,8 +105,6 @@ pub enum Status {
     /// Verified during this run against a reference implementation or a
     /// capture of one.
     Pass(String),
-    /// Verified by a named artifact outside this process.
-    External(String),
     /// A genuine incompatibility.
     Fail(String),
     /// Not implemented yet. The string says what is missing.
@@ -116,7 +115,7 @@ pub enum Status {
 
 impl Status {
     pub fn is_compatible(&self) -> bool {
-        matches!(self, Self::Pass(_) | Self::External(_))
+        matches!(self, Self::Pass(_))
     }
 
     pub fn is_counted(&self) -> bool {
@@ -132,7 +131,6 @@ impl Status {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Pass(_) => "pass",
-            Self::External(_) => "external",
             Self::Fail(_) => "fail",
             Self::Todo(_) => "todo",
             Self::Skip(_) => "skip",
@@ -142,7 +140,6 @@ impl Status {
     fn marker(&self) -> &'static str {
         match self {
             Self::Pass(_) => "PASS",
-            Self::External(_) => "PASS*",
             Self::Fail(_) => "FAIL",
             Self::Todo(_) => "TODO",
             Self::Skip(_) => "SKIP",
@@ -151,7 +148,7 @@ impl Status {
 
     fn detail(&self) -> &str {
         match self {
-            Self::Pass(d) | Self::External(d) | Self::Fail(d) | Self::Todo(d) | Self::Skip(d) => d,
+            Self::Pass(d) | Self::Fail(d) | Self::Todo(d) | Self::Skip(d) => d,
         }
     }
 }
@@ -199,11 +196,21 @@ impl Env {
     /// A deterministic environment for unit tests and push CI. Stale local lab
     /// state is deliberately ignored; live measurements are run by the CLI.
     pub fn offline(repo_root: &std::path::Path) -> Self {
+        let vectors = std::env::var_os("TS_CONFORMANCE_VECTORS")
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_file() {
+                    path.parent().unwrap().to_path_buf()
+                } else {
+                    path
+                }
+            })
+            .unwrap_or_else(|| repo_root.join("tests/vectors"));
         Self {
             target: Target::HeadscaleLab,
             control_url: None,
             preauth_key: None,
-            vectors: repo_root.join("tests/vectors"),
+            vectors,
             headscale_version: None,
             tailscale_version: None,
             harness: harness::Harness::discover(repo_root),
@@ -235,7 +242,9 @@ impl Env {
 
         // Pointing the same checks at the hosted service is opt-in: it needs
         // credentials and internet access, so it can never be the default.
-        if let Ok(url) = std::env::var("TS_CONTROL_URL") {
+        if let Ok(url) = std::env::var("TS_CONTROL_URL")
+            && !url.is_empty()
+        {
             env.target = Target::TailscaleSaas;
             env.control_url = Some(url);
             env.preauth_key = std::env::var("TS_AUTHKEY").ok();
@@ -440,10 +449,6 @@ impl fmt::Display for Report {
             self.compatible(),
             self.counted(),
             self.percentage()
-        )?;
-        writeln!(
-            f,
-            "PASS* means verified by a named artifact outside this process."
         )?;
         let skipped = self.outcomes.len() - self.counted();
         if skipped > 0 {

@@ -4,57 +4,29 @@
 //!
 //! A TLS client that negotiates a session but does not check who it is talking
 //! to is worse than no TLS at all: it costs the same and provides confidence it
-//! has not earned. So this wires `embedded-tls`'s `rustpki` verifier in
-//! properly, against a pinned trust anchor, with hostname checking and a real
-//! clock so an expired certificate is refused.
+//! has not earned. The shared verifier checks a pinned trust anchor, hostname,
+//! validity period, certificate constraints, and every handshake signature.
 //!
-//! # ECDSA only, and what that does and does not rule out
+//! # Allocation-free ECDSA and RSA
 //!
-//! `embedded-tls`'s verifier is allocation-free for ECDSA chains. Its RSA
-//! support pulls in `alloc`, which this project does not have —
-//! `rsa = ["dep:rsa", "rustpki", "alloc"]` in its own manifest.
+//! The endpoint's chain selection is operational state, not a stable API.
+//! `tests/vectors/hosted_tls.json` retains an ECDSA capture from 2026-08-01 and
+//! an RSA capture from 2026-08-12. RSA public operations are fixed to 2048- or
+//! 4096-bit exponent-65537 keys and use bounded Montgomery arithmetic; no
+//! `embedded-tls` RSA or allocation feature is enabled. Certificate signatures
+//! accept strict ECDSA or RSA PKCS#1/PSS encodings, while TLS 1.3
+//! CertificateVerify accepts ECDSA and the protocol-valid RSA-PSS schemes.
 //!
-//! This comment used to go on to say that `controlplane.tailscale.com` serves
-//! an RSA-PSS-only chain, and therefore that the hosted service was out of
-//! reach until someone wrote an allocation-free RSA verifier. **That was
-//! wrong**, and it sat in the roadmap as a blocker for longer than it should
-//! have. Measured — see `tests/vectors/hosted_tls.json` for the full record:
+//! The built-in trust anchors are ISRG Root X2 and Root YR. One explicit
+//! private root may additionally be supplied for a Headscale deployment.
 //!
-//! ```text
-//! offering ECDSA+SHA256 only, 3/3 runs:
-//!   TLSv1.3, TLS_AES_128_GCM_SHA256, peer sig ecdsa_secp256r1_sha256
-//!   leaf  CN=controlplane.tailscale.com  P-256   ecdsa-with-SHA384
-//!   ←     CN=YE1 (Let's Encrypt)         P-384   ecdsa-with-SHA384
-//!   ←     CN=Root YE (ISRG)              P-384   ecdsa-with-SHA384
-//!   ←     ISRG Root X2                   P-384   sha256WithRSAEncryption
-//! ```
-//!
-//! The endpoint is dual-chain and selects on the client's `signature_algorithms`.
-//! An RSA chain appears only when the client offers RSA. `Suite` here is already
-//! `TLS_AES_128_GCM_SHA256`, and `ecdsa_secp256r1_sha256` is the one
-//! CertificateVerify scheme `embedded-tls` supports unconditionally.
-//!
-//! P-384 chain-signature verification is enabled in this harness without
-//! allocation. Two hosted-integration obstacles remain, neither of which is RSA:
-//!
-//! 1. **The anchor model.** Hosted presents four entries ending at ISRG Root X2,
-//!    whose own issuer is RSA-signed X1. A single pinned anchor has to be the
-//!    issuer of the *topmost presented* certificate, so pinning Root YE is one
-//!    hop short.
-//! 2. **[`MAX_CERT`] is 4096** against a measured chain of 3411 DER bytes plus
-//!    per-entry framing. That is a latent overflow, not headroom.
-//!
-//! Key exchange is *not* an obstacle, though it looked like one while this was
-//! being measured. `embedded-tls` offers `NamedGroup::Secp256r1`, and hosted's
-//! IPv4 frontend requires exactly that: X25519-only was refused by four fixed
-//! IPv4 backends, 8/8, while P-256-only succeeded 8/8. Over IPv6 the same
-//! X25519-only client is accepted. A client offering only X25519 would therefore
-//! work over IPv6 and fail over IPv4, which would present as an intermittent
-//! fault rather than a configuration difference.
+//! Key exchange is not the obstacle in either measurement. `embedded-tls`
+//! offers `NamedGroup::Secp256r1`, which the hosted IPv4 frontend accepts.
 
-use embedded_tls::{
-    Aes128GcmSha256, Certificate, CryptoProvider, NoVerify, TlsConfig, TlsConnection, TlsContext,
-    TlsError, TlsVerifier,
+use core::sync::atomic::{AtomicU64, Ordering};
+use embedded_tls::{TlsConfig, TlsConnection, TlsContext, TlsError};
+use tailfeather::control::tls::{
+    RsaWorkspace, Suite, TLS_READ_BUFFER, TLS_WRITE_BUFFER, VerifyingProvider,
 };
 
 use crate::net::{NetError, TcpStream};
@@ -62,14 +34,7 @@ use crate::net::{NetError, TcpStream};
 /// TLS records are up to 16 KiB, so the buffers cannot be smaller and still
 /// speak the protocol. This is by far the largest allocation in the binary,
 /// which is why it is a named constant rather than hidden in a call.
-pub const RECORD_BUFFER: usize = 16 * 1024 + 512;
-
-/// The cipher suite. TLS 1.3 has only a handful, and this one is mandatory to
-/// implement, so no server can refuse it.
-type Suite = Aes128GcmSha256;
-
-/// How large a certificate the verifier will hold.
-const MAX_CERT: usize = 4096;
+pub const RECORD_BUFFER: usize = TLS_READ_BUFFER;
 
 /// The system clock, so certificate validity periods are enforced.
 ///
@@ -78,8 +43,15 @@ const MAX_CERT: usize = 4096;
 /// is for.
 struct SystemClock;
 
+const SYSTEM_TIME: u64 = u64::MAX;
+static TRUSTED_TIME_OVERRIDE: AtomicU64 = AtomicU64::new(SYSTEM_TIME);
+
 impl embedded_tls::TlsClock for SystemClock {
     fn now() -> Option<u64> {
+        let trusted = TRUSTED_TIME_OVERRIDE.load(Ordering::Relaxed);
+        if trusted != SYSTEM_TIME {
+            return Some(trusted);
+        }
         Some(rustix::time::clock_gettime(rustix::time::ClockId::Realtime).tv_sec as u64)
     }
 }
@@ -112,42 +84,6 @@ impl rand_core::RngCore for TlsRng {
 
 impl rand_core::CryptoRng for TlsRng {}
 
-/// A provider that actually verifies.
-///
-/// `embedded-tls`'s own `UnsecureProvider` is named honestly: its `verifier`
-/// returns `Unimplemented`, so the handshake completes without anyone checking
-/// the certificate. Supplying one is the whole point of this type.
-struct Verifying<'a> {
-    rng: TlsRng,
-    verifier: embedded_tls::pki::CertVerifier<'a, Suite, SystemClock, MAX_CERT>,
-}
-
-impl<'a> Verifying<'a> {
-    fn new(ca: &'a [u8]) -> Self {
-        Self {
-            rng: TlsRng,
-            verifier: embedded_tls::pki::CertVerifier::new(Certificate::X509(ca)),
-        }
-    }
-}
-
-impl CryptoProvider for Verifying<'_> {
-    type CipherSuite = Suite;
-    type Signature = p256::ecdsa::DerSignature;
-
-    fn rng(&mut self) -> impl rand_core::CryptoRngCore {
-        &mut self.rng
-    }
-
-    fn verifier(&mut self) -> Result<&mut impl TlsVerifier<Self::CipherSuite>, TlsError> {
-        Ok(&mut self.verifier)
-    }
-}
-
-/// Silences the unused warning on the type `embedded-tls` uses to mean "no
-/// verification", which this module deliberately never constructs.
-const _: Option<NoVerify> = None;
-
 #[derive(Debug)]
 pub enum TlsFailure {
     Net(NetError),
@@ -166,8 +102,8 @@ impl core::fmt::Display for TlsFailure {
 /// Open a verified TLS 1.3 connection.
 ///
 /// `server_name` is checked against the certificate's subject alternative
-/// names, and `ca` is the only trust anchor — a chain that does not lead to it
-/// is refused however well-formed it is.
+/// names. `ca` adds the deployment's private anchor to the built-in ISRG roots;
+/// a chain that reaches none of them is refused however well-formed it is.
 pub async fn connect<'a>(
     stream: TcpStream<'a>,
     server_name: &str,
@@ -175,10 +111,16 @@ pub async fn connect<'a>(
     read_buffer: &'a mut [u8],
     write_buffer: &'a mut [u8],
 ) -> Result<TlsConnection<'a, TcpStream<'a>, Suite>, TlsFailure> {
-    let config = TlsConfig::new().with_server_name(server_name);
+    let config = TlsConfig::new()
+        .with_server_name(server_name)
+        .enable_rsa_signatures();
     let mut connection = TlsConnection::new(stream, read_buffer, write_buffer);
+    let mut rsa = RsaWorkspace::new();
     connection
-        .open(TlsContext::new(&config, Verifying::new(ca)))
+        .open(TlsContext::new(
+            &config,
+            VerifyingProvider::<_, SystemClock>::new(TlsRng, Some(ca), &mut rsa),
+        ))
         .await
         .map_err(TlsFailure::Tls)?;
     Ok(connection)
@@ -190,7 +132,14 @@ pub async fn connect<'a>(
 /// is the point: TLS is a layer under the protocol, not a different protocol.
 /// A successful parse of the server's machine key proves bytes crossed it
 /// intact in both directions, not merely that a handshake completed.
-pub fn run(address: core::net::Ipv4Addr, port: u16, server_name: &str, ca_path: &str) -> ! {
+pub fn run(
+    address: core::net::Ipv4Addr,
+    port: u16,
+    server_name: &str,
+    ca_path: &str,
+    trusted_time: Option<u64>,
+) -> ! {
+    TRUSTED_TIME_OVERRIDE.store(trusted_time.unwrap_or(SYSTEM_TIME), Ordering::Relaxed);
     let clock = crate::time::Clock::start();
     let reactor = crate::exec::Reactor::new(clock);
 
@@ -237,7 +186,7 @@ async fn fetch(
     // of magnitude and a 33 KiB stack frame is not something to put on a
     // device's stack. They are used once, by one connection.
     static mut READ: [u8; RECORD_BUFFER] = [0; RECORD_BUFFER];
-    static mut WRITE: [u8; RECORD_BUFFER] = [0; RECORD_BUFFER];
+    static mut WRITE: [u8; TLS_WRITE_BUFFER] = [0; TLS_WRITE_BUFFER];
     // SAFETY: single-threaded, and these are referenced only here, once.
     let (read_buffer, write_buffer) = unsafe {
         (

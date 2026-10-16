@@ -436,7 +436,7 @@ fn regenerate_the_frozen_vectors() {
     let document = serde_json::json!({
         "_comment": "Noise IK initiations for ts2021, byte-equal to snow 0.10.0's \
                      message 1 with the ts2021 5-byte header prefixed. Regenerate with \
-                     `cargo test -p ts-conformance --test noise_vs_snow -- --ignored`.",
+                     `bazel run //crates/ts-conformance:regenerate_noise_vectors`.",
         "protocol":           PARAMS,
         "prologue":           format!("Tailscale Control Protocol v{CAPABILITY_VERSION}"),
         "capability_version": CAPABILITY_VERSION,

@@ -9,7 +9,7 @@
 //! actually runs in. Linking the crates here would prove they work when `std` is
 //! available to prop them up, which is not the question.
 //!
-//! So these checks run `harness/target/x86_64-unknown-linux-none/release/harness`
+//! So these checks run the `//harness:harness` Bazel runfile
 //! and read what it reports.
 //!
 //! # The event channel
@@ -22,8 +22,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use serde_json::Value;
+
+/// How many times [`Harness::register`] dials before giving up, and how long it
+/// waits after the first failure. Short, because the close is observed within
+/// milliseconds of connecting and the whole lab runs under a test timeout.
+const REGISTER_ATTEMPTS: u32 = 3;
+const REGISTER_BACKOFF: Duration = Duration::from_millis(250);
 
 /// The built harness binary.
 pub struct Harness {
@@ -91,6 +98,21 @@ impl Run {
         self.code == Some(0)
     }
 
+    /// Whether the run ended because the connection went away under it, rather
+    /// than because the server answered something. The harness prints the
+    /// transport error verbatim, so this is the one string that distinguishes
+    /// "nobody was listening any more" from every verdict worth reporting.
+    pub fn closed_early(&self) -> bool {
+        let closed = "network: connection closed";
+        self.stdout.contains(closed) || self.stderr.contains(closed)
+    }
+
+    /// Whether registration reached the point where the server may have
+    /// accepted the request, even if the response never arrived.
+    fn registration_submitted(&self) -> bool {
+        self.event("registration_submitted").is_some()
+    }
+
     /// A short summary for a failure message, since the harness's own output is
     /// the only diagnostic there is.
     pub fn tail(&self) -> String {
@@ -107,8 +129,8 @@ impl Run {
 
 impl Harness {
     /// Locate the built binary, if there is one.
-    pub fn discover(repo_root: &Path) -> Option<Self> {
-        let path = repo_root.join("harness/target/x86_64-unknown-linux-none/release/harness");
+    pub fn discover(_repo_root: &Path) -> Option<Self> {
+        let path = std::env::var_os("TS_CONFORMANCE_HARNESS").map(PathBuf::from)?;
         path.is_file().then_some(Self { path })
     }
 
@@ -118,6 +140,41 @@ impl Harness {
             .output()
             .map_err(|e| format!("could not run the harness: {e}"))?;
         Ok(Run::from_output(&output))
+    }
+
+    /// A `register` run, redialled past a transport-level close.
+    ///
+    /// Headscale occasionally drops a freshly established Noise connection
+    /// before answering on it — the session comes up, the early payload read
+    /// returns nothing, and the run reports `network: connection closed`. It is
+    /// not a verdict about the request, because the server never read one, and
+    /// a real client's response to a hangup is to dial again.
+    ///
+    /// Only that one signature is retried. Anything the server actually said —
+    /// a refused key, a rejected capability version — fails identically on
+    /// every attempt, and retrying it would turn a real regression into a
+    /// slower real regression.
+    ///
+    /// The identity lives in the state directory the caller passes, so an
+    /// ordinary second attempt presents the same machine and node keys rather
+    /// than leaving a stray node behind. A rotation is retried only if the run
+    /// closed before starting its POST: after that point the server may have
+    /// accepted the generated replacement key even though the harness did not
+    /// receive the response and persist it.
+    pub fn register(&self, args: &[&str]) -> Result<Run, String> {
+        let rotating = args.contains(&"--rotate");
+        let mut run = self.run(args)?;
+        for attempt in 1..REGISTER_ATTEMPTS {
+            if run.event("registered").is_some()
+                || !run.closed_early()
+                || (rotating && run.registration_submitted())
+            {
+                break;
+            }
+            std::thread::sleep(REGISTER_BACKOFF * attempt);
+            run = self.run(args)?;
+        }
+        Ok(run)
     }
 
     /// The binary, for a check that needs to drive it itself rather than wait.
@@ -142,5 +199,176 @@ impl Harness {
 }
 
 /// The message a check reports when the binary has not been built.
-pub const NOT_BUILT: &str = "the no_std harness is not built; run 'cd harness && cargo build --release' \
+pub const NOT_BUILT: &str = "the no_std harness is not built; run 'bazel build //harness:harness' \
      (scripts/conformance.sh does this)";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in for the harness binary: a shell script that counts its own
+    /// invocations in `counter` and misbehaves as the test asks. Registration is
+    /// driven through a subprocess, so the only honest way to test the retry is
+    /// with a subprocess that misbehaves.
+    ///
+    /// The harness is `sh` and the script is its first argument, rather than the
+    /// script being executable itself. These tests run in parallel with the rest
+    /// of the module, and a sibling forking while this file is still open for
+    /// writing is exactly the ETXTBSY case — running it as data has no such race.
+    fn stub(dir: &Path, body: &str) -> (Harness, String) {
+        let path = dir.join("stub.sh");
+        std::fs::write(&path, body).unwrap();
+        (
+            Harness {
+                path: PathBuf::from("/bin/sh"),
+            },
+            path.to_string_lossy().into_owned(),
+        )
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ts-conformance-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_closed_connection_is_retried_and_can_succeed() {
+        let dir = scratch_dir("retry");
+        let counter = dir.join("count");
+        let (harness, script) = stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+n=$(cat {counter} 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > {counter}
+if [ "$n" -eq 1 ]; then
+  echo "noise session established"
+  echo "FAIL network: connection closed"
+  exit 1
+fi
+echo '#EVT {{"event":"registered","node":"nodekey:abc"}}'
+"#,
+                counter = counter.display()
+            ),
+        );
+
+        let run = harness.register(&[&script, "register"]).unwrap();
+        assert!(run.event("registered").is_some(), "{}", run.tail());
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "2");
+    }
+
+    #[test]
+    fn a_rotation_closed_before_its_post_is_retried() {
+        let dir = scratch_dir("rotation-before-post");
+        let counter = dir.join("count");
+        let (harness, script) = stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+n=$(cat {counter} 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > {counter}
+if [ "$n" -eq 1 ]; then
+  echo "-> POST /machine/register"
+  echo "FAIL network: connection closed"
+  exit 1
+fi
+echo '#EVT {{"event":"registered","node":"nodekey:abc"}}'
+"#,
+                counter = counter.display()
+            ),
+        );
+
+        let run = harness
+            .register(&[&script, "register", "--rotate"])
+            .unwrap();
+        assert!(run.event("registered").is_some(), "{}", run.tail());
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "2");
+    }
+
+    #[test]
+    fn a_rotation_closed_after_submission_is_not_retried() {
+        let dir = scratch_dir("rotation-after-post");
+        let counter = dir.join("count");
+        let (harness, script) = stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+n=$(cat {counter} 2>/dev/null || echo 0)
+echo "$((n + 1))" > {counter}
+echo "-> POST /machine/register"
+echo '#EVT {{"event":"registration_submitted"}}'
+echo "FAIL network: connection closed"
+exit 1
+"#,
+                counter = counter.display()
+            ),
+        );
+
+        let run = harness
+            .register(&[&script, "register", "--rotate"])
+            .unwrap();
+        assert!(run.event("registered").is_none());
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            "1",
+            "a possibly accepted rotation must not generate a second replacement key"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_reported_rather_than_retried() {
+        let dir = scratch_dir("refusal");
+        let counter = dir.join("count");
+        let (harness, script) = stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+n=$(cat {counter} 2>/dev/null || echo 0)
+echo "$((n + 1))" > {counter}
+echo "FAIL unexpected status 401"
+exit 1
+"#,
+                counter = counter.display()
+            ),
+        );
+
+        let run = harness.register(&[&script, "register"]).unwrap();
+        assert!(run.event("registered").is_none());
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            "1",
+            "a verdict from the server must not be dialled again"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_keeps_closing_gives_up() {
+        let dir = scratch_dir("persistent");
+        let counter = dir.join("count");
+        let (harness, script) = stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+n=$(cat {counter} 2>/dev/null || echo 0)
+echo "$((n + 1))" > {counter}
+echo "FAIL network: connection closed"
+exit 1
+"#,
+                counter = counter.display()
+            ),
+        );
+
+        let run = harness.register(&[&script, "register"]).unwrap();
+        assert!(run.event("registered").is_none());
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            REGISTER_ATTEMPTS.to_string()
+        );
+        assert!(run.closed_early());
+    }
+}

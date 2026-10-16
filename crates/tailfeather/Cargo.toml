@@ -5,22 +5,47 @@ readme = "README.md"
 keywords = ["tailscale", "wireguard", "no-std", "embedded", "sans-io"]
 categories = ["network-programming", "no-std", "embedded"]
 exclude = ["tests/"]
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pawelchcki/tailfeather"
+rust-version = "1.88"
 version = "0.0.1"
 
+[features]
+default = []
+# Retain a bounded display name for each peer (MagicDNS short name, falling
+# back to Hostinfo.Hostname) and for this node. Off by default so the
+# firmware's static RAM budget is unchanged; only the browser client enables it.
+peer-names = []
+
 [dependencies]
+crypto-bigint = { version = "0.5.5", default-features = false }
+critical-section = "1.2.0"
 crypto_box = { version = "0.9", default-features = false, features = ["salsa20"] }
 embedded-io-async = "0.7"
-heapless.workspace = true
-micro-h2.workspace = true
-subtle.workspace = true
-wirefeather.workspace = true
-x25519-dalek.workspace = true
-zeroize.workspace = true
+embedded-tls = { version = "0.19", default-features = false }
+heapless = "0.9"
+micro-h2 = { path = "../micro-h2", version = "0.0.1" }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+sha2 = { version = "0.10", default-features = false }
+smoltcp = { version = "0.13.1", default-features = false, features = [
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+] }
+subtle = { version = "2.6", default-features = false }
+wirefeather = { path = "../wirefeather", version = "0.0.1" }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "precomputed-tables", "zeroize"] }
+zeroize = { version = "1.8", default-features = false }
 
 [dev-dependencies]
+base64 = "0.22"
+critical-section = { version = "1.2.0", features = ["std"] }
 hex = "0.4"
+rand_chacha = "=0.3.1"
+rand_core = "=0.6.4"
+rsa = { version = "=0.9.9", features = ["sha2"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+signature = "=2.2.0"

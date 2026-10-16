@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <!-- xterm.js adds <style> elements for its renderer, which CSP counts as
+       inline style; scripts stay restricted to this origin plus WebAssembly. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https: wss:; style-src 'self' 'unsafe-inline'">
+  <title>tailfeather web</title>
+  <link rel="stylesheet" href="vendor/xterm.css">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <h1>tailfeather <span>browser node</span></h1>
+    <p id="status" data-phase="idle">idle</p>
+    <div class="topbar-actions">
+      <button id="quick-connect" type="button" class="primary" hidden>Connect</button>
+      <button id="drawer-toggle" type="button" aria-controls="drawer" aria-expanded="false">Tailnet</button>
+    </div>
+  </header>
+
+  <p id="auth" hidden>Approve this node: <a id="auth-link" target="_blank" rel="noopener noreferrer"></a></p>
+
+  <div id="workspace">
+    <section id="terminal-panel" aria-label="SSH terminals">
+      <form id="ssh-form" autocomplete="off">
+        <label class="peer">Peer
+          <select id="peer-select" disabled><option value="">No peers yet</option></select>
+        </label>
+        <label class="host">Host <input id="ssh-host" value="100.113.109.28" spellcheck="false" autocapitalize="off" autocorrect="off"></label>
+        <label class="user">User <input id="ssh-user" spellcheck="false" placeholder="user" autocapitalize="off" autocorrect="off"></label>
+        <label class="port">Port <input id="ssh-port" value="22" inputmode="numeric"></label>
+        <button id="ssh-button" type="submit" disabled>Open terminal</button>
+      </form>
+
+      <p id="notice" role="alert" hidden></p>
+
+      <div id="tabbar">
+        <div id="tabs" role="tablist" aria-label="SSH connections"></div>
+        <div class="tab-actions">
+          <button id="new-tab" type="button" title="New connection" aria-label="New connection">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+          <button id="ssh-close" type="button" title="Disconnect this tab's session (keeps its output)" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9"/><path d="M6.3 6.3a8 8 0 1 0 11.4 0"/></svg>
+            <span class="label">Disconnect</span>
+          </button>
+          <button id="focus-button" type="button" title="Terminal only (Esc outside the terminal restores)" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+            <span class="label">Focus</span>
+          </button>
+          <button id="fullscreen-button" type="button" title="Fullscreen" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9V3h6M21 9V3h-6M3 15v6h6M21 15v6h-6"/></svg>
+            <span class="label">Fullscreen</span>
+          </button>
+        </div>
+      </div>
+
+      <div id="terminal"></div>
+
+      <div id="keybar" role="toolbar" aria-label="Terminal keys">
+        <button type="button" data-key="ctrl" aria-pressed="false">Ctrl</button>
+        <button type="button" data-key="esc">Esc</button>
+        <button type="button" data-key="tab">Tab</button>
+        <button type="button" data-key="left" aria-label="Left arrow">←</button>
+        <button type="button" data-key="up" aria-label="Up arrow">↑</button>
+        <button type="button" data-key="down" aria-label="Down arrow">↓</button>
+        <button type="button" data-key="right" aria-label="Right arrow">→</button>
+        <button type="button" data-key="keyboard" aria-label="Show or hide the keyboard">⌨</button>
+      </div>
+    </section>
+
+    <aside id="drawer" aria-labelledby="drawer-title" hidden>
+      <div class="drawer-head">
+        <h2 id="drawer-title" tabindex="-1">Tailnet</h2>
+        <button id="drawer-close" type="button">Close</button>
+      </div>
+
+      <section id="connect">
+        <h3>Join the tailnet</h3>
+        <form id="connect-form" autocomplete="off">
+          <label>Hostname
+            <input id="hostname" name="hostname" value="tailfeather-web" spellcheck="false" autocapitalize="off" autocorrect="off">
+          </label>
+          <label>Auth key <small>(optional; without one you log in through a link, or
+            <a href="/connect">get a one-time key</a> with your Cloudflare Access login)</small>
+            <input id="auth-key" name="authKey" type="password" placeholder="tskey-auth-…" spellcheck="false">
+          </label>
+          <label class="check"><input id="ephemeral" type="checkbox" checked> Ephemeral node</label>
+          <label class="check"><input id="remember" type="checkbox" checked> Remember settings and secrets in this browser</label>
+          <details>
+            <summary>Advanced</summary>
+            <label>Relay <small>(empty = connect directly)</small>
+              <input id="relay" name="relay" placeholder="https://relay.example" spellcheck="false" autocapitalize="off" autocorrect="off">
+            </label>
+            <label>SSH target <small>(its DERP region becomes this node's home)</small>
+              <input id="target" name="target" value="100.113.109.28" spellcheck="false" autocapitalize="off" autocorrect="off">
+            </label>
+            <label>Home DERP region override <small>(region id; empty = automatic)</small>
+              <input id="home-derp" name="homeDerp" inputmode="numeric" spellcheck="false">
+            </label>
+          </details>
+          <div class="buttons">
+            <button id="connect-button" type="submit">Connect</button>
+            <button id="stop-button" type="button" disabled>Stop</button>
+            <button id="forget-button" type="button" class="danger">Forget this browser node</button>
+          </div>
+        </form>
+      </section>
+
+      <details id="ssh-options">
+        <summary>SSH options</summary>
+        <label>Private key <small>(optional)</small>
+          <textarea id="ssh-key" rows="4" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+        </label>
+        <div class="buttons">
+          <button id="hostkey-forget" type="button">Forget host key</button>
+        </div>
+      </details>
+
+      <details id="diagnostics">
+        <summary>Diagnostics</summary>
+        <section id="netmap">
+          <h3>This node</h3>
+          <table id="self"><tbody></tbody></table>
+          <h3>Peers <small id="peer-count"></small></h3>
+          <div class="scroll">
+            <table id="peers">
+              <thead><tr><th>Name</th><th>Tailnet IP</th><th>Online</th><th>Endpoints</th><th>Home DERP</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <h3>DERP map</h3>
+          <div class="scroll">
+            <table id="derp">
+              <thead><tr><th>Region</th><th>Code</th><th>Nodes</th><th>State</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+        <h3>Log</h3>
+        <pre id="log" aria-live="polite"></pre>
+      </details>
+    </aside>
+  </div>
+</div>
+</body>
+</html>

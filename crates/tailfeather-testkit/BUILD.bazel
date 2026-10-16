@@ -1,0 +1,61 @@
+load("@tailfeather_root_deps//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc", "rust_doc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["expected.json"])
+
+rust_library(
+    name = "tailfeather_testkit",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    aliases = aliases(),
+    compile_data = glob(["fixtures/*.json"]),
+    crate_name = "tailfeather_testkit",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "tailfeather-testkit",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    crate_name = "tailfeather_testkit_cli",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    deps = [":tailfeather_testkit"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_test",
+    crate = ":tailfeather_testkit",
+)
+
+rust_test(
+    name = "fixtures_test",
+    srcs = ["tests/fixtures.rs"],
+    crate_name = "fixtures",
+    crate_root = "tests/fixtures.rs",
+    data = glob(["fixtures/*.json"]),
+    edition = "2024",
+    env = {"TAILFEATHER_TESTKIT_FIXTURES": "$(rootpath :fixtures/provenance.json)"},
+    deps = [":tailfeather_testkit"] + all_crate_deps(normal = True),
+)
+
+filegroup(
+    name = "fixtures",
+    srcs = glob(["fixtures/*.json"]),
+)
+
+rust_doc_test(
+    name = "doc_test",
+    crate = ":tailfeather_testkit",
+)
+
+rust_doc(
+    name = "docs",
+    crate = ":tailfeather_testkit",
+    rustdoc_flags = ["-Dwarnings"],
+)

@@ -1,7 +1,10 @@
 {
-  "_comment": "Measured against controlplane.tailscale.com, read-only. Recorded because the repository previously documented this endpoint as RSA-PSS-only, which is wrong and had become a roadmap blocker. Re-measure before relying on it: Let's Encrypt can reissue, and the check that consumes this must assert what it observed rather than assume ECDSA forever.",
+  "_comment": "Two read-only captures from controlplane.tailscale.com. The 2026-08-01 ECDSA capture is retained as a regression fixture. On 2026-08-12 the endpoint required an RSA-PSS offer and selected the Generation Y RSA chain recorded below. Let's Encrypt can reissue, so tests validate the committed public chains rather than assuming either selection forever.",
   "measured_on": "2026-08-01",
   "host": "controlplane.tailscale.com",
+  "source": "controlplane.tailscale.com:443",
+  "provenance": "openssl s_client with ECDSA+SHA256 only; leaf recovered from Cert Spotter issuance 15207156327 and static CAs from Let's Encrypt",
+  "fixture": "hosted-ecdsa-chain.pem",
   "client_offered_sigalgs": "ECDSA+SHA256 only",
   "negotiated": {
     "protocol": "TLSv1.3",
@@ -23,6 +26,7 @@
       "issuer": "C=US, O=Let's Encrypt, CN=YE1",
       "signature_algorithm": "ecdsa-with-SHA384",
       "public_key": "256-bit P-256",
+      "sha256": "dcae35d5111c89ee460a72a79cb5ed7a94b49bff5b4fa83d191e445788e505f6",
       "der_bytes": 934
     },
     {
@@ -31,6 +35,7 @@
       "issuer": "C=US, O=ISRG, CN=Root YE",
       "signature_algorithm": "ecdsa-with-SHA384",
       "public_key": "384-bit P-384",
+      "sha256": "a2372d06431e9716365eeed47ec020351497d182fcc038e457e58168a03cac07",
       "der_bytes": 655
     },
     {
@@ -39,6 +44,7 @@
       "issuer": "C=US, O=Internet Security Research Group, CN=ISRG Root X2",
       "signature_algorithm": "ecdsa-with-SHA384",
       "public_key": "384-bit P-384",
+      "sha256": "0fc0901cca2bae9e9fdbb02d50d02f1094f7b36672086991b9e897626dc485f0",
       "der_bytes": 682
     },
     {
@@ -47,7 +53,51 @@
       "issuer": "C=US, O=Internet Security Research Group, CN=ISRG Root X1",
       "signature_algorithm": "sha256WithRSAEncryption",
       "public_key": "384-bit P-384",
+      "sha256": "ee5f7abd6981bb0255632cd8f49283451b4b18844d12040b44ee00f07b8fe2c6",
       "der_bytes": 1140
     }
-  ]
+  ],
+  "rsa_capture": {
+    "captured_on": "2026-08-12",
+    "source": "controlplane.tailscale.com:443",
+    "provenance": "openssl s_client -showcerts -sigalgs rsa_pss_rsae_sha256; public certificates only",
+    "fixture": "hosted-rsa-chain.pem",
+    "client_offered_sigalgs": "rsa_pss_rsae_sha256 only",
+    "negotiated": {
+      "protocol": "TLSv1.3",
+      "cipher": "TLS_AES_128_GCM_SHA256",
+      "peer_signature_type": "rsa_pss_rsae_sha256",
+      "group": "X25519MLKEM768"
+    },
+    "handshake_bytes_read": 5714,
+    "chain": [
+      {
+        "index": 0,
+        "subject": "CN=controlplane.tailscale.com",
+        "issuer": "C=US, O=Let's Encrypt, CN=YR1",
+        "signature_algorithm": "sha256WithRSAEncryption",
+        "public_key": "RSA 2048, e=65537",
+        "sha256": "fe138eee8a63bb3ca17126c25a5e450aadee6164c37da783860b5a0655e7b767",
+        "der_bytes": 1297
+      },
+      {
+        "index": 1,
+        "subject": "C=US, O=Let's Encrypt, CN=YR1",
+        "issuer": "C=US, O=ISRG, CN=Root YR",
+        "signature_algorithm": "sha256WithRSAEncryption",
+        "public_key": "RSA 2048, e=65537",
+        "sha256": "13949634d99cd6fd6aa80bc034fefacceb1969feef986586713ecdbb05758d3f",
+        "der_bytes": 1247
+      },
+      {
+        "index": 2,
+        "subject": "C=US, O=ISRG, CN=Root YR",
+        "issuer": "C=US, O=Internet Security Research Group, CN=ISRG Root X1",
+        "signature_algorithm": "sha256WithRSAEncryption",
+        "public_key": "RSA 4096, e=65537",
+        "sha256": "072639d0b140d5bffae16ad9c3f6cc6086040621f51ee61a6d46a8915c07cf76",
+        "der_bytes": 1528
+      }
+    ]
+  }
 }

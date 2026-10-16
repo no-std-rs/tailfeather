@@ -1,11 +1,13 @@
 //! Peers, and the table that survives deltas.
 
-use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use core::str::FromStr;
 
 use crate::keys::{DiscoPublic, NodePublic};
 
-use crate::netmap::{Error, MAX_ADDRESSES, MAX_ALLOWED_IPS, MAX_ENDPOINTS, MAX_PEERS};
+use crate::netmap::{
+    CapacityError, Error, MAX_ADDRESSES, MAX_ALLOWED_IPS, MAX_ENDPOINTS, MAX_PEERS,
+};
 
 /// An address with a prefix length, as the server writes them: `100.64.0.1/32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,41 @@ impl Cidr {
     }
 }
 
+/// A peer's subnet, stored IPv4-only.
+///
+/// Peers are the one part of the staged map that scales with the tailnet, and
+/// the staged map lives in the C6's 16 KiB RTC-fast bank, which is silicon and
+/// cannot be grown. A [`Cidr`] spends 24 bytes to hold an address family this
+/// device's data plane does not have: `wirefeather` reads IPv4 headers, the
+/// harness binds `AF_INET`, and [`Peer::endpoints`] is already `SocketAddrV4`
+/// for exactly that reason. Eight bytes here instead saves 192 bytes per peer
+/// across [`MAX_ADDRESSES`] and [`MAX_ALLOWED_IPS`] — the difference between a
+/// 3-peer and a 9-peer table, which is the difference between reaching the
+/// device from your laptop and not.
+///
+/// Self addresses and routes keep the full [`Cidr`]: `default_routes_approved`
+/// must still see the `::/0` the control plane sends, and there is one such
+/// record rather than one per peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cidr4 {
+    pub address: Ipv4Addr,
+    pub prefix: u8,
+}
+
+impl Cidr4 {
+    /// The IPv4 half of a parsed CIDR. `None` for IPv6, which this node cannot
+    /// route and therefore does not retain.
+    pub fn from_cidr(cidr: Cidr) -> Option<Self> {
+        match cidr.address {
+            IpAddr::V4(address) => Some(Self {
+                address,
+                prefix: cidr.prefix,
+            }),
+            IpAddr::V6(_) => None,
+        }
+    }
+}
+
 /// One node on the tailnet.
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -39,13 +76,25 @@ pub struct Peer {
     pub id: u64,
     pub node_key: NodePublic,
     pub disco_key: Option<DiscoPublic>,
-    pub online: bool,
+    /// Bit zero is online; bit one retains delayed-self IPv4 approval.
+    state_flags: u8,
+    /// IPv6 default-route approval retained until a delayed self record is
+    /// distinguished from an ordinary peer. IPv4 fits in allowed-IP storage.
+    pub(crate) approved_ipv6_default: bool,
     /// The DERP region this peer is reachable through when no direct path
     /// exists. Zero means none advertised.
     pub home_derp: u16,
-    pub addresses: heapless::Vec<Cidr, MAX_ADDRESSES>,
-    pub allowed_ips: heapless::Vec<Cidr, MAX_ALLOWED_IPS>,
-    pub endpoints: heapless::Vec<SocketAddr, MAX_ENDPOINTS>,
+    pub addresses: heapless::Vec<Cidr4, MAX_ADDRESSES>,
+    pub allowed_ips: heapless::Vec<Cidr4, MAX_ALLOWED_IPS>,
+    /// Usable direct paths for this IPv4-only node. IPv6 endpoints from a map
+    /// are valid but intentionally not retained, just as IPv6 payloads are
+    /// counted and rejected by the data plane.
+    pub endpoints: heapless::Vec<SocketAddrV4, MAX_ENDPOINTS>,
+    /// What to call this peer on a screen: the first label of its MagicDNS
+    /// name, or its self-reported host name when it has none. Empty when the
+    /// map named neither. Display only; never used to route or authorize.
+    #[cfg(feature = "peer-names")]
+    pub name: heapless::String<{ crate::netmap::MAX_PEER_NAME }>,
 }
 
 impl Peer {
@@ -54,21 +103,37 @@ impl Peer {
             id,
             node_key,
             disco_key: None,
-            online: false,
+            state_flags: 0,
+            approved_ipv6_default: false,
             home_derp: 0,
             addresses: heapless::Vec::new(),
             allowed_ips: heapless::Vec::new(),
             endpoints: heapless::Vec::new(),
+            #[cfg(feature = "peer-names")]
+            name: heapless::String::new(),
         }
+    }
+
+    pub fn online(&self) -> bool {
+        self.state_flags & 1 != 0
+    }
+
+    pub(crate) fn set_online(&mut self, online: bool) {
+        self.state_flags = (self.state_flags & !1) | u8::from(online);
+    }
+
+    pub(crate) fn set_approved_ipv4_default(&mut self, approved: bool) {
+        self.state_flags = (self.state_flags & !2) | (u8::from(approved) << 1);
+    }
+
+    pub(crate) fn approved_ipv4_default(&self) -> bool {
+        self.state_flags & 2 != 0
     }
 
     /// This peer's tailnet IPv4 address, which is what traffic to it is
     /// addressed to.
     pub fn tailscale_ipv4(&self) -> Option<Ipv4Addr> {
-        self.addresses.iter().find_map(|cidr| match cidr.address {
-            IpAddr::V4(address) => Some(address),
-            IpAddr::V6(_) => None,
-        })
+        self.addresses.first().map(|cidr| cidr.address)
     }
 
     /// The first endpoint that can be used directly.
@@ -78,10 +143,7 @@ impl Peer {
     /// has no direct path as far as this node is concerned, and must be reached
     /// through DERP.
     pub fn direct_endpoint(&self) -> Option<core::net::SocketAddrV4> {
-        self.endpoints.iter().find_map(|endpoint| match endpoint {
-            SocketAddr::V4(address) => Some(*address),
-            SocketAddr::V6(_) => None,
-        })
+        self.endpoints.first().copied()
     }
 }
 
@@ -119,6 +181,15 @@ impl<const N: usize> PeerTable<N> {
         self.peers.iter()
     }
 
+    pub(crate) fn copy_from(&mut self, source: &Self) {
+        self.peers.clear();
+        for peer in source.iter() {
+            self.peers
+                .push(peer.clone())
+                .expect("equal peer capacities");
+        }
+    }
+
     pub fn get(&self, id: u64) -> Option<&Peer> {
         self.peers.iter().find(|p| p.id == id)
     }
@@ -141,7 +212,9 @@ impl<const N: usize> PeerTable<N> {
             *existing = peer;
             return Ok(());
         }
-        self.peers.push(peer).map_err(|_| Error::Full)
+        self.peers
+            .push(peer)
+            .map_err(|_| Error::Full(CapacityError::Peers))
     }
 
     pub fn remove(&mut self, id: u64) -> bool {
@@ -196,23 +269,19 @@ mod tests {
     #[test]
     fn a_peer_reports_its_tailnet_address_and_a_usable_endpoint() {
         let mut peer = Peer::new(1, key(1));
+        // A peer's IPv6 subnet is not representable: it is dropped as the map
+        // is parsed, because this node has no way to route it.
+        assert_eq!(
+            Cidr4::from_cidr(Cidr::parse("fd7a:115c:a1e0::1/128").unwrap()),
+            None
+        );
         peer.addresses
-            .push(Cidr::parse("fd7a:115c:a1e0::1/128").unwrap())
+            .push(Cidr4::from_cidr(Cidr::parse("100.64.0.1/32").unwrap()).unwrap())
             .unwrap();
-        peer.addresses
-            .push(Cidr::parse("100.64.0.1/32").unwrap())
-            .unwrap();
-        // The v4 address must be found even when it is not first.
         assert_eq!(peer.tailscale_ipv4(), Some(Ipv4Addr::new(100, 64, 0, 1)));
 
-        peer.endpoints
-            .push("[fd7a::1]:41641".parse().unwrap())
-            .unwrap();
-        assert_eq!(
-            peer.direct_endpoint(),
-            None,
-            "an IPv6-only peer has no direct path for an IPv4 data plane"
-        );
+        // The parser discards IPv6 endpoints before constructing a Peer.
+        assert_eq!(peer.direct_endpoint(), None);
         peer.endpoints
             .push("192.168.6.167:37907".parse().unwrap())
             .unwrap();
@@ -253,7 +322,10 @@ mod tests {
         let mut table = PeerTable::<2>::new();
         table.upsert(Peer::new(1, key(1))).unwrap();
         table.upsert(Peer::new(2, key(2))).unwrap();
-        assert_eq!(table.upsert(Peer::new(3, key(3))), Err(Error::Full));
+        assert_eq!(
+            table.upsert(Peer::new(3, key(3))),
+            Err(Error::Full(CapacityError::Peers))
+        );
     }
 
     #[test]

@@ -1,0 +1,221 @@
+module(
+    name = "tailfeather",
+    version = "0.0.1",
+)
+
+bazel_dep(name = "llvm", version = "0.8.16")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.22")
+bazel_dep(name = "rules_python", version = "2.2.0")
+bazel_dep(name = "rules_rs", version = "0.0.102")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+
+# rules_llvm otherwise fetches musl only from musl.libc.org. That origin is
+# intermittently unreachable from the privileged BuildBuddy runner, so keep
+# the byte-identical Buildroot source mirror ahead of the upstream URL.
+single_version_override(
+    module_name = "llvm",
+    patch_strip = 1,
+    patches = ["//bazel/patches:llvm-musl-mirror.patch"],
+    version = "0.8.16",
+)
+
+single_version_override(
+    module_name = "rules_rs",
+    patch_strip = 1,
+    patches = [
+        "//bazel/patches:rules_rs-build-script-link-deps.patch",
+        "//bazel/patches:rules_rs-zlib-ubuntu-snapshot.patch",
+    ],
+    version = "0.0.102",
+)
+
+rust_toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+rust_toolchains.toolchain(
+    edition = "2024",
+    version = "1.95.0",
+)
+use_repo(rust_toolchains, "default_rust_toolchains")
+
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+use_repo(rules_rust, "rules_rust")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13")
+use_repo(python, "python_3_13")
+
+register_toolchains(
+    "@default_rust_toolchains//:all",
+    "@llvm//toolchain:all",
+    "@python_3_13//:all",
+)
+
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "tailfeather_root_deps",
+    cargo_lock = "//:Cargo.lock",
+    cargo_toml = "//:Cargo.toml",
+    platform_triples = [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+    ],
+)
+crate.annotation(
+    crate = "embedded-tls",
+    repositories = ["harness_deps"],
+    rustc_flags = ["-Cpanic=abort"],
+)
+crate.annotation(
+    crate = "rustix",
+    repositories = ["harness_deps"],
+    rustc_flags = ["-Cpanic=abort"],
+)
+crate.annotation(
+    crate = "esp-hal",
+    patch_args = ["-p1"],
+    patches = ["//bazel/patches:esp-hal-esp32c6-ram-length.patch"],
+    repositories = ["firmware_deps"],
+)
+crate.annotation(
+    crate = "esp-metadata-generated",
+    patch_args = ["-p1"],
+    patches = ["//bazel/patches:esp-metadata-generated-cross.patch"],
+    repositories = ["firmware_deps"],
+)
+crate.from_cargo(
+    name = "harness_deps",
+    cargo_lock = "//harness:Cargo.lock",
+    cargo_toml = "//harness:Cargo.toml",
+    platform_triples = [
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+crate.from_cargo(
+    name = "firmware_deps",
+    cargo_lock = "//firmware:Cargo.lock",
+    cargo_toml = "//firmware:Cargo.toml",
+    platform_triples = [
+        "riscv32imac-unknown-none-elf",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+use_repo(crate, "firmware_deps", "harness_deps", "tailfeather_root_deps")
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+SMOLVM_BUILD_FILE_CONTENT = """
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "smolvm",
+    "smolvm-bin",
+])
+
+filegroup(
+    name = "bundle",
+    srcs = glob(["**"]),
+)
+"""
+
+http_archive(
+    name = "smolvm_1_7_4_linux_x86_64",
+    build_file_content = SMOLVM_BUILD_FILE_CONTENT,
+    sha256 = "50c265b55a9f0fde883690e279705220a900944160ea05903b843684c3c6a784",
+    strip_prefix = "smolvm-1.7.4-linux-x86_64",
+    urls = ["https://github.com/smol-machines/smolvm/releases/download/v1.7.4/smolvm-1.7.4-linux-x86_64.tar.gz"],
+)
+
+http_file(
+    name = "alpine_minirootfs_3_21_7_x86_64",
+    downloaded_file_path = "alpine-minirootfs-3.21.7-x86_64.tar.gz",
+    sha256 = "8cba1ea3e8b500ea986a313d8eecf3d5952a2a0d23a69117bb81c023d9ceac05",
+    urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.7-x86_64.tar.gz"],
+)
+
+http_file(
+    name = "headscale_0_29_3_linux_amd64",
+    downloaded_file_path = "headscale",
+    sha256 = "8dc183758024ed7095cf610fedea0790233613c71353bc8be2715d82ba29b92c",
+    urls = ["https://github.com/juanfont/headscale/releases/download/v0.29.3/headscale_0.29.3_linux_amd64"],
+)
+
+TAILSCALE_BUILD_FILE_CONTENT = """
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["tailscale", "tailscaled"])
+"""
+
+http_archive(
+    name = "tailscale_1_94_2_linux_amd64",
+    build_file_content = TAILSCALE_BUILD_FILE_CONTENT,
+    sha256 = "c6f99a5d774c7783b56902188d69e9756fc3dddfb08ac6be4cb2585f3fecdc32",
+    strip_prefix = "tailscale_1.94.2_amd64",
+    urls = ["https://pkgs.tailscale.com/stable/tailscale_1.94.2_amd64.tgz"],
+)
+
+# The privileged guest installs these checksum-pinned APKs with --no-network.
+# They form its complete networking and TLS overlay; the action never consults
+# Alpine package indexes or upstream repositories.
+http_file(name = "apk_bash", downloaded_file_path = "bash-5.2.37-r0.apk", sha256 = "0d58acbe43dd345a274a74e333f78af583b612229fc003dfb9fdee5dfc9149ff", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/bash-5.2.37-r0.apk"])
+http_file(name = "apk_ethtool", downloaded_file_path = "ethtool-6.11-r0.apk", sha256 = "93bf174c371ace79e8f7bd93cf0257c4b4d03de55b9590a585f632e4034ef1e6", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/ethtool-6.11-r0.apk"])
+http_file(name = "apk_iproute2_minimal", downloaded_file_path = "iproute2-minimal-6.11.0-r0.apk", sha256 = "3c40520dadc71fbaa1e977733ab2d62390b9bab4c984fa77257cd1d1499c5058", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/iproute2-minimal-6.11.0-r0.apk"])
+http_file(name = "apk_iproute2_ss", downloaded_file_path = "iproute2-ss-6.11.0-r0.apk", sha256 = "2dd321b88e0509b41c308fa9481929b3073260c12e21b3b1d55bfe5d0bb1c302", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/iproute2-ss-6.11.0-r0.apk"])
+http_file(name = "apk_iptables", downloaded_file_path = "iptables-1.8.11-r1.apk", sha256 = "659b088f780c9dca88b70587f87f6aa24582ca75008986b5913220b67e3cebef", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/iptables-1.8.11-r1.apk"])
+http_file(name = "apk_libcap2", downloaded_file_path = "libcap2-2.78-r0.apk", sha256 = "a2160f94232206985c3656fe4108bb7b25cf56cfda83b8488791b225cc6e7ed1", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libcap2-2.78-r0.apk"])
+http_file(name = "apk_libelf", downloaded_file_path = "libelf-0.191-r0.apk", sha256 = "6f98ef2df0544da22d910bc93fdb8eb50654ac822dd9d25f3a39ba8acde6c649", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libelf-0.191-r0.apk"])
+http_file(name = "apk_libmnl", downloaded_file_path = "libmnl-1.0.5-r2.apk", sha256 = "0de58a7968c96825f7ad1205ae0d18dd4d96c37db9dca31fee4727f6b08bc308", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libmnl-1.0.5-r2.apk"])
+http_file(name = "apk_libnftnl", downloaded_file_path = "libnftnl-1.2.8-r0.apk", sha256 = "de4048171138081548e581221d1b4642f07a6a638681b5db481b0edd54ba51b2", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libnftnl-1.2.8-r0.apk"])
+http_file(name = "apk_libxtables", downloaded_file_path = "libxtables-1.8.11-r1.apk", sha256 = "7bf83828c8c1c0b7b08aff38fdd2d11829fa77c7a750e6224b0b30fae0aecc0e", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libxtables-1.8.11-r1.apk"])
+http_file(name = "apk_zlib", downloaded_file_path = "zlib-1.3.2-r1.apk", sha256 = "52ed3729bec11d63313f38ade503d40650bb57a36ec72a0050619391fb6bfd5e", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/zlib-1.3.2-r1.apk"])
+http_file(name = "apk_zstd_libs", downloaded_file_path = "zstd-libs-1.5.6-r2.apk", sha256 = "45a06bfc107f44502b7e0503fcd5c8d2d2e6cff255134ed959275eb99caf9979", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/zstd-libs-1.5.6-r2.apk"])
+http_file(name = "apk_wireguard_tools_wg", downloaded_file_path = "wireguard-tools-wg-1.0.20210914-r4.apk", sha256 = "ee896fa69beed863ad93fff45cc3cb3b13aa0de3ded9f32c856a6d6c392e00e2", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/wireguard-tools-wg-1.0.20210914-r4.apk"])
+http_file(name = "apk_libcrypto3", downloaded_file_path = "libcrypto3-3.3.7-r2.apk", sha256 = "3c6fb1c90a974ef0fc83687868712340ca3df3ef5206cfc79fd81ff16f22596a", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libcrypto3-3.3.7-r2.apk"])
+http_file(name = "apk_libncursesw", downloaded_file_path = "libncursesw-6.5_p20241006-r3.apk", sha256 = "3919cf673e841d91865213799ccfd5f77a48f5f9f5402723167470295ee32a49", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libncursesw-6.5_p20241006-r3.apk"])
+http_file(name = "apk_libssl3", downloaded_file_path = "libssl3-3.3.7-r2.apk", sha256 = "00e674d00a80c9808580546dd388093c1c67f21628a9d70e27628bddc86a31e8", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libssl3-3.3.7-r2.apk"])
+http_file(name = "apk_ncurses_terminfo_base", downloaded_file_path = "ncurses-terminfo-base-6.5_p20241006-r3.apk", sha256 = "46402464710d165a8fed4b843b3a20d9950e1e9a20923c3869241014bf6b2f51", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/ncurses-terminfo-base-6.5_p20241006-r3.apk"])
+http_file(name = "apk_openssl", downloaded_file_path = "openssl-3.3.7-r2.apk", sha256 = "a444f449e2993d6b37fd5c9d9928b4378bb33a2362c0d0084ac940f564aaeb97", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/openssl-3.3.7-r2.apk"])
+http_file(name = "apk_readline", downloaded_file_path = "readline-8.2.13-r0.apk", sha256 = "fa4ff2347886f5516d021b9064a00259b29fc6e2608eac5588a339de244acf12", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/readline-8.2.13-r0.apk"])
+http_file(name = "apk_socat", downloaded_file_path = "socat-1.8.1.3-r0.apk", sha256 = "01652284adced99e2f8fe74d24746c176ba50fce1a507a08f4fbe3c95c41c22e", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/socat-1.8.1.3-r0.apk"])
+
+http_file(
+    name = "libkrunfw_source",
+    downloaded_file_path = "libkrunfw-v5.5.0.tar.gz",
+    sha256 = "b0cbf1450269c80aea1dccbf440011deb2762a098b338c234079a6ef06456ead",
+    urls = ["https://codeload.github.com/containers/libkrunfw/tar.gz/refs/tags/v5.5.0"],
+)
+
+http_file(
+    name = "linux_6_12_91_source",
+    downloaded_file_path = "linux-6.12.91.tar.xz",
+    sha256 = "0ff2ab9e169f9f1948557471fbb450d3018f8c5b77caf288e1a3982582597969",
+    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.91.tar.xz"],
+)
+
+# Kbuild's x86 objtool needs libelf headers and a matching runtime. Pin the
+# small Debian packages explicitly so the libkrunfw support artifact does not
+# depend on whichever development packages happen to be on the CI runner.
+http_file(
+    name = "deb_libelf_dev",
+    downloaded_file_path = "libelf-dev_0.188-2.1_amd64.deb",
+    sha256 = "79cb66b55021bd0130308369524bac5240d0b5463cb252cd44be6a1500fdebec",
+    urls = ["https://deb.debian.org/debian/pool/main/e/elfutils/libelf-dev_0.188-2.1_amd64.deb"],
+)
+
+http_file(
+    name = "deb_libelf_runtime",
+    downloaded_file_path = "libelf1_0.188-2.1_amd64.deb",
+    sha256 = "619add379c606b3ac6c1a175853b918e6939598a83d8ebadf3bdfd50d10b3c8c",
+    urls = ["https://deb.debian.org/debian/pool/main/e/elfutils/libelf1_0.188-2.1_amd64.deb"],
+)
+
+# Kbuild drives itself with make, which the bare RBE image does not carry.
+# Pinning it as a declared action input is what lets the kernel build run on
+# the standard executor instead of the workflow runner.
+http_file(
+    name = "deb_make",
+    downloaded_file_path = "make_4.3-4.1_amd64.deb",
+    sha256 = "a1a83af8cbd854af887b72ad196b1f4af58387815e21ced1000253a116a46e2a",
+    urls = ["https://deb.debian.org/debian/pool/main/m/make-dfsg/make_4.3-4.1_amd64.deb"],
+)

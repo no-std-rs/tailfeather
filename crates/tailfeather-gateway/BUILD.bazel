@@ -1,0 +1,55 @@
+load("@tailfeather_root_deps//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc", "rust_doc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(name = "rust_sources", srcs = glob(["src/**/*.rs"]))
+
+rust_library(
+    name = "tailfeather_gateway",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tailfeather_gateway",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "tailfeather_gateway_harness",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {"//crates/wirefeather:wirefeather_harness": "wirefeather"},
+    crate_name = "tailfeather_gateway",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort"],
+    deps = ["//crates/wirefeather:wirefeather_harness"],
+)
+
+rust_library(
+    name = "tailfeather_gateway_firmware",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {"//crates/wirefeather:wirefeather_firmware": "wirefeather"},
+    crate_name = "tailfeather_gateway",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort"],
+    deps = ["//crates/wirefeather:wirefeather_firmware"],
+)
+
+rust_test(
+    name = "unit_test",
+    aliases = aliases(),
+    crate = ":tailfeather_gateway",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "doc_test",
+    crate = ":tailfeather_gateway",
+)
+
+rust_doc(
+    name = "docs",
+    crate = ":tailfeather_gateway",
+    rustdoc_flags = ["-Dwarnings"],
+)

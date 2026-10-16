@@ -1,0 +1,64 @@
+common --enable_bzlmod
+common --enable_platform_specific_config
+common --announce_rc
+common --incompatible_strict_action_env
+common --lockfile_mode=error
+
+# Ordinary invocations prefer BuildBuddy Cloud RBE. The dynamic strategy keeps
+# a local branch available when the remote executor is unreachable.
+common --bes_backend=grpcs://remote.buildbuddy.io
+common --bes_results_url=https://app.buildbuddy.io/invocation/
+common --remote_cache=grpcs://remote.buildbuddy.io
+common --remote_executor=grpcs://remote.buildbuddy.io
+common --remote_download_outputs=minimal
+common --remote_local_fallback=true
+common --remote_cache_async=true
+common --spawn_strategy=dynamic
+common --strategy=Rustc=dynamic
+common --strategy=CppCompile=dynamic
+common --strategy=CppLink=dynamic
+common --extra_execution_platforms=//platforms:rbe_linux_amd64
+common --host_platform=//platforms:rbe_linux_amd64
+common --remote_timeout=60
+
+build --platforms=//platforms:x86_64_linux
+build --action_env=WIFI_SSID=buildbuddy-ci-placeholder
+build --action_env=WIFI_PASSWORD=buildbuddy-ci-placeholder
+build --action_env=TS_AUTH_KEY=tskey-auth-buildbuddy-ci-placeholder
+build --action_env=TS_BUILD_TIME_FLOOR=1767225600
+build --action_env=TS_CONTROL_CA_DER=/dev/null
+build --action_env=TS_CONTROL_URL=https://controlplane.tailscale.com
+build --action_env=TS_HOSTNAME=esp-gateway-ci
+test --test_output=errors
+
+# Fully local and cache-isolated. This is also the foundation for device work.
+common:local --remote_executor=
+common:local --remote_cache=
+common:local --bes_backend=
+common:local --bes_results_url=
+common:local --spawn_strategy=local
+common:local --strategy=Rustc=local
+common:local --strategy=CppCompile=local
+common:local --strategy=CppLink=local
+common:local --remote_upload_local_results=false
+common:local --disk_cache=
+
+build:optimized --compilation_mode=opt
+build:optimized --strip=never
+build:optimized --@rules_rust//rust/settings:lto=fat
+
+# Credentials may enter only these local actions; no BES invocation or remote
+# cache/executor is configured when this config is active.
+common:device --config=local
+common:device --config=optimized
+build:device --platforms=//platforms:esp32c6
+build:device --noremote_accept_cached
+build:device --noremote_upload_local_results
+
+# Test-only plaintext Headscale image. Keeping it debug-built makes the
+# compile-time release guard enforce that it cannot become a production image.
+common:lab-device --config=local
+build:lab-device --compilation_mode=dbg
+build:lab-device --platforms=//platforms:esp32c6
+build:lab-device --noremote_accept_cached
+build:lab-device --noremote_upload_local_results

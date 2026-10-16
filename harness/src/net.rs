@@ -12,7 +12,7 @@ use rustix::fd::{AsRawFd, OwnedFd, RawFd};
 use rustix::io::Errno;
 use rustix::net::{
     AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType, accept_with, bind, connect,
-    getsockname, listen, recvfrom, sendto, socket_with, sockopt,
+    getpeername, getsockname, ipproto, listen, recvfrom, sendto, socket_with, sockopt,
 };
 
 use crate::exec::Reactor;
@@ -47,6 +47,13 @@ fn would_block(e: Errno) -> bool {
 }
 
 fn new_socket(kind: SocketType) -> Result<OwnedFd, NetError> {
+    new_socket_with_protocol(kind, None)
+}
+
+fn new_socket_with_protocol(
+    kind: SocketType,
+    protocol: Option<rustix::net::Protocol>,
+) -> Result<OwnedFd, NetError> {
     socket_with(
         AddressFamily::INET,
         kind,
@@ -54,9 +61,72 @@ fn new_socket(kind: SocketType) -> Result<OwnedFd, NetError> {
         // single-threaded executor, and everything above expects to be able to
         // wait on several things at once.
         SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-        None,
+        protocol,
     )
     .map_err(NetError::Errno)
+}
+
+/// Transport protocol selected by an IPv4 raw socket.
+#[derive(Clone, Copy)]
+pub enum RawProtocol {
+    Udp,
+    Tcp,
+}
+
+/// An asynchronous Linux raw IPv4 socket.
+///
+/// Packets sent and received include their complete IPv4 header. Creation is
+/// privileged, but using the socket is otherwise the same readiness-driven,
+/// memory-safe interface as the harness's datagram sockets.
+pub struct RawIpv4Socket<'r> {
+    fd: OwnedFd,
+    reactor: &'r Reactor,
+}
+
+impl<'r> RawIpv4Socket<'r> {
+    pub fn bind(
+        reactor: &'r Reactor,
+        address: Ipv4Addr,
+        protocol: RawProtocol,
+    ) -> Result<Self, NetError> {
+        let protocol = match protocol {
+            RawProtocol::Udp => ipproto::UDP,
+            RawProtocol::Tcp => ipproto::TCP,
+        };
+        let fd = new_socket_with_protocol(SocketType::RAW, Some(protocol))?;
+        crate::rt::configure_raw_ipv4(fd.as_raw_fd()).map_err(NetError::Errno)?;
+        bind(&fd, &SocketAddrV4::new(address, 0)).map_err(NetError::Errno)?;
+        Ok(Self { fd, reactor })
+    }
+
+    fn raw(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    pub async fn recv(&self, buf: &mut [u8]) -> Result<usize, NetError> {
+        loop {
+            match recvfrom(&self.fd, &mut *buf, RecvFlags::empty()) {
+                Ok((len, _truncated, _from)) => return Ok(len),
+                Err(e) if would_block(e) => {
+                    self.reactor.ready(self.raw(), PollFlags::IN).await;
+                }
+                Err(e) => return Err(NetError::Errno(e)),
+            }
+        }
+    }
+
+    pub async fn send(&self, packet: &[u8], destination: Ipv4Addr) -> Result<usize, NetError> {
+        let destination = SocketAddrV4::new(destination, 0);
+        loop {
+            match sendto(&self.fd, packet, SendFlags::empty(), &destination) {
+                Ok(len) => return Ok(len),
+                Err(e) if would_block(e) => {
+                    self.reactor.ready(self.raw(), PollFlags::OUT).await;
+                }
+                Err(e) => return Err(NetError::Errno(e)),
+            }
+        }
+    }
 }
 
 fn local_v4(fd: &OwnedFd) -> Result<SocketAddrV4, NetError> {
@@ -141,6 +211,23 @@ impl<'r> UdpSocket<'r> {
         }
     }
 
+    /// Inspect the next datagram without removing it from the socket queue.
+    pub async fn peek_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddrV4), NetError> {
+        loop {
+            match recvfrom(&self.fd, &mut *buf, RecvFlags::PEEK) {
+                Ok((len, _truncated, Some(from))) => {
+                    let from = from.try_into().map_err(|_| NetError::NotIpv4)?;
+                    return Ok((len, from));
+                }
+                Ok((_, _, None)) => return Err(NetError::NotIpv4),
+                Err(e) if would_block(e) => {
+                    self.reactor.ready(self.raw(), PollFlags::IN).await;
+                }
+                Err(e) => return Err(NetError::Errno(e)),
+            }
+        }
+    }
+
     /// Send one datagram.
     ///
     /// A datagram is sent whole or not at all, so unlike a stream there is no
@@ -203,6 +290,14 @@ pub struct TcpStream<'r> {
 }
 
 impl<'r> TcpStream<'r> {
+    pub fn peer_address(&self) -> Result<SocketAddrV4, NetError> {
+        getpeername(&self.fd)
+            .map_err(NetError::Errno)?
+            .ok_or(NetError::NotIpv4)?
+            .try_into()
+            .map_err(|_| NetError::NotIpv4)
+    }
+
     /// Connect, without blocking the executor while the handshake completes.
     ///
     /// A non-blocking `connect` returns `EINPROGRESS` and finishes later; the

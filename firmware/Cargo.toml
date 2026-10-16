@@ -1,21 +1,30 @@
-# Deliberately its own workspace: `.cargo/config.toml` next to this file pins
-# the riscv target for every invocation in this directory, which cargo would
-# otherwise apply to the whole root workspace and its host-side tests.
+# Deliberately its own workspace: Bazel resolves this dependency closure
+# independently from the portable libraries and the no-libc harness.
 [workspace]
+resolver = "3"
 
 [package]
 edition      = "2024"
 name         = "esp-gateway-firmware"
 rust-version = "1.88"
-version      = "0.1.0"
+version      = "0.0.1"
+publish      = false
+build        = false
+
+[features]
+default = []
+# Never enable in production. This exists only for isolated Headscale labs.
+test-insecure-control = []
 
 [[bin]]
 name = "esp-gateway-firmware"
 path = "./src/main.rs"
 
-[dependencies]
+[target.'cfg(target_arch = "riscv32")'.dependencies]
 wirefeather = { path = "../crates/wirefeather" }
 tailfeather = { path = "../crates/tailfeather" }
+tailfeather-gateway = { path = "../crates/tailfeather-gateway" }
+micro-h2 = { path = "../crates/micro-h2" }
 
 esp-hal = { version = "~1.1.0", features = ["esp32c6", "log-04", "unstable"] }
 
@@ -28,7 +37,9 @@ esp-rtos = { version = "0.3.0", features = [
 ] }
 
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6", "log-04"] }
-log                    = "0.4.27"
+esp-storage           = { version = "0.9.0", features = ["esp32c6"] }
+embedded-storage      = "0.3.1"
+log                    = { version = "0.4.27", default-features = false }
 
 embassy-net = { version = "0.9.1", features = [
   # smoltcp does not answer pings unless this is on, and being able to ping the
@@ -52,10 +63,14 @@ esp-backtrace = { version = "0.19.0", features = [
   "panic-handler",
   "println",
 ] }
-esp-println = { version = "0.17.0", features = ["esp32c6", "log-04"] }
+esp-println = { version = "0.17.0", default-features = false, features = ["esp32c6", "log-04", "jtag-serial"] }
 embassy-futures = "0.1"
 embassy-executor = { version = "0.10.0", features = ["log"] }
+embassy-sync = "0.8"
 embassy-time = { version = "0.5.0", features = ["log"] }
+embedded-tls = { version = "0.19", default-features = false }
+embedded-io-async = "0.7"
+rand_core = { version = "0.6.4", default-features = false }
 esp-radio = { version = "0.18.0", features = [
   "esp-alloc",
   "esp32c6",
@@ -64,6 +79,7 @@ esp-radio = { version = "0.18.0", features = [
   "wifi",
 ] }
 smoltcp = { version = "0.13.0", default-features = false, features = [
+  "dns-max-result-count-4",
   "log",
   "medium-ethernet",
   "proto-dhcpv4",
@@ -91,3 +107,26 @@ codegen-units = 1
 debug         = 2
 lto           = "fat"
 opt-level     = 3
+
+# P-256 is used only while establishing TLS. Conservative optimization for its
+# arithmetic chain limits the inlined call stack on ESP32-C6 without applying
+# the much slower size-only optimization to the handshake.
+[profile.release.package.crypto-bigint]
+opt-level = 1
+
+[profile.release.package.elliptic-curve]
+opt-level = 1
+
+[profile.release.package.p256]
+opt-level = 1
+
+[profile.release.package.p384]
+opt-level = 1
+
+[profile.release.package.primeorder]
+opt-level = 1
+
+[patch.crates-io]
+micro-h2 = { path = "../crates/micro-h2" }
+tailfeather = { path = "../crates/tailfeather" }
+wirefeather = { path = "../crates/wirefeather" }

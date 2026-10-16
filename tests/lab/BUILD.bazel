@@ -1,0 +1,88 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "guest-controller.sh",
+    "headscale.yaml",
+    "privileged-smolvm.sh",
+])
+
+APK_FILES = [
+    "@apk_bash//file",
+    "@apk_ethtool//file",
+    "@apk_iproute2_minimal//file",
+    "@apk_iproute2_ss//file",
+    "@apk_iptables//file",
+    "@apk_libcap2//file",
+    "@apk_libcrypto3//file",
+    "@apk_libelf//file",
+    "@apk_libmnl//file",
+    "@apk_libnftnl//file",
+    "@apk_libxtables//file",
+    "@apk_libncursesw//file",
+    "@apk_libssl3//file",
+    "@apk_ncurses_terminfo_base//file",
+    "@apk_openssl//file",
+    "@apk_readline//file",
+    "@apk_socat//file",
+    "@apk_wireguard_tools_wg//file",
+    "@apk_zlib//file",
+    "@apk_zstd_libs//file",
+]
+
+sh_test(
+    name = "privileged_lab",
+    srcs = ["privileged-smolvm.sh"],
+    args = [
+        "--rootfs=$(rootpath @alpine_minirootfs_3_21_7_x86_64//file)",
+        "--smolvm=$(rootpath @smolvm_1_7_4_linux_x86_64//:smolvm)",
+        "--libkrunfw=$(rootpath //scripts:libkrunfw_networking)",
+        "--guest=$(rootpath :guest-controller.sh)",
+        "--headscale=$(rootpath @headscale_0_29_3_linux_amd64//file)",
+        "--tailscale=$(rootpath @tailscale_1_94_2_linux_amd64//:tailscale)",
+        "--tailscaled=$(rootpath @tailscale_1_94_2_linux_amd64//:tailscaled)",
+        "--conformance=$(rootpath //crates/ts-conformance:conformance_static)",
+        "--harness=$(rootpath //harness:harness)",
+        "--responder=$(rootpath //crates/wirefeather:responder_static)",
+        "--interop=$(rootpath //scripts:interop-wireguard.sh)",
+        "--nostd-interop=$(rootpath //scripts:nostd-interop.sh)",
+        "--expectations=$(rootpath //tests/expectations:lab.json)",
+        "--vectors=$(rootpath //tests/vectors:versions.json)",
+        "--headscale-config=$(rootpath :headscale.yaml)",
+    ] + ["--apk=$(rootpath %s)" % apk for apk in APK_FILES],
+    data = APK_FILES + [
+        ":guest-controller.sh",
+        ":headscale.yaml",
+        "//crates/ts-conformance:conformance_static",
+        "//crates/wirefeather:responder_static",
+        "//harness:harness",
+        "//scripts:interop-wireguard.sh",
+        "//scripts:nostd-interop.sh",
+        "//scripts:libkrunfw_networking",
+        "//tests/expectations:lab.json",
+        "//tests/vectors:vectors",
+        "@alpine_minirootfs_3_21_7_x86_64//file",
+        "@headscale_0_29_3_linux_amd64//file",
+        "@smolvm_1_7_4_linux_x86_64//:bundle",
+        "@smolvm_1_7_4_linux_x86_64//:smolvm",
+        "@tailscale_1_94_2_linux_amd64//:tailscale",
+        "@tailscale_1_94_2_linux_amd64//:tailscaled",
+        "//tests/vectors:versions.json",
+    ],
+    exec_properties = {
+        "test.Arch": "amd64",
+        "test.OSFamily": "Linux",
+        "test.Pool": "linux-amd64-kvm",
+        "test.container-image": "",
+        "test.use-self-hosted-executors": "true",
+        "test.workload-isolation-type": "none",
+    },
+    size = "enormous",
+    tags = [
+        "exclusive-if-local",
+        "no-cache",
+        "no-local",
+    ],
+    timeout = "long",
+)

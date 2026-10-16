@@ -1,14 +1,15 @@
 [package]
 name = "tailfeather-testkit"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pawelchcki/tailfeather"
+publish = false
 description = "Portable offline vectors, replay checks, and reports for tailfeather"
 readme = "README.md"
 keywords = ["tailscale", "testing", "conformance"]
 categories = ["development-tools::testing", "network-programming"]
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
-version = "0.0.1"
 
 [lib]
 name = "tailfeather_testkit"
@@ -21,4 +22,4 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tailfeather.workspace = true
+tailfeather = { path = "../tailfeather", version = "0.0.1" }

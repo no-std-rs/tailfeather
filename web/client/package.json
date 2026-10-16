@@ -1,0 +1,23 @@
+{
+  "name": "tailfeather-web-client",
+  "private": true,
+  "description": "Static assets and end-to-end tests for the tailfeather browser node",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "./build.sh",
+    "test:links": "node --test e2e/terminal-links.test.mjs",
+    "test:e2e": "node e2e/run.mjs",
+    "test:ssh": "node e2e/ssh.mjs"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-web-links": "0.12.0",
+    "@xterm/xterm": "6.0.0"
+  },
+  "devDependencies": {
+    "playwright-core": "1.60.0",
+    "ssh2": "1.17.0",
+    "ws": "8.21.3"
+  }
+}

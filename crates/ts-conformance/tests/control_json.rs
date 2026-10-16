@@ -40,6 +40,8 @@ fn render(hostname: &str, auth_key: &str) -> serde_json::Value {
             version: "1.94.2",
             os: "linux",
             routable_ips: &[],
+            preferred_derp: 0,
+            peer_api_port: None,
         },
         ephemeral: false,
     };
@@ -190,6 +192,8 @@ fn multibyte_utf8_is_emitted_raw_rather_than_escaped() {
             version: "1.94.2",
             os: "linux",
             routable_ips: &[],
+            preferred_derp: 0,
+            peer_api_port: None,
         },
         ephemeral: false,
     };
@@ -219,6 +223,8 @@ fn a_document_that_does_not_fit_is_refused_rather_than_truncated() {
             version: "1.94.2",
             os: "linux",
             routable_ips: &[],
+            preferred_derp: 0,
+            peer_api_port: None,
         },
         ephemeral: false,
     };
@@ -252,6 +258,8 @@ fn exit_node_routes_parse_as_an_array_of_prefixes() {
             version: "1.94.2",
             os: "linux",
             routable_ips: &tailfeather::control::hostinfo::EXIT_NODE_ROUTES,
+            preferred_derp: 0,
+            peer_api_port: Some(5254),
         },
         ephemeral: true,
     };
@@ -266,6 +274,14 @@ fn exit_node_routes_parse_as_an_array_of_prefixes() {
     assert_eq!(routes.len(), 2);
     assert_eq!(routes[0], "0.0.0.0/0");
     assert_eq!(routes[1], "::/0");
+
+    assert_eq!(value["Hostinfo"]["Services"][0]["Proto"], "peerapi4");
+    assert_eq!(value["Hostinfo"]["Services"][0]["Port"], 5254);
+    assert_eq!(
+        value["Hostinfo"]["Services"][1]["Proto"],
+        "peerapi-dns-proxy"
+    );
+    assert_eq!(value["Hostinfo"]["Services"][1]["Port"], 1);
 
     // A supplied old key is rendered, not replaced by the zero value.
     let mut encoded = [0u8; 128];

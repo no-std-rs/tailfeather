@@ -1,0 +1,9 @@
+{
+  "_comment": "Sanitized minimum of the physical device's post-registration failure: a connection-level SETTINGS frame arrives before stream 3's :status 200 headers, followed by one uncompressed framed empty MapResponse. No identity, credential, endpoint, or map data is retained.",
+  "map_stream": 3,
+  "frames": [
+    "000000040000000000",
+    "00000101040000000388",
+    "000006000000000003020000007b7d"
+  ]
+}

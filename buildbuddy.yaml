@@ -1,0 +1,36 @@
+actions:
+  - name: "Bazel / RBE"
+    container_image: "ubuntu-24.04"
+    allow_concurrent_runs_on_branches: []
+    triggers:
+      push:
+        branches: ["main"]
+      pull_request:
+        branches: ["main"]
+    steps:
+      - run: "bazel test //:format"
+      - run: "bazel build //:clippy //:docs --config=optimized"
+      - run: "bazel test //:unit_tests //:artifact_contract_tests --config=optimized"
+      - run: "bazel build //harness:harness //firmware:ci_image --config=optimized"
+
+  - name: "Offline conformance / RBE"
+    container_image: "ubuntu-24.04"
+    allow_concurrent_runs_on_branches: []
+    triggers:
+      push:
+        branches: ["main"]
+      pull_request:
+        branches: ["main"]
+    steps:
+      - run: "bazel test //:offline_conformance --config=optimized --test_output=all"
+
+  - name: "Privileged lab / RBE"
+    container_image: "ubuntu-24.04"
+    allow_concurrent_runs_on_branches: []
+    triggers:
+      push:
+        branches: ["main"]
+      pull_request:
+        branches: ["main"]
+    steps:
+      - run: "bazel test //:privileged_lab --config=optimized --test_output=all"

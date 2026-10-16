@@ -15,7 +15,13 @@ secrets.toml
 *.swp
 .DS_Store
 
-# The harness and firmware are separate workspaces with their own target dirs
+# The harness, firmware and web client are separate workspaces with their own target dirs
 harness/target
 firmware/target
 .lab/
+bazel-*
+web/client/target
+web/client/node_modules
+web/client/.tools
+web/client/e2e/.profile
+web/dist

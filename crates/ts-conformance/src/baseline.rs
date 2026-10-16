@@ -142,7 +142,7 @@ impl Change {
     /// failure — losing a measurement is the thing this file exists to catch.
     pub fn is_regression(&self) -> bool {
         let rank = |kind: &str| match kind {
-            "pass" | "external" => 3,
+            "pass" => 3,
             "todo" => 2,
             "fail" => 1,
             // Lowest: a skip is not a result at all.
@@ -251,7 +251,7 @@ impl fmt::Display for Comparison {
 
         writeln!(
             f,
-            "Regenerate with `cargo run -p ts-conformance -- --write-expect <path>` \
+            "Regenerate with `bazel run //crates/ts-conformance:conformance -- --write-expect <path>` \
              once the change is understood."
         )
     }

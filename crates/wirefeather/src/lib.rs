@@ -7,7 +7,7 @@
 //! its own. Callers hand it received datagrams along with the current time and
 //! a source of randomness, and it hands back [`Action`]s describing what should
 //! be sent or delivered. That is what lets the identical code run inside an
-//! Embassy task on an ESP32-C6 and under `cargo test` on a laptop.
+//! Embassy task on an ESP32-C6 and under Bazel tests on a laptop.
 //!
 //! # Scope
 //!
@@ -207,12 +207,22 @@ impl Peer {
         if !self.initiating {
             return false;
         }
+        // An unconfirmed current session cannot carry traffic: `encapsulate`
+        // falls back to the confirmed previous one. Once that fallback expires
+        // the peer is unreachable, so a handshake is due immediately rather
+        // than only when the unconfirmed session reaches its own rekey age.
+        let has_confirmed_fallback = self
+            .previous
+            .as_ref()
+            .is_some_and(|session| session.is_confirmed() && session.is_usable(now));
         let needs_session = match &self.current {
             None => true,
             // Rekeying starts while the old session is still carrying traffic,
             // so there is no window in which the peer is unreachable.
             Some(session) => {
-                !session.is_usable(now) || timers::rekey_is_due(session.established(), now)
+                !session.is_usable(now)
+                    || timers::rekey_is_due(session.established(), now)
+                    || (!session.is_confirmed() && !has_confirmed_fallback)
             }
         };
         needs_session && timers::handshake_retry_is_due(self.pending_last_sent, now)
@@ -342,10 +352,12 @@ impl<const PEERS: usize> Device<PEERS> {
 
     /// Whether `peer` currently has a session usable for sending.
     pub fn is_connected(&self, peer: PeerId, now: Instant) -> bool {
-        self.peers
-            .get(peer.0)
-            .and_then(|p| p.current.as_ref())
-            .is_some_and(|s| s.is_usable(now) && s.is_confirmed())
+        self.peers.get(peer.0).is_some_and(|p| {
+            [&p.current, &p.previous]
+                .into_iter()
+                .flatten()
+                .any(|s| s.is_usable(now) && s.is_confirmed())
+        })
     }
 
     /// Process one received UDP datagram.
@@ -621,7 +633,16 @@ impl<const PEERS: usize> Device<PEERS> {
         )?;
 
         peer.last_timestamp = Some(initiation.timestamp);
-        peer.previous = peer.current.take();
+        peer.expire_sessions(now);
+        let displaced = peer.current.take();
+        // A retry can supersede an unconfirmed response before the initiator
+        // proves it received those keys. Do not let that unusable session
+        // evict the older confirmed fallback that still carries traffic.
+        if displaced.as_ref().is_some_and(Session::is_confirmed)
+            || !peer.previous.as_ref().is_some_and(Session::is_confirmed)
+        {
+            peer.previous = displaced;
+        }
         peer.current = Some(Session::new(keys, local_index, initiation.peer_index, now));
         peer.keepalive_armed_since = None;
         // The peer got there first. Our own attempt, if we had one in flight,
@@ -663,21 +684,14 @@ impl<const PEERS: usize> Device<PEERS> {
         peer.expire_sessions(now);
         // A rekey may still be settling, so the packet could belong to either
         // the current or the previous session.
-        let (session, is_previous) = match (&mut peer.current, &mut peer.previous) {
-            (Some(s), _) if s.local_index == receiver => (s, false),
-            (_, Some(s)) if s.local_index == receiver => (s, true),
+        let session = match (&mut peer.current, &mut peer.previous) {
+            (Some(s), _) if s.local_index == receiver => s,
+            (_, Some(s)) if s.local_index == receiver => s,
             _ => return Err(Error::UnknownSession),
         };
 
         let plaintext_len = session.open(datagram, out)?;
         session.confirm();
-        if is_previous {
-            // The peer is still using the old session, so it never saw our
-            // newer handshake response. Discard the unused new session and
-            // promote the one actually in use, otherwise nothing we send
-            // would be readable by the peer.
-            peer.current = peer.previous.take();
-        }
 
         if plaintext_len == 0 {
             // A keepalive. It proves liveness but must not itself schedule
@@ -727,12 +741,16 @@ impl<const PEERS: usize> Device<PEERS> {
     ) -> Result<Action<'o>, Error> {
         let p = self.peers.get_mut(peer.0).ok_or(Error::UnknownPeer)?;
         p.expire_sessions(now);
-        let session = p.current.as_mut().ok_or(Error::NoSession)?;
-        if !session.is_confirmed() {
-            // WireGuard forbids the responder from sending data under keys the
-            // peer has not yet demonstrated it derived identically.
-            return Err(Error::Unconfirmed);
-        }
+        // An active rekey installs an unconfirmed current session while
+        // packets under the confirmed previous session may still be in
+        // flight. Keep sending on that previous session until the peer proves
+        // it received our response by authenticating under the new keys.
+        let session = match (&mut p.current, &mut p.previous) {
+            (Some(current), _) if current.is_confirmed() => current,
+            (_, Some(previous)) if previous.is_confirmed() => previous,
+            (Some(_), _) => return Err(Error::Unconfirmed),
+            (None, _) => return Err(Error::NoSession),
+        };
         let len = session.seal(packet, out)?;
         p.keepalive_armed_since = None;
         let out: &'o [u8] = out;
@@ -751,12 +769,11 @@ impl<const PEERS: usize> Device<PEERS> {
             if !timers::keepalive_is_due(peer.keepalive_armed_since, now) {
                 continue;
             }
-            let Some(session) = peer.current.as_mut() else {
-                continue;
+            let session = match (&mut peer.current, &mut peer.previous) {
+                (Some(current), _) if current.is_confirmed() => current,
+                (_, Some(previous)) if previous.is_confirmed() => previous,
+                _ => continue,
             };
-            if !session.is_confirmed() {
-                continue;
-            }
             let Ok(len) = session.seal(&[], out) else {
                 continue;
             };

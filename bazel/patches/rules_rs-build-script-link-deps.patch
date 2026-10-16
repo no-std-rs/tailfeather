@@ -1,0 +1,144 @@
+diff --git a/rs/rust_crate.bzl b/rs/rust_crate.bzl
+index bd47a92..af7ad7a 100644
+--- a/rs/rust_crate.bzl
++++ b/rs/rust_crate.bzl
+@@ -46,4 +46,42 @@ def rust_crate(
+         extra_compile_data = [],
+         rustc_env = {},
+         skip_deps_verification = False):
++    # portable-atomic rejects its single-core fallback on the Linux execution
++    # host. rules_rs 0.0.102 can place that target feature in the shared set.
++    if name == "portable-atomic" and "unsafe-assume-single-core" in crate_features and "riscv32imac-unknown-none-elf" in triples and "x86_64-unknown-linux-gnu" in triples:
++        crate_features = [feature for feature in crate_features if feature != "unsafe-assume-single-core"]
++        conditional_crate_features = dict(conditional_crate_features)
++        conditional_crate_features["riscv32imac-unknown-none-elf"] = (
++            conditional_crate_features.get("riscv32imac-unknown-none-elf", []) +
++            ["unsafe-assume-single-core"]
++        )
++    # log 0.4.29+ exposes std as its compatibility default. ESP crates still
++    # rely on the historical no_std default, while host-side generators use it.
++    if name == "log" and "riscv32imac-unknown-none-elf" in triples and "x86_64-unknown-linux-gnu" in triples:
++        host_features = [feature for feature in crate_features if feature in ["default", "std"]]
++        if host_features:
++            crate_features = [feature for feature in crate_features if feature not in host_features]
++            conditional_crate_features = dict(conditional_crate_features)
++            conditional_crate_features["x86_64-unknown-linux-gnu"] = (
++                conditional_crate_features.get("x86_64-unknown-linux-gnu", []) +
++                host_features
++            )
++    # Proc macros execute on the host, but Cargo resolves their features from
++    # target dependency edges. A platform select would otherwise drop them.
++    if is_proc_macro and conditional_crate_features:
++        for features in conditional_crate_features.values():
++            for feature in features:
++                if feature not in crate_features:
++                    crate_features.append(feature)
++        conditional_crate_features = {}
++    # esp-hal's proc macro consumes object on the host with features selected
++    # by the ESP target edge. Mirror those features into the execution branch.
++    if name == "object" and "riscv32imac-unknown-none-elf" in conditional_crate_features and "x86_64-unknown-linux-gnu" in triples:
++        target_features = conditional_crate_features["riscv32imac-unknown-none-elf"]
++        conditional_crate_features = dict(conditional_crate_features)
++        conditional_crate_features["x86_64-unknown-linux-gnu"] = (
++            conditional_crate_features.get("x86_64-unknown-linux-gnu", []) +
++            [feature for feature in target_features if feature not in conditional_crate_features.get("x86_64-unknown-linux-gnu", [])]
++        )
++
+     package_metadata(
+@@ -53,6 +53,10 @@ def rust_crate(
+             "BUILD",
+             "BUILD.bazel",
+             "REPO.bazel",
++            # Some crates ship an empty marker file with the same name as the
++            # generated Bazel target (for example esp-phy). Bazel resolves that
++            # file label to the target and creates a self-edge.
++            name,
+             "Cargo.toml.orig",
+             "WORKSPACE",
+             "WORKSPACE.bazel",
+@@ -92,6 +92,11 @@ def rust_crate(
+             links = links,
+             data = compile_data + build_script_data,
+-            link_deps = deps,
++            # Cargo build scripts compile with build-dependencies only. Feeding
++            # every target dependency through link_deps creates an analysis
++            # cycle for esp-radio -> esp-phy -> esp-hal while cross-compiling.
++            # Native link metadata still propagates through each crate's own
++            # generated build-script provider.
++            link_deps = [],
+             build_script_env = build_script_env,
+             allow_build_script_to_detect_nonhermetic_paths = allow_build_script_to_detect_nonhermetic_paths,
+             build_script_env_files = ["cargo_toml_env_vars.env"],
+diff --git a/rs/private/repository_utils.bzl b/rs/private/repository_utils.bzl
+index 79f2a70..1fa2ac8 100644
+--- a/rs/private/repository_utils.bzl
++++ b/rs/private/repository_utils.bzl
+@@ -219,4 +219,11 @@ def render_crate_bazel(
+     rustc_flags, conditional_rustc_flags = render_select(attr.rustc_flags, attr.rustc_flags_select, use_legacy_rules_rust_platforms)
+-    deps, conditional_deps = render_select(attr.deps + bazel_metadata.get("deps", []), attr.deps_select, use_legacy_rules_rust_platforms)
++    proc_macro_deps = attr.deps + bazel_metadata.get("deps", [])
++    if values["is_proc_macro"] == "True":
++        for platform_deps in attr.deps_select.values():
++            proc_macro_deps += platform_deps
++        proc_macro_deps = depset(proc_macro_deps).to_list()
++        deps, conditional_deps = render_select(proc_macro_deps, {}, use_legacy_rules_rust_platforms)
++    else:
++        deps, conditional_deps = render_select(proc_macro_deps, attr.deps_select, use_legacy_rules_rust_platforms)
+ 
+     conditional_build_script_env = render_select_build_script_env(attr.build_script_env_select, use_legacy_rules_rust_platforms)
+diff --git a/rs/private/cargo_workspace_graph.bzl b/rs/private/cargo_workspace_graph.bzl
+index 88928a5..2db874a 100644
+--- a/rs/private/cargo_workspace_graph.bzl
++++ b/rs/private/cargo_workspace_graph.bzl
+@@ -555,6 +555,9 @@ def resolve_cargo_workspace(
+ 
+         package_feature_resolutions = feature_resolutions_by_fq_crate[fq_crate(package["name"], package["version"])]
+-        if "default" in package.get("features", {}):
++        # Cargo resolver v2/v3 enables defaults at dependency edges. Enabling
++        # them on every package also contaminates host build tools with target
++        # defaults during cross compilation. Only workspace roots are implicit.
++        if (package["name"], package["version"]) in workspace_member_keys and "default" in package.get("features", {}):
+             for triple in platform_triples:
+                 package_feature_resolutions.features_enabled[triple].add("default")
+ 
+diff --git a/rs/private/resolver.bzl b/rs/private/resolver.bzl
+index bd54355..7f5fe8d 100644
+--- a/rs/private/resolver.bzl
++++ b/rs/private/resolver.bzl
+@@ -31,5 +31,12 @@ def _dep_target_matches_triple(dep, triple, package_feature_set, cfg_attrs_by_tr
+     ).matches)
+ 
++def _exec_triple(features_enabled, target_triple):
++    # Build scripts and their dependency graph execute on the Linux tool host.
++    # Keep those features separate from a no_std cross-compilation target.
++    host = "x86_64-unknown-linux-gnu"
++    return host if host in features_enabled else target_triple
++
+ def _resolve_one_round(packages, dirty_package_indices, cfg_attrs_by_triple, debug):
+     new_dirty_package_indices = set()
+ 
+@@ -87,12 +94,14 @@ def _resolve_one_round(packages, dirty_package_indices, cfg_attrs_by_triple, deb
+                     package_changed = True
+                     triple_deps.add(bazel_target)
+ 
+-                if has_alias:
++                dep_triple = _exec_triple(features_enabled, triple) if kind == "build" else triple
++
++                if has_alias and kind == "normal":
+                     feature_resolutions.aliases[bazel_target] = dep_name.replace("-", "_")
+ 
+-                triple_features = dep_feature_resolutions.features_enabled[triple]
++                triple_features = dep_feature_resolutions.features_enabled[dep_triple]
+ 
+                 dep_features = dep.get("features")
+                 if dep_features:
+@@ -159,7 +168,8 @@ def _propagate_feature_enablement(
+                         dep_optional = dep.get("optional", False)
+                         if not optional_marker or not dep_optional or dep_name in feature_set or ("dep:" + dep_name) in feature_set:
+                             dep_feature_resolutions = dep["feature_resolutions"]
+-                            triple_features = dep_feature_resolutions.features_enabled[triple]
++                            dep_triple = _exec_triple(features_enabled, triple) if dep.get("kind") == "build" else triple
++                            triple_features = dep_feature_resolutions.features_enabled[dep_triple]
+                             if dep_feature not in triple_features:
+                                 triple_features.add(dep_feature)
+                                 dirty_package_indices.add(dep_feature_resolutions.package_index)

@@ -1,0 +1,28 @@
+diff --git a/ld/esp32c6/memory.x b/ld/esp32c6/memory.x
+index ed5bd02..33bfae4 100644
+--- a/ld/esp32c6/memory.x
++++ b/ld/esp32c6/memory.x
+@@ -18,8 +18,22 @@ MEMORY
+     /* Instruction and Data RAM 
+     0x4086E610 = 2nd stage bootloader iram_loader_seg start address
+     see https://github.com/espressif/esp-idf/blob/03414a15508036c8fc0f51642aed7a264e9527df/components/esp_system/ld/esp32c6/memory.ld.in#L26
++
++    Upstream ends RAM at the bootloader iram_loader_seg start, which leaves
++    .stack -- sized from whatever RAM is left after .data/.bss -- too small for
++    this firmware's control path. RAM is extended by 0x1100 into the low end of
++    dram2_seg, which is dead once the 2nd stage bootloader has finished, and
++    dram2_seg is shortened by the same amount. 0xC00 of that funds the control
++    path itself; the remaining 0x500 rehouses the UDP raw TX arena, which sat
++    in RTC-fast until the staged netmap needed the room back.
++
++    dram2_seg must still END at 0x4087e610. SRAM runs to 0x40880000, but the
++    final 6640 bytes are ROM/bootloader scratch that ROM code reuses at
++    runtime: handing them to the radio heap corrupted it during esp-storage
++    flash writes, failing 5 of 12 erase-and-reboot cycles with 'Load access
++    fault' at random addresses. Stopping here passed 12 of 12.
+     */
+-    RAM : ORIGIN = 0x40800000 , LENGTH = 0x6E610
++    RAM : ORIGIN = 0x40800000 , LENGTH = 0x6F710
+ 
+     /* memory available after the 2nd stage bootloader is finished */
+     dram2_seg ( RW )       : ORIGIN = ORIGIN(RAM) + LENGTH(RAM), len = 0x4087e610 - (ORIGIN(RAM) + LENGTH(RAM))

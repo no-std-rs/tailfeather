@@ -1,0 +1,51 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("//bazel/kernel:kernel.bzl", "krunfw_kernel")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(glob(["*.sh", "*.py"]))
+
+sh_binary(
+    name = "build-libkrunfw-networking",
+    srcs = ["build-libkrunfw-networking.sh"],
+)
+
+krunfw_kernel(
+    name = "libkrunfw_networking",
+    # The networking options the privileged lab needs on top of libkrunfw's
+    # baseline config, and BTF debug info off.
+    config_edits = [
+        "-e", "NAMESPACES",
+        "-e", "NET_NS",
+        "-e", "NET",
+        "-e", "INET",
+        "-e", "NETDEVICES",
+        "-e", "TUN",
+        "-e", "VETH",
+        "-e", "WIREGUARD",
+        "-e", "NETFILTER",
+        "-e", "NETFILTER_ADVANCED",
+        "-e", "NF_TABLES",
+        "-e", "NF_TABLES_IPV4",
+        "-e", "NETFILTER_XTABLES",
+        "-e", "NFT_COMPAT",
+        "-e", "NETFILTER_XT_MARK",
+        "-e", "NETFILTER_XT_MATCH_U32",
+        # The uprobe E2E reuses this artifact and requires writable tracefs.
+        "-e", "DEBUG_FS",
+        "-e", "FTRACE",
+        "-e", "KPROBES",
+        "-e", "UPROBE_EVENTS",
+        "-d", "DEBUG_INFO_BTF",
+    ],
+    host_packages = [
+        "@deb_libelf_dev//file",
+        "@deb_libelf_runtime//file",
+        "@deb_make//file",
+    ],
+    kconfig_header = ":kconfig-generated/parser.tab.h",
+    kconfig_lexer = ":kconfig-generated/lexer.lex.c",
+    kconfig_parser = ":kconfig-generated/parser.tab.c",
+    libkrunfw_archive = "@libkrunfw_source//file",
+    linux_archive = "@linux_6_12_91_source//file",
+)

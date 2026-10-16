@@ -699,6 +699,172 @@ fn a_rekey_keeps_the_old_session_alive_for_packets_still_in_flight() {
 }
 
 #[test]
+fn delayed_old_session_data_does_not_discard_an_active_rekey() {
+    let now = Instant(1_000);
+    let (mut initiator, mut responder) = pair();
+    let (responder_peer, initiator_peer) = connect(&mut initiator, &mut responder, now);
+    let packet = ipv4_packet(8);
+
+    // Hold one old-session packet in flight while the initiator starts a
+    // replacement handshake.
+    let mut delayed = [0u8; crate::MAX_DATAGRAM_LEN];
+    let mut sealed = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = initiator
+        .encapsulate(responder_peer, &packet[..28], now, &mut sealed)
+        .unwrap()
+    else {
+        panic!("the established session must carry data");
+    };
+    let delayed_len = data.len();
+    delayed[..delayed_len].copy_from_slice(data);
+
+    let later = Instant(now.0 + timers::REKEY_AFTER_TIME_MS);
+    let mut initiation = [0u8; crate::MAX_DATAGRAM_LEN];
+    let initiation_len = initiator
+        .start_handshake(
+            responder_peer,
+            later,
+            b"timestamp002",
+            &mut TestRng(11),
+            &mut initiation,
+        )
+        .unwrap();
+    let mut response = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = responder
+        .handle_udp(
+            &initiation[..initiation_len],
+            later,
+            &mut TestRng(12),
+            &mut response,
+        )
+        .unwrap()
+    else {
+        panic!("the rekey initiation must produce a response");
+    };
+    let response_len = data.len();
+
+    // Until the new session is confirmed, outbound traffic continues on the
+    // confirmed old session rather than being dropped as unconfirmed.
+    let mut fallback = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = responder
+        .encapsulate(initiator_peer, &packet[..28], later, &mut fallback)
+        .unwrap()
+    else {
+        panic!("the previous confirmed session must remain usable");
+    };
+    let fallback_len = data.len();
+    let mut opened = [0u8; crate::MAX_DATAGRAM_LEN];
+    assert!(matches!(
+        initiator.handle_udp(
+            &fallback[..fallback_len],
+            later,
+            &mut TestRng(13),
+            &mut opened
+        ),
+        Ok(Action::Receive { .. })
+    ));
+
+    // A delayed old-session packet is ordinary reordering, not proof that the
+    // peer missed the response. It must not evict the pending new session.
+    assert!(matches!(
+        responder.handle_udp(
+            &delayed[..delayed_len],
+            later,
+            &mut TestRng(14),
+            &mut opened
+        ),
+        Ok(Action::Receive { .. })
+    ));
+
+    let mut keepalive = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = initiator
+        .handle_udp(
+            &response[..response_len],
+            later,
+            &mut TestRng(15),
+            &mut keepalive,
+        )
+        .unwrap()
+    else {
+        panic!("the response must produce a confirming keepalive");
+    };
+    let keepalive_len = data.len();
+    assert!(matches!(
+        responder.handle_udp(
+            &keepalive[..keepalive_len],
+            later,
+            &mut TestRng(16),
+            &mut opened
+        ),
+        Ok(Action::Authenticated { .. })
+    ));
+
+    // Once confirmed, replies switch to the new session and still open at the
+    // initiator.
+    let mut reply = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = responder
+        .encapsulate(initiator_peer, &packet[..28], later, &mut reply)
+        .unwrap()
+    else {
+        panic!("the confirmed rekey must carry replies");
+    };
+    let reply_len = data.len();
+    assert!(matches!(
+        initiator.handle_udp(&reply[..reply_len], later, &mut TestRng(17), &mut opened),
+        Ok(Action::Receive { .. })
+    ));
+}
+
+#[test]
+fn repeated_initiations_preserve_the_confirmed_fallback() {
+    let now = Instant(1_000);
+    let (mut initiator, mut responder) = pair();
+    let (responder_peer, initiator_peer) = connect(&mut initiator, &mut responder, now);
+    let later = Instant(now.0 + timers::REKEY_AFTER_TIME_MS);
+    let mut initiation = [0u8; crate::MAX_DATAGRAM_LEN];
+    let mut response = [0u8; crate::MAX_DATAGRAM_LEN];
+
+    // Lose two successive responses. Each initiation installs newer
+    // unconfirmed responder keys, while the original confirmed session must
+    // remain available for ordinary traffic.
+    for (timestamp, seed) in [(*b"timestamp002", 20), (*b"timestamp003", 30)] {
+        let initiation_len = initiator
+            .start_handshake(
+                responder_peer,
+                later,
+                &timestamp,
+                &mut TestRng(seed),
+                &mut initiation,
+            )
+            .unwrap();
+        assert!(matches!(
+            responder.handle_udp(
+                &initiation[..initiation_len],
+                later,
+                &mut TestRng(seed + 1),
+                &mut response,
+            ),
+            Ok(Action::Send { .. })
+        ));
+    }
+
+    let packet = ipv4_packet(8);
+    let mut sealed = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = responder
+        .encapsulate(initiator_peer, &packet[..28], later, &mut sealed)
+        .unwrap()
+    else {
+        panic!("the confirmed fallback must survive repeated initiations");
+    };
+    let sealed_len = data.len();
+    let mut opened = [0u8; crate::MAX_DATAGRAM_LEN];
+    assert!(matches!(
+        initiator.handle_udp(&sealed[..sealed_len], later, &mut TestRng(40), &mut opened,),
+        Ok(Action::Receive { .. })
+    ));
+}
+
+#[test]
 fn rejects_messages_that_are_malformed_or_unsupported() {
     let now = Instant(1_000);
     let (mut device, _, _, _) = handshake(None, now);
@@ -1179,5 +1345,67 @@ fn one_peers_handshake_does_not_starve_another() {
     assert!(matches!(
         hub.handle_udp(&m2[..n2], now, &mut TestRng(4), &mut out),
         Ok(Action::Send { peer, .. }) if peer == b
+    ));
+}
+
+/// A rekey whose confirming data is lost long enough for the confirmed
+/// fallback to expire leaves the responder with only an unconfirmed session,
+/// which cannot carry traffic. Handshake scheduling has to notice that and
+/// recover immediately instead of waiting out the unconfirmed session's own
+/// rekey age.
+#[test]
+fn an_unconfirmed_session_without_a_confirmed_fallback_starts_a_handshake() {
+    let now = Instant(1_000);
+    let (mut a, mut b) = pair();
+    let (peer_b, peer_a) = connect(&mut a, &mut b, now);
+    // A mesh node initiates towards its peers in both directions.
+    b.set_initiating(peer_a, true).unwrap();
+    let mut out = [0u8; crate::MAX_DATAGRAM_LEN];
+
+    // `a` rekeys and `b` answers, but nothing ever arrives under the new keys:
+    // `b` holds an unconfirmed current beside the confirmed previous.
+    let rekey = Instant(now.0 + timers::REKEY_AFTER_TIME_MS);
+    let mut initiation = [0u8; crate::MAX_DATAGRAM_LEN];
+    let initiation_len = a
+        .start_handshake(
+            peer_b,
+            rekey,
+            b"timestamp002",
+            &mut TestRng(7),
+            &mut initiation,
+        )
+        .unwrap();
+    assert!(matches!(
+        b.handle_udp(
+            &initiation[..initiation_len],
+            rekey,
+            &mut TestRng(8),
+            &mut out
+        ),
+        Ok(Action::Send { .. })
+    ));
+
+    // While the first session is still usable, `b` keeps sending on it and no
+    // new handshake is due.
+    let packet = ipv4_packet(8);
+    assert!(matches!(
+        b.encapsulate(peer_a, &packet[..28], rekey, &mut out),
+        Ok(Action::Send { .. })
+    ));
+    assert!(matches!(
+        b.poll_handshakes(rekey, &TIMESTAMP, &mut TestRng(9), &mut out),
+        Action::None
+    ));
+
+    // Once it expires the peer is unreachable, so recovery must start now
+    // rather than at the unconfirmed session's own rekey deadline.
+    let stranded = Instant(now.0 + timers::REJECT_AFTER_TIME_MS);
+    assert!(matches!(
+        b.encapsulate(peer_a, &packet[..28], stranded, &mut out),
+        Err(Error::Unconfirmed)
+    ));
+    assert!(matches!(
+        b.poll_handshakes(stranded, b"timestamp003", &mut TestRng(10), &mut out),
+        Action::Send { .. }
     ));
 }

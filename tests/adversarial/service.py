@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic repo-only fault server for the physical-device suite."""
+"""Deterministic repo-only fault server for the allocation-free harness."""
 
 import argparse
 import asyncio
@@ -51,14 +51,20 @@ async def serve_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     await writer.wait_closed()
 
 
-def tls_context(directory: pathlib.Path) -> ssl.SSLContext:
+def tls_context(directory: pathlib.Path, certificate_out: pathlib.Path | None) -> ssl.SSLContext:
     key = directory / "key.pem"
     certificate = directory / "certificate.pem"
     subprocess.run([
         "openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
         "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1",
-        "-subj", "/CN=wrong.invalid", "-keyout", str(key), "-out", str(certificate),
+        "-subj", "/CN=wrong.invalid", "-addext", "subjectAltName=DNS:wrong.invalid",
+        "-keyout", str(key), "-out", str(certificate),
     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if certificate_out is not None:
+        subprocess.run([
+            "openssl", "x509", "-in", str(certificate), "-outform", "DER",
+            "-out", str(certificate_out),
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certificate, key)
     return context
@@ -66,7 +72,11 @@ def tls_context(directory: pathlib.Path) -> ssl.SSLContext:
 
 async def main(args) -> None:
     with tempfile.TemporaryDirectory(prefix="tailfeather-adversarial-") as temporary:
-        context = tls_context(pathlib.Path(temporary)) if args.mode == "tls-wrong-name" else None
+        certificate_out = pathlib.Path(args.certificate_out) if args.certificate_out else None
+        context = (
+            tls_context(pathlib.Path(temporary), certificate_out)
+            if args.mode == "tls-wrong-name" else None
+        )
         server = await asyncio.start_server(
             lambda reader, writer: serve_client(reader, writer, args),
             args.host,
@@ -85,4 +95,5 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8444)
     parser.add_argument("--mode", choices=[*PAYLOADS, "disconnect", "tls-wrong-name"], required=True)
     parser.add_argument("--cut", type=int, default=7)
+    parser.add_argument("--certificate-out")
     asyncio.run(main(parser.parse_args()))

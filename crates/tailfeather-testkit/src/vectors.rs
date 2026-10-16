@@ -1,4 +1,4 @@
-//! Synthetic vectors embedded in the published testkit.
+//! Synthetic vectors embedded in the internal testkit.
 
 use sha2::{Digest, Sha256};
 

@@ -1,0 +1,53 @@
+load("@harness_deps//:defs.bzl", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.lock", "Cargo.toml"])
+
+filegroup(name = "rust_sources", srcs = glob(["src/**/*.rs"]))
+
+_GENERATED_FIRST_PARTY = [
+    "@harness_deps//:micro-h2-0.0.1",
+    "@harness_deps//:tailfeather-0.0.1",
+    "@harness_deps//:tailfeather-gateway-0.0.1",
+    "@harness_deps//:wirefeather-0.0.1",
+]
+
+rust_binary(
+    name = "harness",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//crates/micro-h2:micro_h2_harness": "micro_h2",
+        "//crates/tailfeather:tailfeather_harness": "tailfeather",
+        "//crates/tailfeather-gateway:tailfeather_gateway_harness": "tailfeather_gateway",
+        "//crates/wirefeather:wirefeather_harness": "wirefeather",
+    },
+    crate_name = "harness",
+    edition = "2024",
+    features = ["-static_link_cpp_runtimes"],
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+        "-Clink-arg=-nostartfiles",
+        "-Clink-arg=-nodefaultlibs",
+        "-Clink-arg=-static",
+        "-Clink-arg=-no-pie",
+        "-Clink-arg=-Wl,--gc-sections",
+        "-Clink-arg=-Wl,-e,_start",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    deps = [
+        dep
+        for dep in all_crate_deps(normal = True)
+        if dep not in _GENERATED_FIRST_PARTY
+    ] + [
+        "//crates/micro-h2:micro_h2_harness",
+        "//crates/tailfeather:tailfeather_harness",
+        "//crates/tailfeather-gateway:tailfeather_gateway_harness",
+        "//crates/wirefeather:wirefeather_harness",
+    ],
+)

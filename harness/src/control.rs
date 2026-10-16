@@ -127,6 +127,59 @@ pub async fn load_netmap(
     fetch_map(reactor, state_dir, address, port, hostname, 1, endpoints).await
 }
 
+/// Publish the reflexive endpoint and measured DERP preference without
+/// replacing the active streaming map request.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_endpoint_update(
+    reactor: &Reactor,
+    state_dir: &str,
+    address: Ipv4Addr,
+    port: u16,
+    hostname: &str,
+    preferred_derp: u16,
+    endpoints: &[&str],
+) -> Result<(), ControlError> {
+    let store = FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
+    let (identity, _) =
+        tailfeather::keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
+            tailfeather::keys::store::IdentityError::Store(e) => ControlError::Store(e),
+            tailfeather::keys::store::IdentityError::Format(e) => ControlError::Identity(e),
+        })?;
+    let session = connect(reactor, state_dir, address, port).await?;
+    let mut http2 = session.into_http2().await?;
+    let mut host = [0u8; 32];
+    let host = write_host(address, port, &mut host);
+    let request = tailfeather::control::MapRequest {
+        version: tailfeather::control::CAPABILITY_VERSION,
+        node_key: &identity.node.public(),
+        disco_key: &identity.disco.public(),
+        hostinfo: tailfeather::control::Hostinfo {
+            hostname,
+            preferred_derp,
+            ..Default::default()
+        },
+        stream: false,
+        omit_peers: true,
+        read_only: false,
+        endpoints,
+    };
+    let mut body = [0u8; 1024];
+    let body = request.write(&mut body).map_err(ControlError::Json)?;
+    let stream = http2
+        .send_request("POST", tailfeather::control::map::PATH, host, body)
+        .await
+        .map_err(ControlError::Http2)?;
+    http2
+        .drain_stream(stream)
+        .await
+        .map_err(ControlError::Http2)?;
+    let status = http2.stream_status(stream).unwrap_or(0);
+    if status != 200 {
+        return Err(ControlError::UnexpectedStatus(status));
+    }
+    Ok(())
+}
+
 /// Everything up to an established channel with the early payload consumed.
 pub async fn connect<'r>(
     reactor: &'r Reactor,
@@ -514,17 +567,27 @@ async fn register(
         body.len()
     );
 
-    let mut response = [0u8; 4096];
-    let (status, len) = http2
-        .request(
-            "POST",
-            tailfeather::control::register::PATH,
-            host,
-            body,
-            &mut response,
-        )
+    // A write or flush can fail after the server has received enough of the
+    // request to accept a rotated key. Stop retries before sending begins.
+    evt!("{{\"event\":\"registration_submitted\"}}");
+    let stream = http2
+        .send_request("POST", tailfeather::control::register::PATH, host, body)
         .await
         .map_err(ControlError::Http2)?;
+
+    let mut response = [0u8; 4096];
+    let mut len = 0;
+    loop {
+        let (read, finished) = http2
+            .read_chunk(stream, &mut response[len..])
+            .await
+            .map_err(ControlError::Http2)?;
+        len += read;
+        if finished {
+            break;
+        }
+    }
+    let status = http2.stream_status(stream).unwrap_or(0);
 
     let text = core::str::from_utf8(&response[..len]).unwrap_or("");
     println!("<- {status}, {len} bytes");
@@ -585,6 +648,71 @@ pub fn run_map(state_dir: &str, address: Ipv4Addr, port: u16, hostname: &str, wa
             evt!("{{\"event\":\"map\",\"result\":\"fail\"}}");
             crate::rt::exit(1)
         }
+    }
+}
+
+/// Feed a length-prefixed map directly through the bounded parser.
+///
+/// This narrow adversarial entry point deliberately skips control transport:
+/// the synthetic service is testing the peer-table bound, not Noise or HTTP/2.
+pub fn run_map_bound(address: Ipv4Addr, port: u16) -> ! {
+    let clock = crate::time::Clock::start();
+    let reactor = Reactor::new(clock);
+    match crate::exec::block_on(&reactor, reject_oversized_map(&reactor, address, port)) {
+        Ok(true) => {
+            println!("PASS map exceeded the configured peer bound");
+            evt!("{{\"event\":\"map\",\"result\":\"fail\"}}");
+            crate::rt::exit(1)
+        }
+        Ok(false) => {
+            println!("FAIL oversized map was accepted");
+            crate::rt::exit(0)
+        }
+        Err(error) => {
+            println!("FAIL {error}");
+            crate::rt::exit(2)
+        }
+    }
+}
+
+async fn reject_oversized_map(
+    reactor: &Reactor,
+    address: Ipv4Addr,
+    port: u16,
+) -> Result<bool, &'static str> {
+    let stream = TcpStream::connect(reactor, address, port)
+        .await
+        .map_err(|_| "could not connect to map-bound service")?;
+    stream
+        .write_all(b"map-bound")
+        .await
+        .map_err(|_| "could not request the adversarial map")?;
+
+    let mut length = [0u8; 4];
+    stream
+        .read_exact(&mut length)
+        .await
+        .map_err(|_| "could not read the map frame length")?;
+    let mut remaining = u32::from_le_bytes(length) as usize;
+    let mut parser = tailfeather::netmap::Parser::<{ tailfeather::netmap::MAX_PEERS }>::new();
+    let mut netmap = tailfeather::netmap::Netmap::<{ tailfeather::netmap::MAX_PEERS }>::new();
+    let mut chunk = [0u8; 1024];
+    while remaining > 0 {
+        let take = remaining.min(chunk.len());
+        stream
+            .read_exact(&mut chunk[..take])
+            .await
+            .map_err(|_| "map frame ended early")?;
+        match parser.push(&mut netmap, &chunk[..take]) {
+            Ok(()) => remaining -= take,
+            Err(tailfeather::netmap::Error::Full(_)) => return Ok(true),
+            Err(_) => return Err("map failed for a reason other than its peer bound"),
+        }
+    }
+    match parser.finish(&mut netmap) {
+        Ok(()) => Ok(false),
+        Err(tailfeather::netmap::Error::Full(_)) => Ok(true),
+        Err(_) => Err("map failed for a reason other than its peer bound"),
     }
 }
 
@@ -658,9 +786,10 @@ async fn fetch_map(
             .read_chunk(stream_id, &mut chunk)
             .await
             .map_err(ControlError::Http2)?;
-        if http2.status() != 200 {
-            println!("<- status {}", http2.status());
-            return Err(ControlError::UnexpectedStatus(http2.status()));
+        let status = http2.stream_status(stream_id).unwrap_or(0);
+        if status != 200 {
+            println!("<- status {status}");
+            return Err(ControlError::UnexpectedStatus(status));
         }
 
         let mut input: &[u8] = &chunk[..len];
@@ -732,13 +861,15 @@ fn report_netmap(
         }
         println!(
             "   peer {} {address} online={} derp={} endpoint={endpoint}",
-            peer.id, peer.online, peer.home_derp
+            peer.id,
+            peer.online(),
+            peer.home_derp
         );
         evt!(
             "{{\"event\":\"peer\",\"id\":{},\"key\":\"{}\",\"address\":\"{address}\",\"online\":{},\"derp\":{},\"endpoint\":\"{endpoint}\",\"disco\":{}}}",
             peer.id,
             peer.node_key,
-            peer.online,
+            peer.online(),
             peer.home_derp,
             peer.disco_key.is_some()
         );

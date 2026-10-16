@@ -175,6 +175,34 @@ impl Client {
     pub fn write_note_preferred(preferred: bool, out: &mut [u8]) -> Result<usize, Error> {
         frame::write(FrameType::NotePreferred, &[preferred as u8], out)
     }
+
+    /// Answer a server's liveness probe.
+    ///
+    /// The eight bytes are opaque and must come back unchanged; the server
+    /// matches them against the probe it sent. A client that never answers is
+    /// indistinguishable from a dead one and gets dropped, which reads on this
+    /// side as an unexplained relay disconnect every few minutes.
+    pub fn write_pong(frame: Frame, payload: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+        if frame.kind != FrameType::Ping {
+            return Err(Error::Malformed);
+        }
+        let echo = payload.get(..frame::PING_LEN).ok_or(Error::Malformed)?;
+        frame::write(FrameType::Pong, echo, out)
+    }
+
+    /// Read which peer the relay has lost.
+    ///
+    /// Newer servers append a reason byte; older ones send the key alone, so
+    /// the length is checked as a minimum rather than an equality.
+    pub fn read_peer_gone(frame: Frame, payload: &[u8]) -> Result<NodePublic, Error> {
+        if frame.kind != FrameType::PeerGone {
+            return Err(Error::Malformed);
+        }
+        let key = payload.get(..KEY_LEN).ok_or(Error::Malformed)?;
+        let mut bytes = [0u8; KEY_LEN];
+        bytes.copy_from_slice(key);
+        Ok(NodePublic::from_bytes(bytes))
+    }
 }
 
 /// Write the HTTP/1.1 upgrade that starts a DERP connection.
@@ -345,6 +373,66 @@ mod tests {
         let (source, packet) = Client::read_packet(frame, &framed[frame::HEADER_LEN..len]).unwrap();
         assert_eq!(source, ours.public());
         assert_eq!(packet, b"wireguard bytes");
+    }
+
+    #[test]
+    fn a_ping_is_answered_with_its_own_eight_bytes() {
+        let mut probe = [0u8; 64];
+        let len = frame::write(
+            FrameType::Ping,
+            b"\x01\x02\x03\x04\x05\x06\x07\x08",
+            &mut probe,
+        )
+        .unwrap();
+        let frame = Frame::parse(&probe).unwrap();
+
+        let mut out = [0u8; 64];
+        let written = Client::write_pong(frame, &probe[frame::HEADER_LEN..len], &mut out).unwrap();
+        let pong = Frame::parse(&out).unwrap();
+        assert_eq!(pong.kind, FrameType::Pong);
+        assert_eq!(pong.length, frame::PING_LEN);
+        assert_eq!(
+            &out[frame::HEADER_LEN..written],
+            b"\x01\x02\x03\x04\x05\x06\x07\x08",
+            "the server matches the echo against what it sent"
+        );
+
+        // A truncated probe is not something to answer with uninitialised bytes.
+        let short = Frame {
+            kind: FrameType::Ping,
+            length: 3,
+        };
+        assert_eq!(
+            Client::write_pong(short, b"abc", &mut out),
+            Err(Error::Malformed)
+        );
+    }
+
+    #[test]
+    fn peer_gone_names_its_peer_with_or_without_a_reason_byte() {
+        let peer = NodePrivate::from_bytes([0x44; 32]).public();
+        let frame = Frame {
+            kind: FrameType::PeerGone,
+            length: 32,
+        };
+        assert_eq!(
+            Client::read_peer_gone(frame, peer.as_bytes()).unwrap(),
+            peer
+        );
+
+        // Newer servers append a reason; the key is still the first 32 bytes.
+        let mut with_reason = [0u8; 33];
+        with_reason[..32].copy_from_slice(peer.as_bytes());
+        with_reason[32] = 1;
+        let frame = Frame {
+            kind: FrameType::PeerGone,
+            length: 33,
+        };
+        assert_eq!(Client::read_peer_gone(frame, &with_reason).unwrap(), peer);
+        assert_eq!(
+            Client::read_peer_gone(frame, &with_reason[..8]),
+            Err(Error::Malformed)
+        );
     }
 
     #[test]

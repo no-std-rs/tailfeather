@@ -239,9 +239,17 @@ fn tcp_payload(frame: &[u8]) -> Option<((u16, u16), u32, &[u8])> {
 
 /// Absolute path of a file in `tests/vectors/`.
 pub fn vector_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/vectors")
-        .join(name)
+    let base = std::env::var_os("TS_CONFORMANCE_VECTORS")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_file() {
+                path.parent().unwrap().to_path_buf()
+            } else {
+                path
+            }
+        })
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/vectors"));
+    base.join(name)
 }
 
 #[cfg(test)]

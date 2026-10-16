@@ -208,6 +208,7 @@ mod tests {
         let text = core::str::from_utf8(request).unwrap();
         assert!(text.starts_with("GET /key?v=131 HTTP/1.1\r\n"));
         assert!(text.contains("Host: 127.0.0.1:8080\r\n"));
+        assert!(text.contains("Connection: close\r\n"));
         assert!(text.ends_with("\r\n\r\n"));
     }
 

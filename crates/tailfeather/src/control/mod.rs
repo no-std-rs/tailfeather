@@ -9,10 +9,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod authority;
 pub mod hostinfo;
 pub mod json;
 pub mod map;
 pub mod register;
+pub mod tls;
+pub mod transport;
 
 pub use hostinfo::{EXIT_NODE_ROUTES, Hostinfo};
 pub use json::{JsonError, Writer};
