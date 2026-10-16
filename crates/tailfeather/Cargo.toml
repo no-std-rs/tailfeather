@@ -25,7 +25,7 @@ crypto_box = { version = "0.9", default-features = false, features = ["salsa20"]
 embedded-io-async = "0.7"
 embedded-tls = { version = "0.19", default-features = false }
 heapless = "0.9"
-micro-h2 = { path = "../micro-h2", version = "0.0.1" }
+micro-h2 = "=0.2.0"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 sha2 = { version = "0.10", default-features = false }

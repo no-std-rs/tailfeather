@@ -8,7 +8,6 @@ exports_files(["Cargo.lock", "Cargo.toml"])
 filegroup(name = "rust_sources", srcs = glob(["src/**/*.rs"]))
 
 _GENERATED_FIRST_PARTY = [
-    "@harness_deps//:micro-h2-0.0.1",
     "@harness_deps//:tailfeather-0.0.1",
     "@harness_deps//:tailfeather-gateway-0.0.1",
     "@harness_deps//:wirefeather-0.0.1",
@@ -18,7 +17,6 @@ rust_binary(
     name = "harness",
     srcs = glob(["src/**/*.rs"]),
     aliases = {
-        "//crates/micro-h2:micro_h2_harness": "micro_h2",
         "//crates/tailfeather:tailfeather_harness": "tailfeather",
         "//crates/tailfeather-gateway:tailfeather_gateway_harness": "tailfeather_gateway",
         "//crates/wirefeather:wirefeather_harness": "wirefeather",
@@ -45,7 +43,6 @@ rust_binary(
         for dep in all_crate_deps(normal = True)
         if dep not in _GENERATED_FIRST_PARTY
     ] + [
-        "//crates/micro-h2:micro_h2_harness",
         "//crates/tailfeather:tailfeather_harness",
         "//crates/tailfeather-gateway:tailfeather_gateway_harness",
         "//crates/wirefeather:wirefeather_harness",

@@ -60,6 +60,6 @@ tokio                  = { version = "1", features = ["macros", "rt-multi-thread
 # An independent HPACK, to decode what we encode and encode what we decode.
 fluke-hpack            = "0.3"
 hex                    = "0.4"
-micro-h2               = { path = "../micro-h2", version = "0.0.1" }
+micro-h2               = "=0.2.0"
 sha2                   = "0.10"
 x25519-dalek           = { version = "2", default-features = false, features = ["static_secrets", "precomputed-tables", "zeroize"] }

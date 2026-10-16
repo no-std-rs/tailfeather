@@ -5,6 +5,8 @@
 //! upgrade, registration, streaming-map, and endpoint-update protocol on a
 //! workstation or an Embassy target.
 
+use core::borrow::BorrowMut;
+
 use embedded_io_async::{Read, Write};
 use micro_h2::{Connection, Event, frame};
 use x25519_dalek::StaticSecret;
@@ -417,7 +419,55 @@ where
         self,
         buffer: &mut [u8; H2_BUFFER],
     ) -> Result<Http2<S, &mut [u8; H2_BUFFER]>, Error<S::Error>> {
-        Http2::start_with_storage(self.stream, self.session, &self.pushback, true, buffer).await
+        Http2::start_with_storage(
+            self.stream,
+            self.session,
+            &self.pushback,
+            true,
+            buffer,
+            Connection::new(),
+        )
+        .await
+    }
+
+    /// Start HTTPS-flavoured HTTP/2 using caller-owned receive and protocol state.
+    /// The connection state is reset for each session, allowing reconnects to
+    /// reuse one allocation-free slot without copying it through async futures.
+    pub async fn into_https2_with_storage<'a>(
+        self,
+        buffer: &'a mut [u8; H2_BUFFER],
+        connection: &'a mut Connection,
+    ) -> Result<Http2<S, &'a mut [u8; H2_BUFFER], &'a mut Connection>, Error<S::Error>> {
+        self.into_carried_with_storage(buffer, connection, true)
+            .await
+    }
+
+    /// Start plaintext-flavoured HTTP/2 using reusable receive and protocol state.
+    pub async fn into_http2_with_storage<'a>(
+        self,
+        buffer: &'a mut [u8; H2_BUFFER],
+        connection: &'a mut Connection,
+    ) -> Result<Http2<S, &'a mut [u8; H2_BUFFER], &'a mut Connection>, Error<S::Error>> {
+        self.into_carried_with_storage(buffer, connection, false)
+            .await
+    }
+
+    async fn into_carried_with_storage<'a>(
+        self,
+        buffer: &'a mut [u8; H2_BUFFER],
+        connection: &'a mut Connection,
+        secure: bool,
+    ) -> Result<Http2<S, &'a mut [u8; H2_BUFFER], &'a mut Connection>, Error<S::Error>> {
+        *connection = Connection::new();
+        Http2::start_with_storage(
+            self.stream,
+            self.session,
+            &self.pushback,
+            secure,
+            buffer,
+            connection,
+        )
+        .await
     }
 }
 
@@ -455,10 +505,12 @@ where
 /// The default `B = [u8; H2_BUFFER]` owns its receive storage and remains the
 /// convenient host interface. Firmware may borrow caller-owned storage through
 /// [`NoiseStream::into_https2_with_buffer`] so reconnects can reuse it.
-pub struct Http2<S, B = [u8; H2_BUFFER]> {
+/// The `C` parameter similarly allows [`NoiseStream::into_https2_with_storage`]
+/// to borrow the protocol state instead of carrying it through async futures.
+pub struct Http2<S, B = [u8; H2_BUFFER], C = Connection> {
     stream: S,
     session: Session,
-    connection: Connection,
+    connection: C,
     buffer: B,
     filled: u16,
     plaintext: [u8; noise::MAX_PLAINTEXT],
@@ -551,7 +603,15 @@ where
         pushback: &[u8],
         secure: bool,
     ) -> Result<Self, Error<S::Error>> {
-        Self::start_with_storage(stream, session, pushback, secure, [0; H2_BUFFER]).await
+        Self::start_with_storage(
+            stream,
+            session,
+            pushback,
+            secure,
+            [0; H2_BUFFER],
+            Connection::new(),
+        )
+        .await
     }
 
     async fn start_carried_placed<'a>(
@@ -564,17 +624,25 @@ where
     where
         S: 'a,
     {
-        let (client, out, len) = Self::prepare(stream, session, pushback, secure, [0; H2_BUFFER])?;
+        let (client, out, len) = Self::prepare(
+            stream,
+            session,
+            pushback,
+            secure,
+            [0; H2_BUFFER],
+            Connection::new(),
+        )?;
         let client = place(client);
         client.send(&out[..len]).await?;
         Ok(client)
     }
 }
 
-impl<S, B> Http2<S, B>
+impl<S, B, C> Http2<S, B, C>
 where
     S: Read + Write,
     B: AsRef<[u8]> + AsMut<[u8]>,
+    C: BorrowMut<Connection>,
 {
     async fn start_with_storage(
         stream: S,
@@ -582,8 +650,10 @@ where
         pushback: &[u8],
         secure: bool,
         buffer: B,
+        connection: C,
     ) -> Result<Self, Error<S::Error>> {
-        let (mut client, out, len) = Self::prepare(stream, session, pushback, secure, buffer)?;
+        let (mut client, out, len) =
+            Self::prepare(stream, session, pushback, secure, buffer, connection)?;
         client.send(&out[..len]).await?;
         Ok(client)
     }
@@ -606,12 +676,13 @@ where
         pushback: &[u8],
         secure: bool,
         mut buffer: B,
+        connection: C,
     ) -> Result<(Self, [u8; 256], usize), Error<S::Error>> {
         buffer.as_mut().fill(0);
         let mut client = Self {
             stream,
             session,
-            connection: Connection::new(),
+            connection,
             buffer,
             filled: 0,
             plaintext: [0; noise::MAX_PLAINTEXT],
@@ -627,7 +698,11 @@ where
         };
         client.plaintext[..pushback.len()].copy_from_slice(pushback);
         let mut out = [0; 256];
-        let len = client.connection.start(&mut out).map_err(Error::Http2)?;
+        let len = client
+            .connection
+            .borrow_mut()
+            .start(&mut out)
+            .map_err(Error::Http2)?;
         Ok((client, out, len))
     }
 
@@ -664,6 +739,7 @@ where
         let mut out = [0; H2_OUT_BUFFER];
         let (stream, len) = self
             .connection
+            .borrow_mut()
             .request(
                 method,
                 path,
@@ -720,6 +796,7 @@ where
             let mut parsed_status = None;
             let (event, reply_len) = self
                 .connection
+                .borrow_mut()
                 .recv(
                     &self.buffer.as_ref()[..frame_len],
                     |name, value| {
@@ -794,6 +871,7 @@ where
             let mut parsed_status = None;
             let (event, reply_len) = self
                 .connection
+                .borrow_mut()
                 .recv(
                     &self.buffer.as_ref()[..frame_len],
                     |name, value| {
@@ -964,7 +1042,14 @@ where
         let mut reply = [0; 2 * frame::HEADER_LEN + 8];
         let reply_len = self
             .connection
-            .finish_data(data.header, &mut reply)
+            .borrow_mut()
+            .finish_data_with_length(
+                data.header,
+                data.header.length
+                    - usize::from(data.padding)
+                    - usize::from(data.header.has(micro_h2::frame::flags::PADDED)),
+                &mut reply,
+            )
             .map_err(Error::Http2)?;
         if reply_len != 0 {
             self.send(&reply[..reply_len]).await?;
@@ -1103,14 +1188,15 @@ impl<const PEERS: usize> MapStream<PEERS> {
         self.pending.iter().any(|event| *event == MapEvent::Applied)
     }
 
-    pub async fn start<S, B>(
-        http2: &mut Http2<S, B>,
+    pub async fn start<S, B, C>(
+        http2: &mut Http2<S, B, C>,
         authority: &str,
         request_body: &[u8],
     ) -> Result<Self, Error<S::Error>>
     where
         S: Read + Write,
         B: AsRef<[u8]> + AsMut<[u8]>,
+        C: BorrowMut<Connection>,
     {
         let mut map = Self::new();
         Self::start_in(&mut map, http2, authority, request_body).await?;
@@ -1118,15 +1204,16 @@ impl<const PEERS: usize> MapStream<PEERS> {
     }
 
     /// Start a map request using caller-provided persistent storage.
-    pub async fn start_in<S, B>(
+    pub async fn start_in<S, B, C>(
         map: &mut Self,
-        http2: &mut Http2<S, B>,
+        http2: &mut Http2<S, B, C>,
         authority: &str,
         request_body: &[u8],
     ) -> Result<(), Error<S::Error>>
     where
         S: Read + Write,
         B: AsRef<[u8]> + AsMut<[u8]>,
+        C: BorrowMut<Connection>,
     {
         let stream = http2
             .send_request("POST", crate::control::map::PATH, authority, request_body)
@@ -1140,14 +1227,15 @@ impl<const PEERS: usize> MapStream<PEERS> {
         Ok(())
     }
 
-    pub async fn next<S, B>(
+    pub async fn next<S, B, C>(
         &mut self,
-        http2: &mut Http2<S, B>,
+        http2: &mut Http2<S, B, C>,
         staging: &mut Netmap<PEERS>,
     ) -> Result<MapEvent, Error<S::Error>>
     where
         S: Read + Write,
         B: AsRef<[u8]> + AsMut<[u8]>,
+        C: BorrowMut<Connection>,
     {
         loop {
             if let Some(event) = self.pending.pop_front() {
@@ -1188,6 +1276,7 @@ impl<const PEERS: usize> MapStream<PEERS> {
             let mut parsed_status = None;
             let (event, reply_len) = http2
                 .connection
+                .borrow_mut()
                 .recv(
                     &http2.buffer.as_ref()[..frame_len],
                     |name, value| {
@@ -1215,15 +1304,16 @@ impl<const PEERS: usize> MapStream<PEERS> {
 
     /// Drain another response while preserving and parsing interleaved map
     /// frames from this stream.
-    pub async fn drain_response<S, B>(
+    pub async fn drain_response<S, B, C>(
         &mut self,
-        http2: &mut Http2<S, B>,
+        http2: &mut Http2<S, B, C>,
         staging: &mut Netmap<PEERS>,
         wanted_stream: u32,
     ) -> Result<(), Error<S::Error>>
     where
         S: Read + Write,
         B: AsRef<[u8]> + AsMut<[u8]>,
+        C: BorrowMut<Connection>,
     {
         loop {
             let input = http2.next_input().await?;
@@ -1271,6 +1361,7 @@ impl<const PEERS: usize> MapStream<PEERS> {
             let mut parsed_status = None;
             let (event, reply_len) = http2
                 .connection
+                .borrow_mut()
                 .recv(
                     &http2.buffer.as_ref()[..frame_len],
                     |name, value| {
@@ -1429,8 +1520,8 @@ impl<const PEERS: usize> MapStream<PEERS> {
 }
 
 /// Send a non-streaming endpoint update without disturbing the map stream.
-pub async fn send_endpoint_update<S, B, const PEERS: usize>(
-    http2: &mut Http2<S, B>,
+pub async fn send_endpoint_update<S, B, C, const PEERS: usize>(
+    http2: &mut Http2<S, B, C>,
     map: &mut MapStream<PEERS>,
     staging: &mut Netmap<PEERS>,
     authority: &str,
@@ -1439,6 +1530,7 @@ pub async fn send_endpoint_update<S, B, const PEERS: usize>(
 where
     S: Read + Write,
     B: AsRef<[u8]> + AsMut<[u8]>,
+    C: BorrowMut<Connection>,
 {
     let stream = http2
         .send_request("POST", crate::control::map::PATH, authority, request_body)
@@ -1615,6 +1707,22 @@ mod tests {
         ))
         .unwrap();
         let mut connection = Connection::new();
+        // The capture starts after registration and the map request. Open the
+        // same streams before replaying their responses.
+        let mut request = [0; 256];
+        for path in ["/machine/register", "/machine/map"] {
+            connection
+                .request(
+                    "POST",
+                    path,
+                    "control.example",
+                    "https",
+                    &[],
+                    &[],
+                    &mut request,
+                )
+                .unwrap();
+        }
         let mut map = MapStream::<1> {
             stream: fixture.map_stream,
             status: None,
@@ -1700,6 +1808,90 @@ mod tests {
         match future.as_mut().poll(&mut context) {
             core::task::Poll::Ready(output) => output,
             core::task::Poll::Pending => panic!("scripted streams never block"),
+        }
+    }
+
+    #[test]
+    fn streamed_data_validates_content_length_without_counting_padding() {
+        // Every attempt reuses the same protocol state, including after an
+        // invalid response. Each new session must start again at stream 1.
+        let mut buffer = [0; H2_BUFFER];
+        let mut connection = Connection::new();
+        for padding in [None, Some(0), Some(7), Some(255)] {
+            for content_length in [4, 5, 6] {
+                let mut headers = [0; 64];
+                let len = micro_h2::hpack::encode::encode_header(":status", "200", &mut headers, 0)
+                    .unwrap();
+                let len = micro_h2::hpack::encode::encode_header(
+                    "content-length",
+                    &std::format!("{content_length}"),
+                    &mut headers,
+                    len,
+                )
+                .unwrap();
+                let mut response = [0; 512];
+                let mut len = frame::write_frame(
+                    micro_h2::FrameType::Headers,
+                    frame::flags::END_HEADERS,
+                    1,
+                    &headers[..len],
+                    &mut response,
+                )
+                .unwrap();
+                let mut payload = std::vec::Vec::new();
+                if let Some(padding) = padding {
+                    payload.push(padding);
+                }
+                payload.extend_from_slice(b"hello");
+                if let Some(padding) = padding {
+                    payload.resize(payload.len() + usize::from(padding), 0);
+                }
+                len += frame::write_frame(
+                    micro_h2::FrameType::Data,
+                    frame::flags::END_STREAM
+                        | if padding.is_some() {
+                            frame::flags::PADDED
+                        } else {
+                            0
+                        },
+                    1,
+                    &payload,
+                    &mut response[len..],
+                )
+                .unwrap();
+                let mut server = Session::new([2; 32], [1; 32]);
+                let mut inbound = std::vec::Vec::new();
+                // Split both DATA and its padding across authenticated records.
+                for chunk in response[..len].chunks(3) {
+                    let mut record = [0; 64];
+                    let len = server.seal(chunk, &mut record).unwrap();
+                    inbound.extend_from_slice(&record[..len]);
+                }
+                let noise = NoiseStream {
+                    stream: Scripted::new(inbound),
+                    session: Session::new([1; 32], [2; 32]),
+                    pushback: heapless::Vec::new(),
+                };
+                let mut http2 =
+                    block_on(noise.into_https2_with_storage(&mut buffer, &mut connection)).unwrap();
+                let mut body = [0; 5];
+                let result = block_on(http2.request(
+                    "POST",
+                    "/machine/register",
+                    "control.example",
+                    &[],
+                    &mut body,
+                ));
+                if content_length == 5 {
+                    assert_eq!(result.unwrap(), (200, 5), "padding: {padding:?}");
+                    assert_eq!(&body, b"hello");
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(Error::Http2(micro_h2::Error::Protocol))
+                    ));
+                }
+            }
         }
     }
 
@@ -1871,7 +2063,7 @@ mod tests {
     fn host_storage_is_owned_and_firmware_storage_is_borrowed() {
         struct HostStream;
         type Owned = Http2<HostStream>;
-        type Borrowed = Http2<HostStream, &'static mut [u8; H2_BUFFER]>;
+        type Borrowed = Http2<HostStream, &'static mut [u8; H2_BUFFER], &'static mut Connection>;
 
         assert!(core::mem::size_of::<Owned>() >= H2_BUFFER);
         assert!(core::mem::size_of::<Borrowed>() < core::mem::size_of::<Owned>());

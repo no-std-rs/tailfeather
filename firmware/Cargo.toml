@@ -21,10 +21,10 @@ name = "esp-gateway-firmware"
 path = "./src/main.rs"
 
 [target.'cfg(target_arch = "riscv32")'.dependencies]
+micro-h2 = "=0.2.0"
 wirefeather = { path = "../crates/wirefeather" }
 tailfeather = { path = "../crates/tailfeather" }
 tailfeather-gateway = { path = "../crates/tailfeather-gateway" }
-micro-h2 = { path = "../crates/micro-h2" }
 
 esp-hal = { version = "~1.1.0", features = ["esp32c6", "log-04", "unstable"] }
 
@@ -127,6 +127,5 @@ opt-level = 1
 opt-level = 1
 
 [patch.crates-io]
-micro-h2 = { path = "../crates/micro-h2" }
 tailfeather = { path = "../crates/tailfeather" }
 wirefeather = { path = "../crates/wirefeather" }

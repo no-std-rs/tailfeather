@@ -61,6 +61,11 @@ crate.from_cargo(
     ],
 )
 crate.annotation(
+    crate = "micro-h2",
+    repositories = ["harness_deps", "firmware_deps"],
+    rustc_flags = ["-Cpanic=abort"],
+)
+crate.annotation(
     crate = "embedded-tls",
     repositories = ["harness_deps"],
     rustc_flags = ["-Cpanic=abort"],

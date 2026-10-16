@@ -9,7 +9,6 @@ exports_files([
 ])
 
 FIRST_PARTY_RUST_TARGETS = [
-    "//crates/micro-h2:micro_h2",
     "//crates/tailfeather:tailfeather",
     "//crates/tailfeather-gateway:tailfeather_gateway",
     "//crates/tailfeather-testkit:tailfeather_testkit",
@@ -54,7 +53,6 @@ rust_clippy(
 filegroup(
     name = "docs",
     srcs = [
-        "//crates/micro-h2:docs",
         "//crates/tailfeather:docs",
         "//crates/tailfeather-gateway:docs",
         "//crates/tailfeather-testkit:docs",
@@ -66,8 +64,6 @@ filegroup(
 test_suite(
     name = "unit_tests",
     tests = [
-        "//crates/micro-h2:unit_test",
-        "//crates/micro-h2:doc_test",
         "//crates/tailfeather:unit_test",
         "//crates/tailfeather:netmap_capture_test",
         "//crates/tailfeather:noise_kat_test",
@@ -110,7 +106,6 @@ sh_test(
     name = "no_allocation_source_contract",
     srcs = ["//scripts:no-allocation-source-contract.sh"],
     data = [
-        "//crates/micro-h2:rust_sources",
         "//crates/tailfeather:rust_sources",
         "//crates/tailfeather-gateway:rust_sources",
         "//crates/wirefeather:rust_sources",

@@ -14,7 +14,6 @@ rust_binary(
     name = "esp_gateway_firmware",
     srcs = glob(["src/**/*.rs"]),
     aliases = {
-        "//crates/micro-h2:micro_h2_firmware": "micro_h2",
         "//crates/tailfeather:tailfeather_firmware": "tailfeather",
         "//crates/tailfeather-gateway:tailfeather_gateway_firmware": "tailfeather_gateway",
         "//crates/wirefeather:wirefeather_firmware": "wirefeather",
@@ -29,7 +28,6 @@ rust_binary(
         "-Clink-arg=-Tlinkall.x",
     ],
     deps = third_party_deps() + [
-        "//crates/micro-h2:micro_h2_firmware",
         "//crates/tailfeather:tailfeather_firmware",
         "//crates/tailfeather-gateway:tailfeather_gateway_firmware",
         "//crates/wirefeather:wirefeather_firmware",
@@ -40,7 +38,6 @@ rust_binary(
     name = "esp_gateway_firmware_lab",
     srcs = glob(["src/**/*.rs"]),
     aliases = {
-        "//crates/micro-h2:micro_h2_firmware": "micro_h2",
         "//crates/tailfeather:tailfeather_firmware": "tailfeather",
         "//crates/tailfeather-gateway:tailfeather_gateway_firmware": "tailfeather_gateway",
         "//crates/wirefeather:wirefeather_firmware": "wirefeather",
@@ -57,7 +54,6 @@ rust_binary(
     ],
     tags = ["manual"],
     deps = third_party_deps() + [
-        "//crates/micro-h2:micro_h2_firmware",
         "//crates/tailfeather:tailfeather_firmware",
         "//crates/tailfeather-gateway:tailfeather_gateway_firmware",
         "//crates/wirefeather:wirefeather_firmware",
@@ -71,7 +67,6 @@ rust_binary(
     name = "esp_gateway_firmware_lint",
     srcs = glob(["src/**/*.rs"]),
     aliases = {
-        "//crates/micro-h2:micro_h2_firmware": "micro_h2",
         "//crates/tailfeather:tailfeather_firmware": "tailfeather",
         "//crates/tailfeather-gateway:tailfeather_gateway_firmware": "tailfeather_gateway",
         "//crates/wirefeather:wirefeather_firmware": "wirefeather",
@@ -97,7 +92,6 @@ rust_binary(
     ],
     tags = ["manual"],
     deps = third_party_deps() + [
-        "//crates/micro-h2:micro_h2_firmware",
         "//crates/tailfeather:tailfeather_firmware",
         "//crates/tailfeather-gateway:tailfeather_gateway_firmware",
         "//crates/wirefeather:wirefeather_firmware",

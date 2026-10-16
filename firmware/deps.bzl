@@ -3,7 +3,6 @@
 load("@firmware_deps//:data.bzl", "DEP_DATA")
 
 _GENERATED_FIRST_PARTY = [
-    "@firmware_deps//:micro-h2-0.0.1",
     "@firmware_deps//:tailfeather-0.0.1",
     "@firmware_deps//:tailfeather-gateway-0.0.1",
     "@firmware_deps//:wirefeather-0.0.1",
