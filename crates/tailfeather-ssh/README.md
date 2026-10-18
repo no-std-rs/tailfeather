@@ -87,6 +87,11 @@ an empty mapping does not match. `=` implements non-root identity mapping;
 `root` and numeric zero are excluded. There are no Unix accounts or UID aliases.
 Use an explicit non-root console name such as `console`.
 
+Control may include an IPv6 `nodeIP` beside each IPv4 principal. Valid IPv6
+principals are ignored because they cannot match this IPv4-only transport;
+they never grant access to an IPv4 connection. Malformed addresses invalidate
+the entire policy.
+
 Check/delegation, rule expiry, nonzero session durations, recording requirements,
 node-ID/user-login principals, unknown requirements, duplicate fields, malformed
 values, and capacity overflow invalidate the **entire** policy. An unsupported
@@ -150,3 +155,46 @@ fixture reached through OpenSSH's ProxyCommand.
 The standalone fixture is built and tested by Bazel; Cargo's release checks run
 the TCP interoperability cases without it.
 It does not establish a live connection through Tailscale's hosted control plane.
+
+The live two-node test uses Headscale 0.29.3 and an unmodified Tailscale client:
+
+```sh
+bazel test //tests/lab:ssh_live --config=optimized --test_output=all
+```
+
+It starts a separate userspace `tailscaled`, registers the `live_server` host
+fixture using Tailfeather's control implementation, and runs
+`tailscale ssh console@<assigned-ip>`. The client verifies the advertised host
+key with its default verification. An exact greeting and echo, client exit
+status zero, and TCP drain are required. The fixture uses Tailfeather's
+WireGuard, IPv4 TCP stack, network filter, and live `TailnetAccess` authorizer.
+The generated policy includes both IPv4 and IPv6 principals, matching real
+control output. All identities and state are disposable; the existing host
+tailnet is not used. The Bazel test pins Tailscale 1.94.2; the same test was also
+run with the installed Tailscale 1.96.4 client.
+
+The stock `tailscale nc` proxy can close after the client exits zero before
+forwarding its SSH close acknowledgment. In that case the fixture records
+`Transport(UnexpectedEof)` after the completed exchange. The SSH engine's
+separate close-handshake regressions continue to require the acknowledgment;
+the live test accepts this proxy EOF only after verifying client status and
+the complete expected output.
+
+To use the installed client, build the host fixture and supply the pinned
+Headscale binary (the lab needs no root privileges or TUN device):
+
+```sh
+cargo build -p tailfeather-ssh --example live_server --locked
+python3 tests/lab/ssh-live.py --headscale /path/to/headscale
+python3 tests/lab/ssh-live.py --headscale /path/to/headscale --interactive
+```
+
+The interactive variant gives the default client a controlling terminal. It
+reports the expected PTY-allocation warning, then completes the line-console
+exchange without changing client authentication or host-key verification.
+
+`live_server` is a test adapter with a process deadline and direct UDP paths.
+It accepts only a loopback HTTP coordinator; production adapters must verify
+control TLS, persist their identity and host key, and handle cancellation and
+reconnection. This test establishes real-client compatibility in a Headscale
+tailnet, rather than hosted-control or physical-device acceptance.
