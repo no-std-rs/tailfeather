@@ -235,7 +235,17 @@ fn response_larger_than_openssh_window_survives_window_adjustments() {
         "{}; server={server}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert_eq!(result.stdout.len(), 2 * 1024 * 1024 + 65536);
+    assert_eq!(
+        result.stdout.len(),
+        2 * 1024 * 1024 + 65536,
+        "server={server}; first mismatch={:?}; stderr={}",
+        result
+            .stdout
+            .iter()
+            .enumerate()
+            .position(|(i, b)| *b != (i % 251) as u8),
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(
         result
             .stdout

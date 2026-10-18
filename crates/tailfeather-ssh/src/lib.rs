@@ -196,7 +196,7 @@ impl<S: Read + Write, R: RngCore + CryptoRng, A: Authorizer> zssh::Behavior
 /// response storage. Neither an allocator nor an async runtime is required.
 ///
 /// Cancel/drop this future on network removal, policy change, or your runtime's
-/// handshake/idle deadline, including while a read or write is blocked. A live
+/// handshake/idle/close deadline, including while a read or write is blocked. A live
 /// authorizer is also checked before every console callback and response.
 pub async fn serve<S: Read + Write, R: RngCore + CryptoRng, A: Authorizer, C: Console>(
     stream: S,
@@ -278,8 +278,8 @@ async fn run<S: Read + Write, R: RngCore + CryptoRng, A: Authorizer, C: Console>
         };
         channel.exit(status).await?;
     }
-    // CHANNEL_CLOSE and exit-status are already on the wire. The runtime
-    // closes/drains TCP; a further SSH disconnect can race the client's FIN.
+    // Both sides completed CHANNEL_CLOSE. The runtime can now close/drain TCP;
+    // a further SSH disconnect can race the client's FIN.
     Ok(())
 }
 

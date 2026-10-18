@@ -18,6 +18,9 @@ Local changes:
 - Reject additional session channels instead of queuing work the application
   will never serve.
 - Reject channel opens with a zero maximum packet size.
+- Finish both halves of the channel-close handshake before returning to the
+  caller. Closing TCP earlier can truncate buffered output in older OpenSSH
+  clients. A received close is acknowledged without sending more channel data.
 - Acquire the zero-copy writer asynchronously, before exposing its buffer, and
   cap the buffer to available window credit. Sending never polls into a filled
   payload. This local API change requires `channel.stdout().await?` (likewise

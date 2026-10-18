@@ -347,18 +347,18 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
     pub(crate) async fn channel_exit(&mut self, exit_status: u32) -> Result<(), TransportError<T>> {
         let recipient_channel = self.channel_state().tx_channel_id;
-
-        self.send(wire::Message::ChannelEof { recipient_channel })
+        if !matches!(self.channel_state().rx_half, HalfState::Close) {
+            self.send(wire::Message::ChannelEof { recipient_channel })
+                .await?;
+            self.send(wire::Message::ChannelRequest {
+                recipient_channel,
+                request: wire::Request::ExitStatus {
+                    want_reply: false,
+                    exit_status,
+                },
+            })
             .await?;
-
-        self.send(wire::Message::ChannelRequest {
-            recipient_channel,
-            request: wire::Request::ExitStatus {
-                want_reply: false,
-                exit_status,
-            },
-        })
-        .await?;
+        }
 
         self.send(wire::Message::ChannelClose { recipient_channel })
             .await?;
@@ -367,6 +367,13 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
         if let HalfState::Close = self.channel_state().rx_half {
             self.dequeue_pending_channel().await?;
+        }
+
+        // A channel is closed only after both sides have sent CHANNEL_CLOSE.
+        // In particular, older OpenSSH clients can discard buffered stdout if
+        // TCP reaches EOF before they drain output and acknowledge this close.
+        while self.active_channel.is_some() {
+            self.poll_client().await?;
         }
 
         self.request = None;

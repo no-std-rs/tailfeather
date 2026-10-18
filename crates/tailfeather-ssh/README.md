@@ -54,7 +54,7 @@ With Rust 1.95.0 on x86-64 Linux, the optimized host memory probe reports:
 | Small TCP storage, including socket metadata | 4,928 |
 
 The separate `probe:no_std_probe` fixture links without `std`, libc, or an
-allocator. Its optimized x86-64 code and read-only data are 130,120 bytes, with
+allocator. Its optimized x86-64 code and read-only data are 130,368 bytes, with
 173 bytes of initialized data. This measures the SSH console fixture, excluding
 the Tailscale node, TCP stack, and application-specific policy/console code; it
 is not an ESP32 flash measurement. Its 128 KiB code/data budget and allocator
@@ -124,13 +124,15 @@ Construct `TailnetAccess` using authenticated tunnel metadata and the TCP
 endpoints. Never treat a source IP from a LAN connection as an authenticated
 Tailscale identity. Then call `serve(stream, rng, host_key, access, console,
 packet_buffer, response_buffer)`. It returns when the single console exits or
-the connection fails. Gracefully close/drain TCP and release its slot afterwards.
+the connection fails. Successful exit waits for the peer's SSH channel-close
+acknowledgment so buffered client output can drain. Apply the runtime's deadline
+to this phase too. Gracefully close/drain TCP and release its slot afterwards.
 The crate does not enable a listener in the firmware or harness automatically.
 
 For a changing map, pass an authorizer closure which briefly borrows the current
 map and calls `TailnetAccess::allows`. The server rechecks before each console
 callback and response. The surrounding reactor must cancel/drop `serve` on a
-policy or peer change, and enforce handshake/idle deadlines: a blocked read or
+policy or peer change, and enforce handshake/idle/close deadlines: a blocked read or
 write cannot observe policy updates by itself. Packet and response storage are
 wiped on completion/error or cancellation after the first poll.
 

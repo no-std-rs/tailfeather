@@ -257,3 +257,78 @@ fn zero_copy_writer_reports_close_before_exposing_a_buffer() {
         Err(Error::UnexpectedEof)
     ));
 }
+
+fn close_messages(mut bytes: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+    while !bytes.is_empty() {
+        let len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let padding = usize::from(bytes[4]);
+        let message = wire::Message::decode(&bytes[5..4 + len - padding]).unwrap();
+        result.push(match message {
+            wire::Message::ChannelEof {
+                recipient_channel: 4,
+            } => 0,
+            wire::Message::ChannelRequest {
+                recipient_channel: 4,
+                request:
+                    wire::Request::ExitStatus {
+                        want_reply: false,
+                        exit_status: 23,
+                    },
+            } => 1,
+            wire::Message::ChannelClose {
+                recipient_channel: 4,
+            } => 2,
+            other => panic!("unexpected close message: {other:?}"),
+        });
+        bytes = &bytes[4 + len..];
+    }
+    result
+}
+
+#[test]
+fn exit_waits_for_the_peer_close_acknowledgment() {
+    let mut buffer = [0; 1024];
+    let mut transport = authenticated(
+        &mut buffer,
+        &[
+            wire::Message::ChannelEof {
+                recipient_channel: 0,
+            },
+            wire::Message::ChannelClose {
+                recipient_channel: 0,
+            },
+        ],
+    );
+    active(&mut transport, 0);
+    blocking(Channel::new(&mut transport).exit(23)).unwrap();
+    assert_eq!(
+        transport.behavior.stream.offset,
+        transport.behavior.stream.input.len()
+    );
+    assert!(transport.active_channel.is_none());
+    assert_eq!(close_messages(&transport.behavior.stream.output), [0, 1, 2]);
+}
+
+#[test]
+fn a_peer_initiated_close_gets_only_a_close_acknowledgment() {
+    let mut buffer = [0; 1024];
+    let mut transport = authenticated(&mut buffer, &[]);
+    active(&mut transport, 0);
+    transport.channel_state().rx_half = HalfState::Close;
+    transport.channel_state().tx_half = HalfState::Close;
+    blocking(Channel::new(&mut transport).exit(23)).unwrap();
+    assert_eq!(close_messages(&transport.behavior.stream.output), [2]);
+    assert!(transport.active_channel.is_none());
+}
+
+#[test]
+fn transport_eof_cannot_complete_the_channel_close_handshake() {
+    let mut buffer = [0; 1024];
+    let mut transport = authenticated(&mut buffer, &[]);
+    active(&mut transport, 0);
+    assert_eq!(
+        blocking(Channel::new(&mut transport).exit(23)),
+        Err(Error::UnexpectedEof)
+    );
+}
