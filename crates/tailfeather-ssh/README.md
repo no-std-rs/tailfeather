@@ -54,7 +54,7 @@ With Rust 1.95.0 on x86-64 Linux, the optimized host memory probe reports:
 | Small TCP storage, including socket metadata | 4,928 |
 
 The separate `probe:no_std_probe` fixture links without `std`, libc, or an
-allocator. Its optimized x86-64 code and read-only data are 130,368 bytes, with
+allocator. Its optimized x86-64 code and read-only data are 130,384 bytes, with
 173 bytes of initialized data. This measures the SSH console fixture, excluding
 the Tailscale node, TCP stack, and application-specific policy/console code; it
 is not an ESP32 flash measurement. Its 128 KiB code/data budget and allocator

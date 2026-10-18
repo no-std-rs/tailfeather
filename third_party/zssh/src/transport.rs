@@ -1250,7 +1250,9 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
         let mac_len = if self.curr_keys.is_some() { 16 } else { 0 };
 
-        if 4 + packet_len + mac_len > self.buffer.len() {
+        // The buffer is at least 512 bytes. Bound the untrusted length before
+        // adding framing bytes: u32 packet lengths can overflow usize on MCUs.
+        if packet_len > self.buffer.len() - 4 - mac_len {
             Err(ProtocolError::BufferExhausted)?;
         }
 

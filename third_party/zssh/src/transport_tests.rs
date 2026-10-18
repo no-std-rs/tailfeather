@@ -332,3 +332,39 @@ fn transport_eof_cannot_complete_the_channel_close_handshake() {
         Err(Error::UnexpectedEof)
     );
 }
+
+#[test]
+fn oversized_packet_headers_are_rejected_before_reading_the_body() {
+    for encrypted in [false, true] {
+        for length in if encrypted {
+            [496u32, u32::MAX - 7]
+        } else {
+            [516, u32::MAX - 3]
+        } {
+            let mut buffer = [0; 512];
+            let mut transport = authenticated(&mut buffer, &[]);
+            transport.authenticated = false;
+            let mut header = length.to_be_bytes();
+            if encrypted {
+                let key = [1; 32];
+                // recv starts at sequence zero, and uses the separate header
+                // key before validating the packet length or reading its MAC.
+                let mut cipher = ChaCha20Legacy::new((&key).into(), (&[0; 8]).into());
+                cipher.apply_keystream(&mut header);
+                transport.curr_keys = Some(KeyMaterial {
+                    client_head_key: key,
+                    client_main_key: [2; 32],
+                    server_head_key: [3; 32],
+                    server_main_key: [4; 32],
+                    session_id: [5; 32],
+                });
+            }
+            transport.behavior.stream.input.extend_from_slice(&header);
+            assert_eq!(
+                blocking(transport.recv()),
+                Err(Error::Protocol(ProtocolError::BufferExhausted))
+            );
+            assert_eq!(transport.behavior.stream.offset, 4);
+        }
+    }
+}

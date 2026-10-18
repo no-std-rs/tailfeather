@@ -18,6 +18,8 @@ Local changes:
 - Reject additional session channels instead of queuing work the application
   will never serve.
 - Reject channel opens with a zero maximum packet size.
+- Bound incoming packet lengths before adding framing/MAC bytes, including on
+  32-bit targets where a hostile u32 length could otherwise overflow usize.
 - Finish both halves of the channel-close handshake before returning to the
   caller. Closing TCP earlier can truncate buffered output in older OpenSSH
   clients. A received close is acknowledged without sending more channel data.
