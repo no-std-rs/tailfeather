@@ -36,7 +36,9 @@ def prepare(root=ROOT, *, tag=None, web_channel=None, commit=None):
     if web_channel == "main":
         web_version += f"-main.{commit[:12]}"
     manifests = [root / "Cargo.toml", *root.glob("crates/*/Cargo.toml")]
-    manifests += [root / path / "Cargo.toml" for path in ("harness", "firmware", "web/client")]
+    manifests += [root / path / "Cargo.toml" for path in (
+        "harness", "firmware", "web/client", "crates/tailfeather-ssh/probe",
+    )]
     changed = {}
     for path in manifests:
         if not path.exists():
@@ -63,7 +65,8 @@ def prepare(root=ROOT, *, tag=None, web_channel=None, commit=None):
     locked_versions = dict(current)
     if web_channel:
         locked_versions["tailfeather-web"] = web_version
-    for relative in ("Cargo.lock", "harness/Cargo.lock", "firmware/Cargo.lock", "web/client/Cargo.lock"):
+    for relative in ("Cargo.lock", "harness/Cargo.lock", "firmware/Cargo.lock", "web/client/Cargo.lock",
+                     "crates/tailfeather-ssh/probe/Cargo.lock"):
         path = root / relative
         if not path.exists():
             continue

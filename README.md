@@ -60,6 +60,8 @@ before credentials enter the Rust action environment. See
 
 - `tailfeather`: bounded node, control, netmap, disco, DERP, keys, and state.
 - `tailfeather-gateway`: allocation-free IPv4 routing and fixed-capacity NAT.
+- `tailfeather-ssh`: small allocation-free SSH console with bounded Tailscale
+  accept-policy enforcement; see [`crates/tailfeather-ssh/README.md`](crates/tailfeather-ssh/README.md).
 - `wirefeather`: allocation-free WireGuard-compatible handshake and transport.
 - `tailfeather-testkit`: std-only offline fixture and baseline checks.
 - `ts-conformance`: offline and live compatibility measurement.

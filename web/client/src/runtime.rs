@@ -521,6 +521,7 @@ impl State {
             routable_ips: &[],
             preferred_derp,
             peer_api_port: None,
+            ssh_host_keys: &[],
         }
     }
 

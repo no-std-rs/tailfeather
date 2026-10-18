@@ -12,6 +12,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
     crate_name = "tailfeather",
+    crate_features = ["fast-curve25519", "ssh-policy"],
     edition = "2024",
     rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
     deps = all_crate_deps(normal = True),

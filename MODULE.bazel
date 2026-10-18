@@ -105,7 +105,13 @@ crate.from_cargo(
         "x86_64-unknown-linux-gnu",
     ],
 )
-use_repo(crate, "firmware_deps", "harness_deps", "tailfeather_root_deps")
+crate.from_cargo(
+    name = "ssh_probe_deps",
+    cargo_lock = "//crates/tailfeather-ssh/probe:Cargo.lock",
+    cargo_toml = "//crates/tailfeather-ssh/probe:Cargo.toml",
+    platform_triples = ["x86_64-unknown-linux-gnu"],
+)
+use_repo(crate, "firmware_deps", "harness_deps", "ssh_probe_deps", "tailfeather_root_deps")
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")

@@ -43,9 +43,11 @@ pub enum Token<'a> {
     Key(&'a str),
     Str(&'a str),
     /// Integers only. Every number in a MapResponse is an id, a port or a
-    /// region; a fractional one is parsed and discarded rather than pulling
-    /// floating point into a firmware build.
+    /// region. Other numeric forms are reported without floating-point parsing.
     Int(i64),
+    /// A fraction, exponent, or integer outside i64. Never silently coerce a
+    /// security constraint such as SSH session duration to zero.
+    OtherNumber,
     Bool(bool),
     Null,
 }
@@ -362,11 +364,11 @@ impl Scanner {
         on_token: &mut impl FnMut(Token<'_>) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let text = core::str::from_utf8(&self.buffer).map_err(|_| Error::Json)?;
-        // A fractional or exponent form is valid JSON and is not something this
-        // protocol uses for anything we read, so it is accepted and discarded
-        // rather than rejected.
-        let value = text.parse::<i64>().unwrap_or(0);
-        on_token(Token::Int(value))?;
+        let token = match text.parse::<i64>() {
+            Ok(value) => Token::Int(value),
+            Err(_) => Token::OtherNumber,
+        };
+        on_token(token)?;
         self.state = State::AfterValue;
         Ok(())
     }
@@ -451,6 +453,7 @@ mod tests {
                 Token::Key(k) => write!(text, "k:{k}").unwrap(),
                 Token::Str(s) => write!(text, "s:{s}").unwrap(),
                 Token::Int(i) => write!(text, "i:{i}").unwrap(),
+                Token::OtherNumber => text.push_str("number").unwrap(),
                 Token::Bool(b) => write!(text, "b:{b}").unwrap(),
                 Token::Null => text.push_str("null").unwrap(),
             }
@@ -533,7 +536,7 @@ mod tests {
         assert_eq!(joined(r#"{"a":1}"#, 1).as_str(), "{ k:a i:1 }");
         // Fractions are legal JSON; nothing we read uses one, so it is
         // discarded rather than rejected.
-        assert_eq!(joined(r#"[1.5]"#, 1).as_str(), "[ i:0 ]");
+        assert_eq!(joined(r#"[1.5]"#, 1).as_str(), "[ number ]");
     }
 
     #[test]

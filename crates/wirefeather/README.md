@@ -1,5 +1,10 @@
 # wirefeather
 
+The default `fast-curve25519` feature retains precomputed basepoint tables.
+Use `default-features = false` to trade key-operation speed for smaller code.
+Another dependency enabling the tables re-enables them through Cargo feature
+unification.
+
 A sans-io [WireGuard](https://www.wireguard.com) protocol core: `no_std`,
 allocation-free, and independent of any socket API.
 

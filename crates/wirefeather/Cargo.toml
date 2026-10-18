@@ -11,13 +11,17 @@ readme      = "README.md"
 keywords    = ["wireguard", "vpn", "no-std", "embedded", "sans-io"]
 categories  = ["network-programming", "no-std", "cryptography"]
 
+[features]
+default = ["fast-curve25519"]
+fast-curve25519 = ["x25519-dalek/precomputed-tables"]
+
 [dependencies]
 blake2            = { version = "0.10", default-features = false }
 chacha20poly1305  = { version = "0.10", default-features = false }
 heapless          = "0.9"
 hmac              = { version = "0.12", default-features = false }
 subtle            = { version = "2.6", default-features = false }
-x25519-dalek      = { version = "2", default-features = false, features = ["static_secrets", "precomputed-tables", "zeroize"] }
+x25519-dalek      = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 zeroize           = { version = "1.8", default-features = false }
 
 [dev-dependencies]

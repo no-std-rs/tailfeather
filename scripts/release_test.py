@@ -31,7 +31,8 @@ class VersionsTest(unittest.TestCase):
         self.root = Path(self.directory.name)
         files = [ROOT / "Cargo.toml", *ROOT.glob("crates/*/Cargo.toml")]
         files += [ROOT / path for path in ["Cargo.lock", "harness/Cargo.toml", "harness/Cargo.lock",
-                  "firmware/Cargo.toml", "firmware/Cargo.lock", "web/client/Cargo.toml", "web/client/Cargo.lock"]]
+                  "firmware/Cargo.toml", "firmware/Cargo.lock", "web/client/Cargo.toml", "web/client/Cargo.lock",
+                  "crates/tailfeather-ssh/probe/Cargo.toml", "crates/tailfeather-ssh/probe/Cargo.lock"]]
         files += list(ROOT.glob("crates/*/version.txt"))
         for source in files:
             target = self.root / source.relative_to(ROOT)
@@ -53,7 +54,12 @@ class VersionsTest(unittest.TestCase):
         self.assertEqual(self.manifest("crates/tailfeather-testkit/Cargo.toml")["package"]["version"], "0.0.1")
         self.assertEqual(self.manifest("crates/tailfeather-testkit/Cargo.toml")["dependencies"]["tailfeather"]["version"], "0.2.0")
         self.assertEqual(self.manifest("harness/Cargo.toml")["dependencies"]["tailfeather-gateway"]["version"], "0.3.0")
-        for relative in ["Cargo.lock", "harness/Cargo.lock", "firmware/Cargo.lock", "web/client/Cargo.lock"]:
+        probe = self.manifest("crates/tailfeather-ssh/probe/Cargo.toml")
+        self.assertEqual(probe["package"]["version"], "0.0.1")
+        self.assertEqual(probe["patch"]["crates-io"]["tailfeather"]["version"], "0.2.0")
+        self.assertEqual(self.manifest("crates/tailfeather-ssh/Cargo.toml")["dependencies"]["tailfeather"]["version"], "0.2.0")
+        for relative in ["Cargo.lock", "harness/Cargo.lock", "firmware/Cargo.lock", "web/client/Cargo.lock",
+                         "crates/tailfeather-ssh/probe/Cargo.lock"]:
             packages = self.manifest(relative)["package"]
             for package in packages:
                 if package["name"] in self.versions:

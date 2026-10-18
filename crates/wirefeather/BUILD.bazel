@@ -12,6 +12,7 @@ rust_library(
     name = "wirefeather",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
+    crate_features = ["fast-curve25519"],
     crate_name = "wirefeather",
     edition = "2024",
     deps = all_crate_deps(normal = True),

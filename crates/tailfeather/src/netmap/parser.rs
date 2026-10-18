@@ -113,6 +113,9 @@ pub struct Netmap<const PEERS: usize = MAX_PEERS> {
     /// Staged packet-filter policy. No packet is forwarded until at least one
     /// syntactically valid policy update has been received.
     pub packet_filter: crate::netmap::PacketPolicy,
+    /// Bounded SSH authorization, separate from the network packet filter.
+    #[cfg(feature = "ssh-policy")]
+    pub ssh_policy: crate::netmap::ssh::Policy,
     /// How many complete MapResponses have been applied.
     pub responses: usize,
     /// This node's display name: the first label of its MagicDNS name.
@@ -133,6 +136,8 @@ impl<const PEERS: usize> Netmap<PEERS> {
             primary_routes: heapless::Vec::new(),
             home_derp: 0,
             packet_filter: crate::netmap::PacketPolicy::new(),
+            #[cfg(feature = "ssh-policy")]
+            ssh_policy: crate::netmap::ssh::Policy::new(),
             responses: 0,
             #[cfg(feature = "peer-names")]
             name: heapless::String::new(),
@@ -163,6 +168,8 @@ impl<const PEERS: usize> Netmap<PEERS> {
         }
         self.home_derp = source.home_derp;
         self.packet_filter.copy_from(&source.packet_filter);
+        #[cfg(feature = "ssh-policy")]
+        self.ssh_policy.clone_from(&source.ssh_policy);
         self.responses = source.responses;
         #[cfg(feature = "peer-names")]
         {
@@ -201,6 +208,10 @@ struct Pending {
     node_key: Option<NodePublic>,
     disco_key: Option<DiscoPublic>,
     online: Option<bool>,
+    #[cfg(feature = "ssh-policy")]
+    expired: Option<bool>,
+    #[cfg(feature = "ssh-policy")]
+    key_expiry_restricted: Option<bool>,
     home_derp: Option<u16>,
     addresses: heapless::Vec<Cidr4, { crate::netmap::MAX_ADDRESSES }>,
     allowed_ips: heapless::Vec<Cidr4, { crate::netmap::MAX_ALLOWED_IPS }>,
@@ -223,6 +234,10 @@ impl Pending {
             node_key: None,
             disco_key: None,
             online: None,
+            #[cfg(feature = "ssh-policy")]
+            expired: None,
+            #[cfg(feature = "ssh-policy")]
+            key_expiry_restricted: None,
             home_derp: None,
             addresses: heapless::Vec::new(),
             allowed_ips: heapless::Vec::new(),
@@ -336,6 +351,8 @@ struct State {
     deferred_peer: Option<Peer>,
     region: PendingRegion,
     filter: PendingFilter,
+    #[cfg(feature = "ssh-policy")]
+    ssh: crate::netmap::ssh::Builder,
     /// The first error, kept so parsing stops reporting the same thing.
     failed: Option<Error>,
 }
@@ -618,6 +635,10 @@ impl State {
         let mut peer = Peer::new(self.pending.id, node_key);
         peer.disco_key = self.pending.disco_key;
         peer.set_online(self.pending.online.unwrap_or(false));
+        #[cfg(feature = "ssh-policy")]
+        peer.set_expired(self.pending.expired.unwrap_or(false));
+        #[cfg(feature = "ssh-policy")]
+        peer.set_key_expiry_restricted(self.pending.key_expiry_restricted.unwrap_or(false));
         peer.set_approved_ipv4_default(self.pending.approved_ipv4_default);
         peer.approved_ipv6_default = self.pending.approved_ipv6_default;
         peer.home_derp = self.pending.home_derp.unwrap_or(0);
@@ -738,8 +759,19 @@ impl State {
             // inventing one would produce a peer with no key.
             return;
         };
+        if let Some(key) = self.pending.node_key {
+            peer.node_key = key;
+        }
         if let Some(online) = self.pending.online {
             peer.set_online(online);
+        }
+        #[cfg(feature = "ssh-policy")]
+        if let Some(expired) = self.pending.expired {
+            peer.set_expired(expired);
+        }
+        #[cfg(feature = "ssh-policy")]
+        if let Some(restricted) = self.pending.key_expiry_restricted {
+            peer.set_key_expiry_restricted(restricted);
         }
         if let Some(derp) = self.pending.home_derp {
             peer.home_derp = derp;
@@ -986,6 +1018,10 @@ impl State {
             Context::PeerObject | Context::PatchObject if self.key == "Online" => {
                 self.pending.online = Some(value);
             }
+            #[cfg(feature = "ssh-policy")]
+            Context::PeerObject | Context::PatchObject if self.key == "Expired" => {
+                self.pending.expired = Some(value);
+            }
             Context::DerpNode => match self.key.as_str() {
                 "STUNOnly" => {
                     self.region.node_flags = (self.region.node_flags & !1) | u8::from(value);
@@ -1033,6 +1069,32 @@ impl State {
         netmap: &mut Netmap<PEERS>,
         token: Token<'_>,
     ) -> Result<(), Error> {
+        #[cfg(feature = "ssh-policy")]
+        {
+            let field = self.context() == Context::Root && self.key == "SSHPolicy";
+            self.ssh.token(&mut netmap.ssh_policy, &token, field);
+            if matches!(self.context(), Context::PeerObject | Context::PatchObject)
+                && self.key == "KeyExpiry"
+            {
+                match &token {
+                    Token::Str(value) => {
+                        // Go's zero time means no expiry. Supporting finite
+                        // deadlines needs an advancing trusted clock; deny
+                        // them rather than retaining an unchecked timestamp.
+                        self.pending.key_expiry_restricted = Some(*value != "0001-01-01T00:00:00Z");
+                    }
+                    Token::StartObject
+                    | Token::StartArray
+                    | Token::Int(_)
+                    | Token::OtherNumber
+                    | Token::Bool(_) => {
+                        self.pending.key_expiry_restricted = Some(true);
+                    }
+                    // A null optional patch field leaves the old value alone.
+                    _ => {}
+                }
+            }
+        }
         match token {
             Token::StartObject | Token::StartArray => self.on_start(netmap),
             Token::EndObject | Token::EndArray => self.on_end(netmap),
@@ -1055,6 +1117,11 @@ impl State {
             }
             Token::Str(value) => self.on_string(netmap, value),
             Token::Int(value) => self.on_number(netmap, value),
+            Token::OtherNumber => {
+                if self.context() != Context::Ignored {
+                    self.fail(Error::Malformed);
+                }
+            }
             Token::Bool(value) => self.on_bool(netmap, value),
             Token::Null => self.on_null(netmap),
         }
@@ -1121,6 +1188,8 @@ impl<const PEERS: usize> Parser<PEERS> {
                 deferred_peer: None,
                 region: PendingRegion::new(),
                 filter: PendingFilter::new(),
+                #[cfg(feature = "ssh-policy")]
+                ssh: crate::netmap::ssh::Builder::new(),
                 failed: None,
             },
         }
@@ -1137,6 +1206,10 @@ impl<const PEERS: usize> Parser<PEERS> {
         self.state.deferred_peer = None;
         self.state.region = PendingRegion::new();
         self.state.filter = PendingFilter::new();
+        #[cfg(feature = "ssh-policy")]
+        {
+            self.state.ssh = crate::netmap::ssh::Builder::new();
+        }
         self.state.failed = None;
     }
 
