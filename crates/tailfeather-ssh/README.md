@@ -54,7 +54,7 @@ With Rust 1.95.0 on x86-64 Linux, the optimized host memory probe reports:
 | Small TCP storage, including socket metadata | 4,928 |
 
 The separate `probe:no_std_probe` fixture links without `std`, libc, or an
-allocator. Its optimized x86-64 code and read-only data are 130,040 bytes, with
+allocator. Its optimized x86-64 code and read-only data are 130,120 bytes, with
 173 bytes of initialized data. This measures the SSH console fixture, excluding
 the Tailscale node, TCP stack, and application-specific policy/console code; it
 is not an ESP32 flash measurement. Its 128 KiB code/data budget and allocator
@@ -98,6 +98,12 @@ deliberate subset, not full Tailscale SSH policy compatibility.
 Absent/null policy deltas preserve the previous policy. An empty policy revokes
 access. A replacement policy authorizes nobody until its entire object arrives.
 Keep normal map framing/validation transactional, as with the other fields.
+
+SSH peers must have key expiry disabled. This clock-free subset accepts absent
+or canonical Go zero `KeyExpiry` values, and denies finite or unsupported expiry
+values even when the deadline is in the future. Full records and peer patches
+retain this restriction independently of `Expired`; null patches preserve it.
+Key-rotation patches immediately replace the identity used for authorization.
 
 ## Wiring
 

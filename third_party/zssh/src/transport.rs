@@ -15,6 +15,10 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
+#[cfg(test)]
+#[path = "transport_tests.rs"]
+mod tests;
+
 const KEXINIT_KEX_ALGORITHM: &str = "curve25519-sha256";
 const KEXINIT_STRICT_KEX_CLIENT: &str = "kex-strict-c-v00@openssh.com";
 const KEXINIT_KEX: &str = "curve25519-sha256,kex-strict-s-v00@openssh.com";
@@ -370,20 +374,11 @@ impl<'a, T: Behavior> Transport<'a, T> {
         Ok(())
     }
 
-    pub(crate) async fn channel_write_all(
-        &mut self,
-        len: usize,
-        pipe: Pipe,
-    ) -> Result<bool, TransportError<T>> {
-        while !self.channel_write(len, pipe).await? {
-            if let HalfState::Close = self.channel_state().tx_half {
-                return Ok(false); // client has closed the channel
-            }
-
-            self.poll_client().await?;
+    pub(crate) fn channel_write_credit(&self) -> usize {
+        match self.active_channel.as_ref().map(|channel| channel.tx_half) {
+            Some(HalfState::Window(amount)) => wire::from_u32(amount),
+            _ => 0,
         }
-
-        Ok(true)
     }
 
     // Backported from 0.5: polling may overwrite the shared packet buffer, so
@@ -882,11 +877,15 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         maximum_packet_size,
                     },
             } if self.authenticated => {
+                if maximum_packet_size == 0 {
+                    return Err(ProtocolError::MalformedPacket.into());
+                }
                 if self.active_channel.is_some() || self.channels.iter().any(Option::is_some) {
                     self.send(wire::Message::ChannelOpenFailure {
                         recipient_channel: sender_channel,
                         reason: wire::ChannelOpenFailureReason::ResourceShortage,
-                    }).await?;
+                    })
+                    .await?;
                     return Ok(None);
                 }
                 for channel in self.channels.into_iter().flatten() {

@@ -81,7 +81,7 @@ impl Hostinfo<'_> {
             .field_str("Hostname", self.hostname);
 
         if !self.ssh_host_keys.is_empty() {
-            writer.key("SSH_HostKeys").begin_array();
+            writer.key("sshHostKeys").begin_array();
             for key in self.ssh_host_keys {
                 writer.str(key);
             }

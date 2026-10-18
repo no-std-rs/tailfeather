@@ -72,28 +72,34 @@ impl<'a, 'b, T: Behavior> Channel<'a, 'b, T> {
     }
 
     /// Obtains a writer over this channel for the specified pipe.
-    pub fn writer(&mut self, pipe: Pipe) -> Writer<'a, '_, T> {
-        Writer::new(self.transport, pipe)
+    /// Waits for positive window credit before any payload buffer is exposed.
+    pub async fn writer(&mut self, pipe: Pipe) -> Result<Writer<'a, '_, T>, TransportError<T>> {
+        self.transport.channel_write_window(1).await?;
+        Ok(Writer::new(self.transport, pipe))
     }
 
     /// Obtains a writer over this channel for standard output.
-    pub fn stdout(&mut self) -> Writer<'a, '_, T> {
-        self.writer(Pipe::Stdout)
+    pub async fn stdout(&mut self) -> Result<Writer<'a, '_, T>, TransportError<T>> {
+        self.writer(Pipe::Stdout).await
     }
 
     /// Obtains a writer over this channel for standard error.
-    pub fn stderr(&mut self) -> Writer<'a, '_, T> {
-        self.writer(Pipe::Stderr)
+    pub async fn stderr(&mut self) -> Result<Writer<'a, '_, T>, TransportError<T>> {
+        self.writer(Pipe::Stderr).await
     }
 
     /// Convenience method that writes all bytes into standard output.
     pub async fn write_all_stdout(&mut self, bytes: &[u8]) -> Result<(), TransportError<T>> {
-        self.stdout().write_all_internal(bytes).await
+        Writer::new(self.transport, Pipe::Stdout)
+            .write_all_internal(bytes)
+            .await
     }
 
     /// Convenience method that writes all bytes into standard error.
     pub async fn write_all_stderr(&mut self, bytes: &[u8]) -> Result<(), TransportError<T>> {
-        self.stderr().write_all_internal(bytes).await
+        Writer::new(self.transport, Pipe::Stderr)
+            .write_all_internal(bytes)
+            .await
     }
 }
 
@@ -132,9 +138,14 @@ impl<'a, 'b, T: Behavior> Writer<'a, 'b, T> {
         Self { transport, pipe }
     }
 
-    /// Returns a byte slice into the packet buffer.
+    /// Returns a byte slice into the packet buffer, limited to the credit
+    /// obtained before this writer was created. Filling it never needs a
+    /// subsequent receive that could overwrite the payload.
     pub fn buffer(&mut self) -> &mut [u8] {
-        self.transport.channel_data_payload_buffer(self.pipe)
+        let credit = self.transport.channel_write_credit();
+        let buffer = self.transport.channel_data_payload_buffer(self.pipe);
+        let len = buffer.len().min(credit);
+        &mut buffer[..len]
     }
 
     /// Writes all requested bytes already present in the packet buffer.
@@ -142,16 +153,18 @@ impl<'a, 'b, T: Behavior> Writer<'a, 'b, T> {
     /// This will take the first `len` bytes in the byte slice returned
     /// by the `buffer()` method and send them as a single SSH message.
     pub async fn write_all(self, len: usize) -> Result<(), TransportError<T>> {
-        self.transport.channel_write_all(len, self.pipe).await?;
-
-        // TODO: report to the caller whether we wrote all bytes (the only
-        // case where we don't is if the client closed the channel on us).
-
-        Ok(())
+        if len > self.transport.channel_write_credit() {
+            return Err(crate::ProtocolError::WindowOverflow.into());
+        }
+        if self.transport.channel_write(len, self.pipe).await? {
+            Ok(())
+        } else {
+            Err(crate::Error::UnexpectedEof)
+        }
     }
 
     async fn write_all_internal(mut self, bytes: &[u8]) -> Result<(), TransportError<T>> {
-        for mut chunk in bytes.chunks(self.buffer().len()) {
+        for mut chunk in bytes.chunks(self.transport.channel_data_payload_buffer(self.pipe).len()) {
             while !chunk.is_empty() {
                 let window = self.transport.channel_write_window(1).await?;
                 let len = chunk.len().min(window);

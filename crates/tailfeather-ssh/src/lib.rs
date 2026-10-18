@@ -68,6 +68,7 @@ impl<F: Fn(&str) -> bool> Authorizer for F {
 /// Construct this from authenticated tunnel metadata, never client-supplied
 /// identity or an arbitrary LAN TCP connection. `AllowedIPs` subnet routes
 /// deliberately do not prove that their traffic originates at the router.
+/// Only peers with key expiry disabled are supported without a trusted clock.
 pub struct TailnetAccess<'a, const PEERS: usize> {
     pub netmap: &'a Netmap<PEERS>,
     pub peer_key: NodePublic,
@@ -82,6 +83,7 @@ impl<const PEERS: usize> Authorizer for TailnetAccess<'_, PEERS> {
             return false;
         };
         !peer.expired()
+            && peer.key_expiry_unbounded()
             && peer
                 .addresses
                 .iter()
@@ -319,7 +321,7 @@ mod tests {
         let mut writer = tailfeather::control::json::Writer::new(&mut body);
         info.write(&mut writer);
         let json = core::str::from_utf8(writer.finish().unwrap()).unwrap();
-        assert!(json.contains("\"SSH_HostKeys\":[\"ssh-ed25519 "));
+        assert!(json.contains("\"sshHostKeys\":[\"ssh-ed25519 "));
     }
 
     #[test]
@@ -390,6 +392,86 @@ mod tests {
         assert!(!allowed(&map, key, source, Ipv4Addr::LOCALHOST));
         map.packet_filter = Default::default();
         assert!(!allowed(&map, key, source, dest));
+    }
+
+    #[test]
+    fn control_expiry_and_rotated_keys_revoke_ssh_access() {
+        fn update(map: &mut Netmap<1>, json: &str) {
+            let mut parser = Parser::new();
+            for chunk in json.as_bytes().chunks(3) {
+                parser.push(map, chunk).unwrap();
+            }
+            parser.finish(map).unwrap();
+        }
+        fn allows(map: &Netmap<1>, key: NodePublic) -> bool {
+            TailnetAccess {
+                netmap: map,
+                peer_key: key,
+                source: Ipv4Addr::new(100, 64, 0, 2),
+                destination: Ipv4Addr::new(100, 64, 0, 1),
+                local_user: "console",
+            }
+            .allows("console")
+        }
+        let old = NodePrivate::from_bytes([2; 32]).public();
+        let new = NodePrivate::from_bytes([3; 32]).public();
+        let mut text = [0; 128];
+        let old_text = old.encode(&mut text).unwrap();
+        let mut map = Netmap::<1>::new();
+        update(
+            &mut map,
+            r#"{"Node":{"Addresses":["100.64.0.1/32"]},"PacketFilter":[{"SrcIPs":["*"],"DstPorts":[{"IP":"*","Ports":{"First":22,"Last":22}}]}],"SSHPolicy":{"rules":[{"principals":[{"any":true}],"sshUsers":{"console":"console"},"action":{"accept":true}}]}}"#,
+        );
+        for expiry in [
+            r#""2000-01-01T00:00:00Z""#,
+            r#""2099-01-01T00:00:00Z""#,
+            r#""invalid""#,
+            "true",
+            "42",
+            "{}",
+            "[]",
+        ] {
+            update(
+                &mut map,
+                &std::format!(
+                    r#"{{"PeersChanged":[{{"ID":1,"Key":"{old_text}","Addresses":["100.64.0.2/32"],"KeyExpiry":{expiry}}}]}}"#
+                ),
+            );
+            assert!(!allows(&map, old), "finite/unsupported expiry {expiry}");
+            update(
+                &mut map,
+                r#"{"PeersChangedPatch":[{"NodeID":1,"KeyExpiry":null,"Expired":false}]}"#,
+            );
+            assert!(!allows(&map, old), "null must preserve expiry");
+            update(
+                &mut map,
+                r#"{"PeersChangedPatch":[{"NodeID":1,"KeyExpiry":"0001-01-01T00:00:00Z"}]}"#,
+            );
+            assert!(allows(&map, old));
+            update(
+                &mut map,
+                r#"{"PeersChangedPatch":[{"NodeID":1,"KeyExpiry":"2099-01-01T00:00:00Z"}]}"#,
+            );
+            assert!(!allows(&map, old));
+        }
+        update(
+            &mut map,
+            r#"{"PeersChangedPatch":[{"NodeID":1,"Expired":true,"KeyExpiry":"0001-01-01T00:00:00Z"}]}"#,
+        );
+        assert!(!allows(&map, old), "zero expiry must not clear Expired");
+        update(
+            &mut map,
+            r#"{"PeersChangedPatch":[{"NodeID":1,"Expired":false}]}"#,
+        );
+        assert!(allows(&map, old));
+        let new_text = new.encode(&mut text).unwrap();
+        update(
+            &mut map,
+            &std::format!(r#"{{"PeersChangedPatch":[{{"NodeID":1,"Key":"{new_text}"}}]}}"#),
+        );
+        assert!(!allows(&map, old), "rotated key must lose its identity");
+        assert!(allows(&map, new));
+        assert_eq!(map.peers.get(1).unwrap().addresses.len(), 1);
     }
 
     struct PendingStream;

@@ -17,6 +17,11 @@ Local changes:
   window-adjust/rekey packet can overwrite the response being retried.
 - Reject additional session channels instead of queuing work the application
   will never serve.
+- Reject channel opens with a zero maximum packet size.
+- Acquire the zero-copy writer asynchronously, before exposing its buffer, and
+  cap the buffer to available window credit. Sending never polls into a filled
+  payload. This local API change requires `channel.stdout().await?` (likewise
+  `stderr` and `writer`); the Tailfeather wrapper uses copying writes.
 
 `//crates/tailfeather-ssh:openssh_test` covers a response larger than OpenSSH's
 initial receive window, short underlying writes, and normal console operation.

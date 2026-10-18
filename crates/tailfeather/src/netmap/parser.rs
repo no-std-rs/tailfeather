@@ -210,6 +210,8 @@ struct Pending {
     online: Option<bool>,
     #[cfg(feature = "ssh-policy")]
     expired: Option<bool>,
+    #[cfg(feature = "ssh-policy")]
+    key_expiry_restricted: Option<bool>,
     home_derp: Option<u16>,
     addresses: heapless::Vec<Cidr4, { crate::netmap::MAX_ADDRESSES }>,
     allowed_ips: heapless::Vec<Cidr4, { crate::netmap::MAX_ALLOWED_IPS }>,
@@ -234,6 +236,8 @@ impl Pending {
             online: None,
             #[cfg(feature = "ssh-policy")]
             expired: None,
+            #[cfg(feature = "ssh-policy")]
+            key_expiry_restricted: None,
             home_derp: None,
             addresses: heapless::Vec::new(),
             allowed_ips: heapless::Vec::new(),
@@ -633,6 +637,8 @@ impl State {
         peer.set_online(self.pending.online.unwrap_or(false));
         #[cfg(feature = "ssh-policy")]
         peer.set_expired(self.pending.expired.unwrap_or(false));
+        #[cfg(feature = "ssh-policy")]
+        peer.set_key_expiry_restricted(self.pending.key_expiry_restricted.unwrap_or(false));
         peer.set_approved_ipv4_default(self.pending.approved_ipv4_default);
         peer.approved_ipv6_default = self.pending.approved_ipv6_default;
         peer.home_derp = self.pending.home_derp.unwrap_or(0);
@@ -753,12 +759,19 @@ impl State {
             // inventing one would produce a peer with no key.
             return;
         };
+        if let Some(key) = self.pending.node_key {
+            peer.node_key = key;
+        }
         if let Some(online) = self.pending.online {
             peer.set_online(online);
         }
         #[cfg(feature = "ssh-policy")]
         if let Some(expired) = self.pending.expired {
             peer.set_expired(expired);
+        }
+        #[cfg(feature = "ssh-policy")]
+        if let Some(restricted) = self.pending.key_expiry_restricted {
+            peer.set_key_expiry_restricted(restricted);
         }
         if let Some(derp) = self.pending.home_derp {
             peer.home_derp = derp;
@@ -1060,6 +1073,27 @@ impl State {
         {
             let field = self.context() == Context::Root && self.key == "SSHPolicy";
             self.ssh.token(&mut netmap.ssh_policy, &token, field);
+            if matches!(self.context(), Context::PeerObject | Context::PatchObject)
+                && self.key == "KeyExpiry"
+            {
+                match &token {
+                    Token::Str(value) => {
+                        // Go's zero time means no expiry. Supporting finite
+                        // deadlines needs an advancing trusted clock; deny
+                        // them rather than retaining an unchecked timestamp.
+                        self.pending.key_expiry_restricted = Some(*value != "0001-01-01T00:00:00Z");
+                    }
+                    Token::StartObject
+                    | Token::StartArray
+                    | Token::Int(_)
+                    | Token::OtherNumber
+                    | Token::Bool(_) => {
+                        self.pending.key_expiry_restricted = Some(true);
+                    }
+                    // A null optional patch field leaves the old value alone.
+                    _ => {}
+                }
+            }
         }
         match token {
             Token::StartObject | Token::StartArray => self.on_start(netmap),

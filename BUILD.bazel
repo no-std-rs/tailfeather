@@ -33,6 +33,7 @@ INTEGRATION_RUST_TEST_TARGETS = [
     "//crates/ts-conformance:matrix_test",
     "//crates/ts-conformance:noise_vs_snow_test",
     "//crates/ts-conformance:pcap_replay_test",
+    "//third_party/zssh:unit_test",
 ]
 
 CLIPPY_RUST_TARGETS = FIRST_PARTY_RUST_TARGETS + INTEGRATION_RUST_TEST_TARGETS + [
@@ -91,6 +92,7 @@ test_suite(
         "//crates/ts-conformance:doc_test",
         "//crates/wirefeather:unit_test",
         "//crates/wirefeather:doc_test",
+        "//third_party/zssh:unit_test",
     ],
 )
 
