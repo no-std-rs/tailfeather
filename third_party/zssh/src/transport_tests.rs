@@ -368,3 +368,49 @@ fn oversized_packet_headers_are_rejected_before_reading_the_body() {
         }
     }
 }
+
+#[test]
+fn non_contributory_curve25519_keys_fail_before_installing_session_keys() {
+    // Both low-order inputs force an all-zero shared secret, independently of
+    // the server's ephemeral private key. A normal base point still works.
+    for coordinate in [0, 1, 9] {
+        let mut public_key = [0; 32];
+        public_key[0] = coordinate;
+        let mut buffer = [0; 1024];
+        let mut transport = authenticated(
+            &mut buffer,
+            &[wire::Message::KexEcdhInit {
+                client_ephemeral_public_key: &public_key,
+            }],
+        );
+        transport.authenticated = false;
+        transport.kex = Some(KexState {
+            discard_guessed: false,
+            exchange_hash_hasher: ObjectHasher::new(Sha256::new()),
+        });
+
+        let result = blocking(transport.poll_client());
+        if coordinate == 9 {
+            assert_eq!(result, Ok(None));
+            assert!(transport.next_keys.is_some());
+        } else {
+            assert_eq!(
+                result,
+                Err(Error::ServerDisconnect(
+                    wire::DisconnectReason::KeyExchangeFailed
+                ))
+            );
+            assert!(transport.next_keys.is_none());
+            let bytes = &transport.behavior.stream.output;
+            let len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+            let padding = usize::from(bytes[4]);
+            assert_eq!(
+                wire::Message::decode(&bytes[5..4 + len - padding]).unwrap(),
+                wire::Message::Disconnect {
+                    reason: wire::DisconnectReason::KeyExchangeFailed,
+                }
+            );
+            assert_eq!(bytes.len(), 4 + len, "no key-exchange reply is sent");
+        }
+    }
+}

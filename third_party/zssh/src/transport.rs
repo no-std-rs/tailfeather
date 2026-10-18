@@ -625,6 +625,18 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         let shared_secret = server_ephemeral_secret_key
                             .diffie_hellman(&client_ephemeral_public_key);
 
+                        // RFC 8731 requires rejecting all-zero X25519 results
+                        // before signing the exchange or deriving session keys.
+                        if !shared_secret.was_contributory() {
+                            self.send(wire::Message::Disconnect {
+                                reason: wire::DisconnectReason::KeyExchangeFailed,
+                            })
+                            .await?;
+                            return Err(Error::ServerDisconnect(
+                                wire::DisconnectReason::KeyExchangeFailed,
+                            ));
+                        }
+
                         // Finish building up the exchange hash
 
                         match self.behavior.host_secret_key() {
