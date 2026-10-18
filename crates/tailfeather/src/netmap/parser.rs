@@ -1118,9 +1118,15 @@ impl State {
             Token::Str(value) => self.on_string(netmap, value),
             Token::Int(value) => self.on_number(netmap, value),
             Token::OtherNumber => {
-                if self.context() != Context::Ignored {
+                // Hosted DERP regions include fractional coordinates. They
+                // are unused metadata; do not reject the map for their shape.
+                // All other retained contexts keep rejecting non-integers.
+                let coordinate = self.context() == Context::DerpRegion
+                    && matches!(self.key.as_str(), "Latitude" | "Longitude");
+                if self.context() != Context::Ignored && !coordinate {
                     self.fail(Error::Malformed);
                 }
+                self.key.clear();
             }
             Token::Bool(value) => self.on_bool(netmap, value),
             Token::Null => self.on_null(netmap),

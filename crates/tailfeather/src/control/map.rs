@@ -14,8 +14,9 @@
 //!
 //! "Should" is doing work in that sentence, which is why [`PATH`] has a
 //! subcommand behind it in the harness: the question is answered by looking at
-//! the bytes a real server sends, not by reading its source. Whether the *hosted*
-//! service honours the same is a separate question and still open.
+//! the bytes a real server sends, not by reading its source. The hosted service
+//! also honours the omission: the SSH `live_server --hosted` acceptance test
+//! received and applied its uncompressed map stream.
 //!
 //! # Framing
 //!

@@ -686,3 +686,51 @@ fn peer_subnets_are_retained_ipv4_only_while_self_routes_keep_both_families() {
     assert_eq!(netmap.addresses.len(), 2);
     assert!(netmap.default_routes_approved());
 }
+
+#[test]
+fn hosted_derp_coordinates_do_not_reject_the_network_map() {
+    let document = r#"{
+        "DERPMap":{"Regions":{"22":{
+            "RegionID":22,"RegionCode":"waw","Latitude":52.23,"Longitude":21.011111,
+            "Nodes":[{"HostName":"derp22.tailscale.com","DERPPort":443,"STUNPort":3478}]
+        }}},
+        "ControlDialPlan":{"Candidates":[{"DialStartDelaySec":0.3}]}
+    }"#;
+    for chunk in [1, 7, 4096] {
+        let mut map = Netmap::<32>::new();
+        apply(&mut map, document, chunk);
+        let region = map.derp.region(22).unwrap();
+        assert_eq!(region.code.as_str(), "waw");
+        assert_eq!(region.nodes[0].port, 443);
+        assert_eq!(region.nodes[0].stun_port, 3478);
+    }
+}
+
+#[test]
+fn non_integer_forms_in_retained_numeric_fields_still_fail() {
+    for number in ["1.5", "1e2", "18446744073709551616"] {
+        for document in [
+            format!(r#"{{"Node":{{"HomeDERP":{number}}}}}"#),
+            format!(r#"{{"PeersRemoved":[{number}]}}"#),
+            format!(r#"{{"PeersChangedPatch":[{{"Expired":{number}}}]}}"#),
+            format!(r#"{{"PeersChangedPatch":[{{"KeyExpiry":{number}}}]}}"#),
+            format!(r#"{{"PeersChangedPatch":[{{"ID":{number}}}]}}"#),
+            format!(r#"{{"DERPMap":{{"Regions":{{"22":{{"RegionID":{number}}}}}}}}}"#),
+            format!(
+                r#"{{"DERPMap":{{"Regions":{{"22":{{"Nodes":[{{"DERPPort":{number}}}]}}}}}}}}"#
+            ),
+            format!(
+                r#"{{"DERPMap":{{"Regions":{{"22":{{"Nodes":[{{"STUNPort":{number}}}]}}}}}}}}"#
+            ),
+            format!(r#"{{"PacketFilter":[{{"IPProto":[{number}]}}]}}"#),
+            format!(
+                r#"{{"PacketFilter":[{{"DstPorts":[{{"IP":"*","Ports":{{"First":{number},"Last":65535}}}}]}}]}}"#
+            ),
+        ] {
+            let mut map = Netmap::<32>::new();
+            let mut parser = Parser::<32>::new();
+            parser.push(&mut map, document.as_bytes()).unwrap();
+            assert!(parser.finish(&mut map).is_err(), "accepted {document}");
+        }
+    }
+}

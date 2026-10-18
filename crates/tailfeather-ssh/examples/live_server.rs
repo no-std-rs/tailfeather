@@ -1,10 +1,10 @@
-//! Disposable live interoperability server. Only connects to a loopback
-//! Headscale lab; production adapters must authenticate control with TLS.
+//! Disposable live interoperability server for loopback Headscale or hosted
+//! Tailscale. Hosted control uses the core TLS verifier and system clock.
 use std::{
     cell::RefCell,
     future::{Future, poll_fn},
     io::{Read as _, Write as _},
-    net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
     rc::Rc,
     sync::mpsc,
     task::{Context, Poll, Waker},
@@ -19,7 +19,8 @@ use tailfeather::{
 };
 use tailfeather_ssh::{Authorizer, Console, HostKey, Reply, TailnetAccess, rand_core};
 
-const PEERS: usize = 4;
+// A hosted tailnet can contain more than the isolated lab's two nodes.
+const PEERS: usize = tailfeather::netmap::MAX_PEERS;
 type SharedNode = Rc<RefCell<Node<PEERS>>>;
 type SharedTcp = Rc<RefCell<Stack<'static, 2>>>;
 
@@ -106,8 +107,21 @@ fn blocking<F: Future>(future: F) -> F::Output {
     }
 }
 
+struct SystemClock;
+impl tailfeather::embedded_tls::TlsClock for SystemClock {
+    fn now() -> Option<u64> {
+        Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+    }
+}
+
 fn control_loop(
     address: SocketAddr,
+    hosted: bool,
     identity: Identity,
     host_key: String,
     endpoint: String,
@@ -124,17 +138,73 @@ fn control_loop(
         stream.set_nodelay(true).unwrap();
         Control(stream)
     };
-    let authority = address.to_string();
-    let server_key = blocking(transport::fetch_server_key(&mut connect(), &authority)).unwrap();
+    if hosted {
+        use tailfeather::{
+            control::tls::*,
+            embedded_tls::{TlsConfig, TlsConnection, TlsContext},
+        };
+        let connect_tls = || {
+            let read = Box::leak(Box::new([0; TLS_READ_BUFFER]));
+            let write = Box::leak(Box::new([0; TLS_WRITE_BUFFER]));
+            let config = TlsConfig::new()
+                .with_server_name("controlplane.tailscale.com")
+                .enable_rsa_signatures();
+            let mut connection = TlsConnection::new(connect(), read, write);
+            let mut rsa = RsaWorkspace::new();
+            blocking(connection.open(TlsContext::new(
+                &config,
+                VerifyingProvider::<_, SystemClock>::new(Random::new(), None, &mut rsa),
+            )))
+            .unwrap();
+            connection
+        };
+        control_session(
+            connect_tls,
+            "controlplane.tailscale.com",
+            true,
+            identity,
+            host_key,
+            endpoint,
+            maps,
+        );
+    } else {
+        control_session(
+            connect,
+            &address.to_string(),
+            false,
+            identity,
+            host_key,
+            endpoint,
+            maps,
+        );
+    }
+}
+
+fn control_session<
+    S: tailfeather::embedded_io_async::Read + tailfeather::embedded_io_async::Write,
+>(
+    connect: impl Fn() -> S,
+    authority: &str,
+    secure: bool,
+    identity: Identity,
+    host_key: String,
+    endpoint: String,
+    maps: mpsc::Sender<Netmap<PEERS>>,
+) {
+    let server_key = blocking(transport::fetch_server_key(&mut connect(), authority)).unwrap();
     let noise = blocking(transport::establish(
         connect(),
-        &authority,
+        authority,
         &identity,
         &server_key,
         &mut Random::new(),
     ))
     .unwrap();
-    let mut http2 = blocking(noise.into_http2()).unwrap();
+    let mut http2 = if secure {
+        blocking(noise.into_https2()).unwrap()
+    } else {
+        blocking(noise.into_http2()).unwrap()
+    };
     let host_keys = [host_key.as_str()];
     let hostinfo = Hostinfo {
         hostname: "tailfeather-ssh-live",
@@ -159,7 +229,7 @@ fn control_loop(
     let (status, len) = blocking(http2.request(
         "POST",
         control::register::PATH,
-        &authority,
+        authority,
         body,
         &mut response,
     ))
@@ -170,6 +240,30 @@ fn control_loop(
     assert!(registration.is_success(), "registration refused");
     println!("REGISTERED {key}");
     let endpoints = [endpoint.as_str()];
+    // At current capability versions hosted control ignores endpoint/hostinfo
+    // changes on streaming requests. Publish them with a non-streaming update.
+    let mut publication = [0; 2048];
+    let publication = MapRequest {
+        version: control::CAPABILITY_VERSION,
+        node_key: &key,
+        disco_key: &disco,
+        hostinfo,
+        stream: false,
+        omit_peers: true,
+        read_only: false,
+        endpoints: &endpoints,
+    }
+    .write(&mut publication)
+    .unwrap();
+    let (status, _) = blocking(http2.request(
+        "POST",
+        control::map::PATH,
+        authority,
+        publication,
+        &mut response,
+    ))
+    .unwrap();
+    assert_eq!(status, 200);
     let mut body = [0; 2048];
     let body = MapRequest {
         version: control::CAPABILITY_VERSION,
@@ -184,7 +278,7 @@ fn control_loop(
     .write(&mut body)
     .unwrap();
     let mut stream = blocking(transport::MapStream::<PEERS>::start(
-        &mut http2, &authority, body,
+        &mut http2, authority, body,
     ))
     .unwrap();
     let mut staging = Netmap::new();
@@ -250,15 +344,24 @@ fn send(action: Option<NodeAction>, udp: &UdpSocket) {
 }
 
 fn main() {
-    let address: SocketAddr = std::env::args()
+    let control = std::env::args()
         .nth(1)
-        .expect("loopback Headscale address")
-        .parse()
-        .unwrap();
-    assert!(
-        address.ip().is_loopback(),
-        "test server only supports loopback control"
-    );
+        .expect("loopback Headscale address or --hosted");
+    let hosted = control == "--hosted";
+    let address: SocketAddr = if hosted {
+        ("controlplane.tailscale.com", 443)
+            .to_socket_addrs()
+            .unwrap()
+            .find(SocketAddr::is_ipv4)
+            .unwrap()
+    } else {
+        let address: SocketAddr = control.parse().unwrap();
+        assert!(
+            address.ip().is_loopback(),
+            "plaintext control must be loopback"
+        );
+        address
+    };
     let endpoint_ip: Ipv4Addr = std::env::args()
         .nth(2)
         .expect("local underlay IPv4")
@@ -276,7 +379,9 @@ fn main() {
     let public = host_key.public_key(&mut public).unwrap().to_owned();
     let (tx, rx) = mpsc::channel();
     let control_identity = identity.clone();
-    std::thread::spawn(move || control_loop(address, control_identity, public, endpoint, tx));
+    std::thread::spawn(move || {
+        control_loop(address, hosted, control_identity, public, endpoint, tx)
+    });
     let node: SharedNode = Rc::new(RefCell::new(Node::factory_reset(identity, 1)));
     let pending = node.borrow_mut().poll(0).unwrap();
     if let Some(NodeAction::PersistState(state)) = pending {
