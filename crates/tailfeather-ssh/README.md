@@ -139,4 +139,6 @@ authenticated peer and compiled control policy, and deliberately short writes.
 It covers console round trips, denied usernames, blocked exec, revocation,
 responses larger than the client's receive window, and the standalone no_std
 fixture reached through OpenSSH's ProxyCommand.
+The standalone fixture is built and tested by Bazel; Cargo's release checks run
+the TCP interoperability cases without it.
 It does not establish a live connection through Tailscale's hosted control plane.

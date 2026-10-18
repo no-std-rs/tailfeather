@@ -36,7 +36,7 @@ rust_test(
         "PATH": "/usr/bin:/bin",
         "TF_SSH_NO_STD_PROBE": "$(rootpath //crates/tailfeather-ssh/probe:no_std_probe)",
     },
-    tags = ["no-remote", "no-sandbox"],
+    tags = ["no-remote"],
 )
 
 rust_doc_test(name = "doc_test", crate = ":tailfeather_ssh")

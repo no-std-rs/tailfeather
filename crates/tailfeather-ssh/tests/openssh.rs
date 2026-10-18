@@ -248,7 +248,17 @@ fn response_larger_than_openssh_window_survives_window_adjustments() {
 
 #[test]
 fn standalone_no_std_server_round_trips_with_openssh() {
-    let binary = std::fs::canonicalize(std::env::var("TF_SSH_NO_STD_PROBE").unwrap()).unwrap();
+    // Cargo's release checks do not build the separate Bazel-only ELF fixture.
+    // Keep its presence mandatory when this test runs under Bazel.
+    let Some(binary) = std::env::var_os("TF_SSH_NO_STD_PROBE") else {
+        assert!(
+            std::env::var_os("TEST_SRCDIR").is_none(),
+            "Bazel must supply TF_SSH_NO_STD_PROBE"
+        );
+        eprintln!("standalone fixture is exercised by the Bazel openssh_test target");
+        return;
+    };
+    let binary = std::fs::canonicalize(binary).unwrap();
     let quoted = binary.to_str().unwrap().replace('\'', "'\"'\"'");
     let mut client = Command::new("ssh")
         .args([
