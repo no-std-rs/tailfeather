@@ -95,8 +95,11 @@ gh workflow run pages.yml --repo no-std-rs/tailfeather --ref main
 `build.json` at either URL records the compiled version, source commit, and
 channel. Web tarballs reject links and unsafe paths and have reproducible
 metadata and SHA-256 manifests. Publication runs the trusted main-branch script
-in a separate job from compilation. The Pages environment permits main, the
-exact Tailfeather release-PR branch, and `tailfeather-v*` tags.
+in a separate job from compilation. The Pages environment permits `main`,
+`tailfeather-v*` tags, and `refs/pull/*/merge` for PR events. GitHub checks the
+PR merge ref against this policy, not the source branch name. The workflow
+allows publication only for the App-authored Tailfeather release branch, and
+the trusted publisher verifies its current head again before updating assets.
 
 ## Runnerless activation
 
