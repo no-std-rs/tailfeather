@@ -76,7 +76,8 @@ pub struct Peer {
     pub id: u64,
     pub node_key: NodePublic,
     pub disco_key: Option<DiscoPublic>,
-    /// Bit zero is online; bit one retains delayed-self IPv4 approval.
+    /// Bit zero is online; bit one retains delayed-self IPv4 approval;
+    /// bit two retains explicit control-plane expiry for SSH authorization.
     state_flags: u8,
     /// IPv6 default-route approval retained until a delayed self record is
     /// distinguished from an ordinary peer. IPv4 fits in allowed-IP storage.
@@ -120,6 +121,16 @@ impl Peer {
 
     pub(crate) fn set_online(&mut self, online: bool) {
         self.state_flags = (self.state_flags & !1) | u8::from(online);
+    }
+
+    #[cfg(feature = "ssh-policy")]
+    pub fn expired(&self) -> bool {
+        self.state_flags & 4 != 0
+    }
+
+    #[cfg(feature = "ssh-policy")]
+    pub(crate) fn set_expired(&mut self, expired: bool) {
+        self.state_flags = (self.state_flags & !4) | (u8::from(expired) << 2);
     }
 
     pub(crate) fn set_approved_ipv4_default(&mut self, approved: bool) {

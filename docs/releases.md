@@ -30,7 +30,7 @@ Review and merge each release PR normally; main requires a PR for everyone.
 
 Runnerless changes only a track's version file and changelog. Packaging and web
 builds run `scripts/prepare-release.py` to align the Cargo package versions,
-local dependency requirements, and all four Cargo locks with those authoritative
+local dependency requirements, and all five Cargo locks with those authoritative
 version files. The preparation happens in the build checkout. Internal package
 versions are preserved; the web application receives the Tailfeather version or
 its main-preview variant. Source manifests are development metadata.

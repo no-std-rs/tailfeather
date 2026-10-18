@@ -7,9 +7,11 @@ exclude  = ["firmware", "harness", "web"]
 members  = [
   "crates/tailfeather",
   "crates/tailfeather-gateway",
+  "crates/tailfeather-ssh",
   "crates/tailfeather-testkit",
   "crates/ts-conformance",
   "crates/wirefeather",
+  "third_party/zssh",
 ]
 resolver = "3"
 

@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="${BUILD_WORKSPACE_DIRECTORY:-$PWD}"
 if grep -RInE '^[[:space:]]*(extern crate alloc|use alloc::)' \
     "$ROOT/harness/src" "$ROOT/firmware/src" \
-    "$ROOT/crates/tailfeather/src" "$ROOT/crates/wirefeather/src"; then
+    "$ROOT/crates/tailfeather/src" "$ROOT/crates/tailfeather-ssh/src" \
+    "$ROOT/crates/tailfeather-ssh/probe/src" "$ROOT/crates/wirefeather/src"; then
     echo "allocation reached portable, harness, or firmware code" >&2
     exit 1
 fi

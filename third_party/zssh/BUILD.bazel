@@ -1,0 +1,12 @@
+load("@tailfeather_root_deps//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "zssh",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    edition = "2021",
+    deps = all_crate_deps(normal = True),
+)

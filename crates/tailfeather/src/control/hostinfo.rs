@@ -44,6 +44,8 @@ pub struct Hostinfo<'a> {
     /// TCP port of the IPv4 peer API. When present, the node also advertises
     /// the exit-node DNS proxy capability whose sentinel port is always one.
     pub peer_api_port: Option<u16>,
+    /// Public OpenSSH host-key lines. Empty unless this node serves Tailscale SSH.
+    pub ssh_host_keys: &'a [&'a str],
 }
 
 impl Hostinfo<'_> {
@@ -65,6 +67,7 @@ impl Default for Hostinfo<'_> {
             routable_ips: &[],
             preferred_derp: 0,
             peer_api_port: None,
+            ssh_host_keys: &[],
         }
     }
 }
@@ -76,6 +79,14 @@ impl Hostinfo<'_> {
             .field_str("IPNVersion", self.version)
             .field_str("OS", self.os)
             .field_str("Hostname", self.hostname);
+
+        if !self.ssh_host_keys.is_empty() {
+            writer.key("SSH_HostKeys").begin_array();
+            for key in self.ssh_host_keys {
+                writer.str(key);
+            }
+            writer.end_array();
+        }
 
         if !self.routable_ips.is_empty() {
             writer.key("RoutableIPs").begin_array();

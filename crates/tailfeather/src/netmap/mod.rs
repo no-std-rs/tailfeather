@@ -41,6 +41,8 @@ pub mod parser;
 pub mod peer;
 pub mod policy;
 pub mod scanner;
+#[cfg(feature = "ssh-policy")]
+pub mod ssh;
 
 pub use derp::{DerpMap, DerpNode, DerpRegion};
 pub use dns::DnsConfig;

@@ -42,6 +42,7 @@ fn render(hostname: &str, auth_key: &str) -> serde_json::Value {
             routable_ips: &[],
             preferred_derp: 0,
             peer_api_port: None,
+            ssh_host_keys: &[],
         },
         ephemeral: false,
     };
@@ -194,6 +195,7 @@ fn multibyte_utf8_is_emitted_raw_rather_than_escaped() {
             routable_ips: &[],
             preferred_derp: 0,
             peer_api_port: None,
+            ssh_host_keys: &[],
         },
         ephemeral: false,
     };
@@ -225,6 +227,7 @@ fn a_document_that_does_not_fit_is_refused_rather_than_truncated() {
             routable_ips: &[],
             preferred_derp: 0,
             peer_api_port: None,
+            ssh_host_keys: &[],
         },
         ephemeral: false,
     };
@@ -260,6 +263,7 @@ fn exit_node_routes_parse_as_an_array_of_prefixes() {
             routable_ips: &tailfeather::control::hostinfo::EXIT_NODE_ROUTES,
             preferred_derp: 0,
             peer_api_port: Some(5254),
+            ssh_host_keys: &[],
         },
         ephemeral: true,
     };

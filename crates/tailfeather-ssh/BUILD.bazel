@@ -1,0 +1,50 @@
+load("@tailfeather_root_deps//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc", "rust_doc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(name = "rust_sources", srcs = glob(["src/**/*.rs"]))
+
+rust_library(
+    name = "tailfeather_ssh",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tailfeather_ssh",
+    compile_data = ["README.md"],
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_test",
+    crate = ":tailfeather_ssh",
+    aliases = aliases(),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "openssh_test",
+    srcs = ["tests/openssh.rs"],
+    crate_name = "openssh_test",
+    edition = "2024",
+    deps = [":tailfeather_ssh"] + all_crate_deps(normal = True, normal_dev = True),
+    data = ["//crates/tailfeather-ssh/probe:no_std_probe"],
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "TF_SSH_NO_STD_PROBE": "$(rootpath //crates/tailfeather-ssh/probe:no_std_probe)",
+    },
+    tags = ["no-remote", "no-sandbox"],
+)
+
+rust_doc_test(name = "doc_test", crate = ":tailfeather_ssh")
+rust_doc(name = "docs", crate = ":tailfeather_ssh", rustdoc_flags = ["-Dwarnings"])
+
+rust_binary(
+    name = "footprint",
+    srcs = ["examples/footprint.rs"],
+    edition = "2024",
+    deps = [":tailfeather_ssh"] + all_crate_deps(normal = True),
+)

@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "tailfeather-ssh-probe"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+tailfeather-ssh = { path = ".." }
+
+[patch.crates-io]
+tailfeather = { path = "../../tailfeather" }
+wirefeather = { path = "../../wirefeather" }
+zssh = { path = "../../../third_party/zssh" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

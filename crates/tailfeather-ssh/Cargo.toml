@@ -1,0 +1,26 @@
+[package]
+name = "tailfeather-ssh"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/no-std-rs/tailfeather"
+rust-version = "1.88"
+description = "Small allocation-free SSH console for a Tailscale-compatible node"
+readme = "README.md"
+publish = false
+
+[dependencies]
+base64 = { version = "0.22", default-features = false }
+embedded-io-async = { version = "0.6", default-features = false }
+ed25519-dalek = { version = "2.2", default-features = false, features = ["zeroize"] }
+heapless = "0.9"
+rand_core = { version = "0.6", default-features = false }
+tailfeather = { path = "../tailfeather", version = "0.0.1", default-features = false, features = ["ssh-policy"] }
+zeroize = { version = "1.8", default-features = false }
+# This server-only release shares the existing crypto versions. No OS RNG,
+# allocator, AES, RSA, PQ KEX, client implementation, or executor is pulled in.
+zssh = { path = "../../third_party/zssh", version = "=0.4.2" }
+
+[dev-dependencies]
+embedded-io-async = { version = "0.6", features = ["std"] }
+rand_chacha = "=0.3.1"

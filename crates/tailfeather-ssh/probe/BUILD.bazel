@@ -1,0 +1,40 @@
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["Cargo.toml", "Cargo.lock"])
+filegroup(name = "rust_sources", srcs = ["src/main.rs"])
+
+rust_binary(
+    name = "no_std_probe",
+    srcs = ["src/main.rs", "//harness:compiler_builtins_source"],
+    edition = "2024",
+    features = ["-static_link_cpp_runtimes"],
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Crelocation-model=static",
+        "-Clink-arg=-nostartfiles",
+        "-Clink-arg=-nodefaultlibs",
+        "-Clink-arg=-static",
+        "-Clink-arg=-no-pie",
+        "-Clink-arg=-Wl,--gc-sections",
+        "-Clink-arg=-Wl,-e,_start",
+    ],
+    target_compatible_with = ["@platforms//cpu:x86_64", "@platforms//os:linux"],
+    deps = ["@ssh_probe_deps//:tailfeather-ssh-0.0.1"],
+)
+
+sh_test(
+    name = "artifact_contract",
+    srcs = ["size-contract.sh"],
+    args = [
+        "$(rootpath :no_std_probe)",
+        "$(rootpath @llvm//tools:llvm-readelf)",
+        "$(rootpath @llvm//tools:llvm-nm)",
+        "$(rootpath @llvm//tools:llvm-size)",
+        "$(rootpath //scripts:harness-artifact-contract.sh)",
+    ],
+    data = [":no_std_probe", "@llvm//tools:llvm-readelf", "@llvm//tools:llvm-nm", "@llvm//tools:llvm-size", "//scripts:harness-artifact-contract.sh"],
+    tags = ["artifact-contract"],
+)

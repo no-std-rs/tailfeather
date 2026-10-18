@@ -1,5 +1,10 @@
 # tailfeather
 
+The default `fast-curve25519` feature retains precomputed basepoint tables.
+Use `default-features = false` to trade key-operation speed for smaller code.
+The optional `ssh-policy` feature retains the bounded SSH accept-policy subset
+used by `tailfeather-ssh`; it adds no policy storage when disabled.
+
 `tailfeather` is a `no_std`, allocation-free implementation of the protocol
 pieces needed by a small Tailscale-compatible mesh node. It exposes the
 `keys`, `noise`, `control`, `netmap`, `disco`, `derp`, and `node` modules, and

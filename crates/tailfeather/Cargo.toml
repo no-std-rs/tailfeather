@@ -14,11 +14,16 @@ version = "0.0.1"
 publish = ["crates-io", "runnerless-capture"]
 
 [features]
-default = []
+default = ["fast-curve25519"]
+# Preserve the existing node's speed/flash tradeoff; small console consumers
+# can disable defaults to omit Curve25519's precomputed basepoint tables.
+fast-curve25519 = ["x25519-dalek/precomputed-tables"]
 # Retain a bounded display name for each peer (MagicDNS short name, falling
 # back to Hostinfo.Hostname) and for this node. Off by default so the
 # firmware's static RAM budget is unchanged; only the browser client enables it.
 peer-names = []
+# Retain the small, fail-closed SSH accept-policy subset used by tailfeather-ssh.
+ssh-policy = []
 
 [dependencies]
 crypto-bigint = { version = "0.5.5", default-features = false }
@@ -37,8 +42,8 @@ smoltcp = { version = "0.13.1", default-features = false, features = [
     "socket-tcp",
 ] }
 subtle = { version = "2.6", default-features = false }
-wirefeather = { path = "../wirefeather", version = "0.0.1" }
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "precomputed-tables", "zeroize"] }
+wirefeather = { path = "../wirefeather", version = "0.0.1", default-features = false }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.8", default-features = false }
 
 [dev-dependencies]

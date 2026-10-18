@@ -22,6 +22,7 @@ pub const SSH_SESSION_COUNT: usize = SSH_SOCKET_COUNT - 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     NoSockets,
+    EmptyBuffer,
     AlreadyListening,
     NotListening,
     InvalidPacket,
@@ -35,6 +36,7 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NoSockets => f.write_str("local TCP storage has no sockets"),
+            Self::EmptyBuffer => f.write_str("local TCP byte queues are empty"),
             Self::AlreadyListening => f.write_str("local TCP stack is already listening"),
             Self::NotListening => f.write_str("local TCP stack is not listening"),
             Self::InvalidPacket => f.write_str("packet is not a valid IPv4 packet for this node"),
@@ -71,23 +73,23 @@ pub struct Poll {
 }
 
 /// Caller-owned arena for socket metadata and all TCP byte queues.
-pub struct Storage<'a, const N: usize> {
+pub struct Storage<'a, const N: usize, const BUFFER: usize = STREAM_BUFFER> {
     sockets: [SocketStorage<'a>; N],
-    rx: [[u8; STREAM_BUFFER]; N],
-    tx: [[u8; STREAM_BUFFER]; N],
+    rx: [[u8; BUFFER]; N],
+    tx: [[u8; BUFFER]; N],
 }
 
-impl<const N: usize> Storage<'_, N> {
+impl<const N: usize, const BUFFER: usize> Storage<'_, N, BUFFER> {
     pub const fn new() -> Self {
         Self {
             sockets: [const { SocketStorage::EMPTY }; N],
-            rx: [[0; STREAM_BUFFER]; N],
-            tx: [[0; STREAM_BUFFER]; N],
+            rx: [[0; BUFFER]; N],
+            tx: [[0; BUFFER]; N],
         }
     }
 }
 
-impl<const N: usize> Default for Storage<'_, N> {
+impl<const N: usize, const BUFFER: usize> Default for Storage<'_, N, BUFFER> {
     fn default() -> Self {
         Self::new()
     }
@@ -107,14 +109,17 @@ impl<'a, const N: usize> Stack<'a, N> {
     /// Construct a stack for the node's assigned Tailnet IPv4 address.
     /// `random_seed` seeds TCP initial sequence numbers and must not be reused
     /// as a secret key.
-    pub fn new(
-        storage: &'a mut Storage<'a, N>,
+    pub fn new<const BUFFER: usize>(
+        storage: &'a mut Storage<'a, N, BUFFER>,
         assigned_ipv4: [u8; 4],
         random_seed: u64,
         now_ms: u64,
     ) -> Result<Self, Error> {
         if N == 0 {
             return Err(Error::NoSockets);
+        }
+        if BUFFER == 0 {
+            return Err(Error::EmptyBuffer);
         }
         let mut device = PacketDevice::empty();
         let mut config = Config::new(HardwareAddress::Ip);
@@ -681,6 +686,37 @@ mod tests {
         assert_eq!(storage.tx.len(), SSH_SOCKET_COUNT);
         assert_eq!(storage.rx[0].len(), STREAM_BUFFER);
         assert_eq!(MTU, crate::tunnel::budget::INNER_MTU);
+    }
+
+    #[test]
+    fn small_console_queues_complete_a_handshake_and_carry_data() {
+        let mut storage = Storage::<2, 1024>::new();
+        assert_eq!(storage.rx[0].len(), 1024);
+        let mut stack = Stack::new(&mut storage, SERVER.octets(), 7, 0).unwrap();
+        stack.listen(22).unwrap();
+        let mut ingress = [0; MTU];
+        let mut egress = [0; MTU];
+        let (stream, server_next) = establish(&mut stack, &mut ingress, &mut egress);
+        let length = segment(
+            &mut ingress,
+            TcpControl::None,
+            TcpSeqNumber(101),
+            Some(server_next),
+            b"console\n",
+        );
+        stack
+            .ingest_ipv4(&ingress[..length], &mut egress, 3)
+            .unwrap();
+        let mut bytes = [0; 16];
+        let read = stack.read(stream, &mut bytes).unwrap();
+        assert_eq!(&bytes[..read], b"console\n");
+        assert_eq!(stack.write(stream, b"ready\n"), Ok(6));
+        assert!(stack.poll_transmit(&mut egress, 4).unwrap().transmitted > 0);
+        let mut empty = Storage::<2, 0>::new();
+        assert!(matches!(
+            Stack::new(&mut empty, SERVER.octets(), 7, 0),
+            Err(Error::EmptyBuffer)
+        ));
     }
 
     #[test]

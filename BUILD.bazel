@@ -11,6 +11,9 @@ exports_files([
 FIRST_PARTY_RUST_TARGETS = [
     "//crates/tailfeather:tailfeather",
     "//crates/tailfeather-gateway:tailfeather_gateway",
+    "//crates/tailfeather-ssh:tailfeather_ssh",
+    "//crates/tailfeather-ssh:footprint",
+    "//crates/tailfeather-ssh/probe:no_std_probe",
     "//crates/tailfeather-testkit:tailfeather_testkit",
     "//crates/tailfeather-testkit:tailfeather-testkit",
     "//crates/ts-conformance:ts_conformance",
@@ -23,6 +26,7 @@ INTEGRATION_RUST_TEST_TARGETS = [
     "//crates/tailfeather-testkit:fixtures_test",
     "//crates/tailfeather:netmap_capture_test",
     "//crates/tailfeather:noise_kat_test",
+    "//crates/tailfeather-ssh:openssh_test",
     "//crates/ts-conformance:control_json_test",
     "//crates/ts-conformance:h2_differential_test",
     "//crates/ts-conformance:hpack_differential_test",
@@ -55,6 +59,7 @@ filegroup(
     srcs = [
         "//crates/tailfeather:docs",
         "//crates/tailfeather-gateway:docs",
+        "//crates/tailfeather-ssh:docs",
         "//crates/tailfeather-testkit:docs",
         "//crates/ts-conformance:docs",
         "//crates/wirefeather:docs",
@@ -70,6 +75,9 @@ test_suite(
         "//crates/tailfeather:doc_test",
         "//crates/tailfeather-gateway:unit_test",
         "//crates/tailfeather-gateway:doc_test",
+        "//crates/tailfeather-ssh:unit_test",
+        "//crates/tailfeather-ssh:openssh_test",
+        "//crates/tailfeather-ssh:doc_test",
         "//crates/tailfeather-testkit:unit_test",
         "//crates/tailfeather-testkit:fixtures_test",
         "//crates/tailfeather-testkit:doc_test",
@@ -108,6 +116,8 @@ sh_test(
     data = [
         "//crates/tailfeather:rust_sources",
         "//crates/tailfeather-gateway:rust_sources",
+        "//crates/tailfeather-ssh:rust_sources",
+        "//crates/tailfeather-ssh/probe:rust_sources",
         "//crates/wirefeather:rust_sources",
         "//firmware:rust_sources",
         "//harness:rust_sources",
@@ -172,6 +182,7 @@ test_suite(
         ":harness_elf_contract",
         ":no_allocation_source_contract",
         ":testkit_baseline",
+        "//crates/tailfeather-ssh/probe:artifact_contract",
     ],
 )
 

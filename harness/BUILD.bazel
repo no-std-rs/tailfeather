@@ -6,6 +6,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files(["Cargo.lock", "Cargo.toml"])
 
 filegroup(name = "rust_sources", srcs = glob(["src/**/*.rs"]))
+filegroup(name = "compiler_builtins_source", srcs = ["src/compiler_builtins.rs"])
 
 _GENERATED_FIRST_PARTY = [
     "@harness_deps//:tailfeather-0.0.1",
