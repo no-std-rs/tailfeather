@@ -8,6 +8,33 @@ exports_files([
     "privileged-smolvm.sh",
 ])
 
+sh_test(
+    name = "ssh_live",
+    srcs = ["//scripts:runfiles-exec.sh"],
+    args = [
+        "$(rootpath @python_3_13//:python3)",
+        "$(rootpath :ssh-live.py)",
+        "--config=$(rootpath :headscale.yaml)",
+        "--headscale=$(rootpath @headscale_0_29_3_linux_amd64//file)",
+        "--server=$(rootpath //crates/tailfeather-ssh:live_server)",
+        "--tailscale=$(rootpath @tailscale_1_94_2_linux_amd64//:tailscale)",
+        "--tailscaled=$(rootpath @tailscale_1_94_2_linux_amd64//:tailscaled)",
+    ],
+    data = [
+        "ssh-live.py",
+        "headscale.yaml",
+        "//crates/tailfeather-ssh:live_server",
+        "@python_3_13//:files",
+        "@python_3_13//:python3",
+        "@headscale_0_29_3_linux_amd64//file",
+        "@tailscale_1_94_2_linux_amd64//:tailscale",
+        "@tailscale_1_94_2_linux_amd64//:tailscaled",
+    ],
+    env = {"PATH": "/usr/bin:/bin"},
+    size = "medium",
+    tags = ["no-remote"],
+)
+
 APK_FILES = [
     "@apk_bash//file",
     "@apk_ethtool//file",

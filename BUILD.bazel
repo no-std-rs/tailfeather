@@ -13,6 +13,7 @@ FIRST_PARTY_RUST_TARGETS = [
     "//crates/tailfeather-gateway:tailfeather_gateway",
     "//crates/tailfeather-ssh:tailfeather_ssh",
     "//crates/tailfeather-ssh:footprint",
+    "//crates/tailfeather-ssh:live_server",
     "//crates/tailfeather-ssh/probe:no_std_probe",
     "//crates/tailfeather-testkit:tailfeather_testkit",
     "//crates/tailfeather-testkit:tailfeather-testkit",
@@ -93,6 +94,7 @@ test_suite(
         "//crates/wirefeather:unit_test",
         "//crates/wirefeather:doc_test",
         "//third_party/zssh:unit_test",
+        "//tests/lab:ssh_live",
     ],
 )
 

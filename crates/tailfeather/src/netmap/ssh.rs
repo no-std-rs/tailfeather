@@ -6,7 +6,7 @@
 //! favour of a later accept. No policy, malformed input, or capacity overflow
 //! authorizes nobody. Absent/null map deltas preserve the previous policy.
 
-use core::net::Ipv4Addr;
+use core::net::{IpAddr, Ipv4Addr};
 use heapless::{String, Vec};
 
 use super::scanner::Token;
@@ -236,8 +236,12 @@ impl Builder {
                 self.key.clear();
             }
             Token::Str(value) => match (context, self.key.as_str()) {
-                (Context::Principal, "nodeIP") => match value.parse::<Ipv4Addr>() {
-                    Ok(address) => self.source(Source::Address(address)),
+                (Context::Principal, "nodeIP") => match value.parse::<IpAddr>() {
+                    Ok(IpAddr::V4(address)) => self.source(Source::Address(address)),
+                    // Control emits both addresses for dual-stack nodes.
+                    // IPv6 principals cannot match an IPv4 connection and
+                    // need no storage; malformed addresses still fail closed.
+                    Ok(IpAddr::V6(_)) => (),
                     Err(_) => self.bad = true,
                 },
                 (Context::Users, key) => {
@@ -389,6 +393,40 @@ mod tests {
         );
         assert!(map.ssh_policy.allows(Ipv4Addr::LOCALHOST, "dev", "console"));
         assert!(!map.ssh_policy.allows(Ipv4Addr::LOCALHOST, "dev", "other"));
+    }
+
+    #[test]
+    fn dual_stack_node_principals_preserve_ipv4_authorization() {
+        let mut map = Netmap::new();
+        // Headscale 0.29.3 compiles a tagged source into both node addresses.
+        // The IPv6 sibling cannot match this IPv4-only server.
+        apply(
+            &mut map,
+            r#"{"SSHPolicy":{"rules":[{"principals":[{"nodeIP":"100.64.0.2"},{"nodeIP":"fd7a:115c:a1e0::2"}],"sshUsers":{"console":"console","root":""},"action":{"accept":true,"allowAgentForwarding":true,"allowLocalPortForwarding":true,"allowRemotePortForwarding":true}}]}}"#,
+        );
+        assert!(map.ssh_policy.is_supported());
+        assert!(allowed(&map, "console"));
+        assert!(!allowed(&map, "root"));
+        assert!(
+            !map.ssh_policy
+                .allows(Ipv4Addr::LOCALHOST, "console", "console")
+        );
+
+        for principal in ["fd7a:115c:a1e0::2", "::1", "::ffff:100.64.0.2"] {
+            apply(
+                &mut map,
+                &std::format!(
+                    r#"{{"SSHPolicy":{{"rules":[{{"principals":[{{"nodeIP":"{principal}"}}],"sshUsers":{{"console":"console"}},"action":{{"accept":true}}}}]}}}}"#
+                ),
+            );
+            assert!(map.ssh_policy.is_supported());
+            assert!(!allowed(&map, "console"), "IPv6 must never authorize IPv4");
+        }
+        for principal in ["not-an-ip", "fd7a:::2", "100.64.0.2/32"] {
+            apply(&mut map, &ACCEPT.replace("100.64.0.2", principal));
+            assert!(!map.ssh_policy.is_supported());
+            assert!(!allowed(&map, "console"));
+        }
     }
 
     #[test]

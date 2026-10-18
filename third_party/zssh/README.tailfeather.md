@@ -11,6 +11,8 @@ a second set of implementations. The wrapper remains a separate thin crate.
 
 Local changes:
 
+- Reject all-zero X25519 shared secrets with a key-exchange-failed disconnect
+  before signing the exchange or deriving session keys, as RFC 8731 requires.
 - Backport the window-aware copying write path from zssh 0.5.0: wait for space
   **before** copying application data into the shared packet buffer, split to
   the available window, and report a closed channel. Otherwise processing a
