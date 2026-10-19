@@ -10,6 +10,8 @@ use crate::netmap::{CapacityError, Error, MAX_DERP_HOSTNAME, MAX_DERP_NODES, MAX
 
 /// The port a DERP node listens on when it does not say otherwise.
 pub const DEFAULT_DERP_PORT: u16 = 443;
+/// Upstream uses this port when STUNPort is omitted or zero; -1 disables it.
+pub const DEFAULT_STUN_PORT: u16 = 3478;
 /// Distinct certificate-name overrides retained across the DERP map. Most
 /// relays either omit `CertName` or repeat `HostName`, so only exceptions use
 /// this bounded table.

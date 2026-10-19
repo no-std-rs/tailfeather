@@ -215,8 +215,49 @@ requires. Hosted DERP maps include fractional coordinates; these unused coordina
 are ignored while retained fields still reject non-integer forms. The example retains at most 32 peers, so keep the test tailnet within
 that bound and configure the supported SSH policy described above.
 
-`live_server` is a disposable test adapter with a process deadline and direct
-UDP paths. Plain HTTP control remains restricted to loopback. Production
-adapters must persist their identity and host key and handle cancellation,
-reconnection, and DERP transport. Hosted acceptance above covers a direct UDP
-path between processes on the same host; physical-device acceptance is separate.
+The fixture measures STUN from its WireGuard UDP socket, publishes the local
+and reflexive endpoints, and selects a home DERP region by response latency.
+It uses encrypted disco probes and CallMeMaybe over DERP for bilateral NAT
+hole punching. Active relayed peers get bounded discovery retries; periodic
+STUN refreshes publish changed NAT mappings without interrupting the map stream.
+The core decoder accepts IPv4-mapped IPv6 STUN replies from dual-stack
+listeners and applies upstream's default ports (STUN 3478, DERP 443), while
+keeping this adapter's data plane IPv4.
+
+DERP connections use the same verified TLS implementation, authenticated
+framing, ping/pong handling, bounded queues and reconnect backoff. Direct and
+relayed WireGuard packets pass through the same SSH packet policy. Use
+`--relay-only` to require relay transport and `--sessions=N` for sequential
+acceptance exchanges. A private lab CA can be supplied in `TF_TEST_CA_DER`;
+certificate, hostname and time verification remain enabled.
+
+`bazel test //:privileged_lab --config=optimized` runs stock Tailscale behind
+two independent filtering NAT routers in isolated namespaces inside a VM:
+
+| Scenario | Required evidence |
+| --- | --- |
+| Peer UDP blocked, STUN available | Default SSH through DERP; zero direct application bytes |
+| Peer UDP restored | Ping reports the translated public endpoint; SSH delivers direct authenticated IPv4 |
+| UDP lost after a direct session | SSH falls back to DERP |
+| Relay transport restarted | A new authenticated relay connection serves another SSH session |
+| NAT public port changed | STUN and control publish the new port; direct SSH recovers |
+| All UDP blocked, including STUN | Automatic DERP fallback still serves SSH |
+| Endpoint-dependent NAT | STUN succeeds with a different mapping from peer UDP; SSH uses DERP |
+
+Every exchange uses default `tailscale ssh`, verifies its control-provided host
+key, checks the actual greeting and echoed input, and requires client exit zero
+and server TCP drain. The lab also fragments the relay TLS stream to exercise
+partial reads. Its existing control, DNS, peer API, exit routing, WireGuard and
+no-std interoperability checks run alongside these SSH scenarios.
+
+Hosted acceptance on 2026-10-19 also used public STUN servers and forced
+public DERP transport with stock Tailscale 1.96.4. Default SSH verified the host
+key, echoed piped input and exited zero; the server reported zero direct bytes
+and completed TCP drain. Disposable devices, keys and policy were removed.
+
+`live_server` remains a disposable test adapter with a process deadline.
+Plain HTTP control is restricted to loopback. Production adapters must persist
+their identity and host key and reconnect control sessions. This line console
+does not implement PTY, shell execution or SFTP; IPv6 data paths, port-mapping
+protocols and SSH `check` rules are outside this fixture's supported scope.
+Physical-device acceptance is separate.

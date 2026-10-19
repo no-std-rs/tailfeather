@@ -6,7 +6,7 @@ actions:
       push:
         branches: ["main"]
       pull_request:
-        branches: ["main"]
+        branches: ["*"] # Include stacked PRs whose base is another feature branch.
     steps:
       - run: "bazel test //:format"
       - run: "bazel build //:clippy //:docs --config=optimized"
@@ -20,7 +20,7 @@ actions:
       push:
         branches: ["main"]
       pull_request:
-        branches: ["main"]
+        branches: ["*"] # Include stacked PRs whose base is another feature branch.
     steps:
       - run: "bazel test //:offline_conformance --config=optimized --test_output=all"
 
@@ -31,6 +31,6 @@ actions:
       push:
         branches: ["main"]
       pull_request:
-        branches: ["main"]
+        branches: ["*"] # Include stacked PRs whose base is another feature branch.
     steps:
       - run: "bazel test //:privileged_lab --config=optimized --test_output=all"
