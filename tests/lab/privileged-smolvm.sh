@@ -122,7 +122,7 @@ SMOLVM_BOOT_DEBUG=1 \
     --image "$GUEST_ROOT" \
     --cpus 4 \
     --mem 2048 \
-    --timeout 720s \
+    --timeout 1800s \
     --no-init-cache \
     -- /opt/lab/guest-controller.sh || status=$?
 
