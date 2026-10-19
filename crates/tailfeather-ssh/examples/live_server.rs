@@ -553,6 +553,43 @@ where
     Ok(())
 }
 
+fn apply_map(
+    node: &mut Node<PEERS>,
+    map: &mut Netmap<PEERS>,
+    preferred: Option<network::Discovery>,
+) -> std::io::Result<()> {
+    node.adopt_reconnected_map(map).map_err(publication_error)?;
+    if let Some(preferred) = preferred {
+        // The map reader runs independently and can still carry our old home.
+        // Retain the measured choice while it remains eligible in the new map.
+        let _ = node.prefer_derp(preferred.region);
+    }
+    Ok(())
+}
+
+fn queue_discovery(
+    node: &mut Node<PEERS>,
+    publications: &mpsc::SyncSender<network::Discovery>,
+    discovery: network::Discovery,
+) -> std::io::Result<()> {
+    // A map replacement can remove a region while its STUN scan is in flight.
+    // Never advertise that stale choice, or move home if the queue is full.
+    if discovery.region == 0
+        || node
+            .netmap()
+            .derp
+            .region(discovery.region)
+            .is_none_or(|r| !r.can_be_home())
+    {
+        return Err(std::io::Error::other("discovered home no longer eligible"));
+    }
+    publications
+        .try_send(discovery)
+        .map_err(publication_error)?;
+    node.prefer_derp(discovery.region)
+        .map_err(publication_error)
+}
+
 struct Stream {
     tcp: SharedTcp,
     id: StreamId,
@@ -736,7 +773,7 @@ fn main() {
     node.borrow_mut().set_initiate_on_demand(true);
     node.borrow_mut().set_direct_paths(!relay_only);
     let mut map = rx.recv_timeout(Duration::from_secs(30)).unwrap();
-    node.borrow_mut().adopt_reconnected_map(&mut map).unwrap();
+    apply_map(&mut node.borrow_mut(), &mut map, None).unwrap();
     let assigned = node
         .borrow()
         .netmap()
@@ -793,9 +830,7 @@ fn main() {
         );
         let now = start.elapsed().as_millis() as u64;
         while let Ok(mut update) = rx.try_recv() {
-            node.borrow_mut()
-                .adopt_reconnected_map(&mut update)
-                .unwrap();
+            apply_map(&mut node.borrow_mut(), &mut update, published).unwrap();
             if debug_network {
                 for peer in node.borrow().netmap().peers.iter() {
                     println!(
@@ -904,8 +939,10 @@ fn main() {
         if let Some(discovery) = discovery
             && published != Some(discovery)
         {
-            match publications.try_send(discovery) {
+            let queued = queue_discovery(&mut node.borrow_mut(), &publications, discovery);
+            match queued {
                 Ok(()) => {
+                    relays.home(discovery.region);
                     if !relay_only
                         && published
                             .is_some_and(|previous| previous.reflexive != discovery.reflexive)
@@ -1099,5 +1136,73 @@ fn main() {
             }
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refreshed_home_is_applied_without_a_control_echo() {
+        let mut node = Node::<PEERS>::factory_reset(Identity::generate(&mut Random::new()), 1);
+        let generation = match node.poll(0).unwrap().unwrap() {
+            NodeAction::PersistState(state) => state.generation(),
+            _ => panic!("expected initial persistence"),
+        };
+        node.persistence_result(generation, true).unwrap();
+        let mut map = Netmap::new();
+        let mut parser = tailfeather::netmap::Parser::new();
+        parser.push(&mut map, br#"{"HomeDERP":999,"DERPMap":{"Regions":{"999":{"Nodes":[{"HostName":"old"}]},"1000":{"Nodes":[{"HostName":"new"}]}}}}"#).unwrap();
+        parser.finish(&mut map).unwrap();
+        node.handle_control_event(tailfeather::ControlEvent::MapFinished {
+            lease: &mut map,
+            result: Ok(()),
+        })
+        .unwrap();
+        node.prefer_derp(999).unwrap();
+        let mut delayed_map = node.netmap().clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let next = network::Discovery {
+            region: 1000,
+            reflexive: None,
+        };
+        queue_discovery(&mut node, &sender, next).unwrap();
+        assert_eq!(node.netmap().home_derp, 1000);
+        assert!(matches!(
+            node.poll_derp().unwrap(),
+            Some(NodeAction::Derp(tailfeather::node::DerpCommand::Connect {
+                region: 1000,
+                ..
+            }))
+        ));
+        assert!(
+            queue_discovery(
+                &mut node,
+                &sender,
+                network::Discovery {
+                    region: 999,
+                    reflexive: None
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(node.netmap().home_derp, 1000);
+        assert_eq!(receiver.recv().unwrap(), next);
+        apply_map(&mut node, &mut delayed_map, Some(next)).unwrap();
+        assert_eq!(node.netmap().home_derp, 1000);
+        assert!(
+            queue_discovery(
+                &mut node,
+                &sender,
+                network::Discovery {
+                    region: 123,
+                    reflexive: None
+                }
+            )
+            .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(node.netmap().home_derp, 1000);
     }
 }
