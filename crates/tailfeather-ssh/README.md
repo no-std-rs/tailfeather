@@ -220,6 +220,8 @@ and reflexive endpoints, and selects a home DERP region by response latency.
 It uses encrypted disco probes and CallMeMaybe over DERP for bilateral NAT
 hole punching. Active relayed peers get bounded discovery retries; periodic
 STUN refreshes publish changed NAT mappings without interrupting the map stream.
+A failed publication reconnects with verified TLS/Noise and retries the latest
+mapping. Healthy relay connections stay open until stopped or a transport error.
 The core decoder accepts IPv4-mapped IPv6 STUN replies from dual-stack
 listeners and applies upstream's default ports (STUN 3478, DERP 443), while
 keeping this adapter's data plane IPv4. Standalone STUN services can discover
@@ -232,6 +234,7 @@ allowed. The host adapter, no-std harness and firmware use this eligibility rule
 DERP connections use the same verified TLS implementation, authenticated
 framing, ping/pong handling, bounded queues and reconnect backoff. Direct and
 relayed WireGuard packets pass through the same SSH packet policy. Use
+`--timeout-seconds=N` to extend the fixture deadline,
 `--relay-only` to require relay transport and `--sessions=N` for sequential
 acceptance exchanges. A private lab CA can be supplied in `TF_TEST_CA_DER`;
 certificate, hostname and time verification remain enabled.
@@ -246,7 +249,8 @@ two independent filtering NAT routers in isolated namespaces inside a VM:
 | UDP lost after a direct session | SSH falls back to DERP |
 | Relay transport restarted | A new authenticated relay connection serves another SSH session |
 | NAT public port changed | STUN and control publish the new port; direct SSH recovers |
-| All UDP blocked, including STUN | Automatic DERP fallback still serves SSH |
+| Endpoint publisher connection reset | A new Noise session retries the mapping while the map stream stays live |
+| All UDP blocked, including STUN | Automatic DERP fallback serves a 310-second SSH session without reconnecting |
 | Endpoint-dependent NAT | STUN succeeds with a different mapping from peer UDP; SSH uses DERP |
 | Unavailable primary DERP and STUN | Retained backup services establish the connection and mapping |
 | Standalone STUN region before the relay region | It supplies endpoints but never becomes the home relay |

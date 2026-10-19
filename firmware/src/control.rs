@@ -886,58 +886,58 @@ async fn probe_stun(
     );
     socket.bind(LISTEN_PORT).ok()?;
 
-    let mut best: Option<(u64, u16, core::net::SocketAddrV4)> = None;
+    let mut selection = tailfeather::stun::Selection::new(node.netmap());
     let mut response = [0; STUN_BUFFER];
     for region in node
         .netmap()
         .derp
         .iter()
-        .filter(|region| region.can_be_home())
+        .filter(|region| !region.no_measure_no_home)
     {
-        let Some(relay) = region.nodes.iter().find(|node| node.stun_port != 0) else {
-            continue;
-        };
-        let addresses = match stack
-            .dns_query(relay.host_name.as_str(), DnsQueryType::A)
+        for relay in region.nodes.iter().filter(|node| node.stun_port != 0) {
+            let addresses = match stack
+                .dns_query(relay.host_name.as_str(), DnsQueryType::A)
+                .await
+            {
+                Ok(addresses) => addresses,
+                Err(_) => continue,
+            };
+            let Some(address) = addresses.into_iter().next() else {
+                continue;
+            };
+            let embassy_net::IpAddress::Ipv4(address) = address;
+            let endpoint = IpEndpoint::new(address.into(), relay.stun_port);
+            let mut transaction = [0; tailfeather::stun::TRANSACTION_ID_LEN];
+            rng.0.read(&mut transaction);
+            let request = tailfeather::stun::request(transaction);
+            let started = Instant::now();
+            if socket.send_to(&request, endpoint).await.is_err() {
+                continue;
+            }
+            let (len, source) = match select(
+                socket.recv_from(&mut response),
+                Timer::after(Duration::from_millis(400)),
+            )
             .await
-        {
-            Ok(addresses) => addresses,
-            Err(_) => continue,
-        };
-        let Some(address) = addresses.into_iter().next() else {
-            continue;
-        };
-        let embassy_net::IpAddress::Ipv4(address) = address;
-        let endpoint = IpEndpoint::new(address.into(), relay.stun_port);
-        let mut transaction = [0; tailfeather::stun::TRANSACTION_ID_LEN];
-        rng.0.read(&mut transaction);
-        let request = tailfeather::stun::request(transaction);
-        let started = Instant::now();
-        if socket.send_to(&request, endpoint).await.is_err() {
-            continue;
-        }
-        let (len, source) = match select(
-            socket.recv_from(&mut response),
-            Timer::after(Duration::from_millis(400)),
-        )
-        .await
-        {
-            Either::First(Ok(received)) => received,
-            Either::First(Err(_)) | Either::Second(()) => continue,
-        };
-        if source.endpoint != endpoint {
-            continue;
-        }
-        let Ok((address, port)) = tailfeather::stun::response(&response[..len], transaction) else {
-            continue;
-        };
-        let elapsed = Instant::now().duration_since(started).as_millis();
-        let reflexive = core::net::SocketAddrV4::new(address.into(), port);
-        if best.is_none_or(|(best_ms, ..)| elapsed < best_ms) {
-            best = Some((elapsed, region.id, reflexive));
+            {
+                Either::First(Ok(received)) => received,
+                Either::First(Err(_)) | Either::Second(()) => continue,
+            };
+            if source.endpoint != endpoint {
+                continue;
+            }
+            let Ok((address, port)) = tailfeather::stun::response(&response[..len], transaction)
+            else {
+                continue;
+            };
+            let elapsed = Instant::now().duration_since(started).as_millis();
+            let reflexive = core::net::SocketAddrV4::new(address.into(), port);
+            selection.record(region, elapsed, reflexive);
         }
     }
-    best.map(|(_, region, endpoint)| (region, endpoint))
+    selection
+        .reflexive()
+        .map(|endpoint| (selection.home(), endpoint))
 }
 
 struct EndpointPublication {

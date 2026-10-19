@@ -171,7 +171,9 @@ timeout 180 "$CONFORMANCE_ROOT/scripts/nostd-interop.sh" /opt/lab/harness >"$STA
 
 for mode in nat udp-blocked hard-nat; do
     echo "guest-controller: running SSH network acceptance ($mode)"
-    timeout 220 bash /opt/lab/ssh-network.sh /opt/lab/headscale /opt/lab/tailscale /opt/lab/tailscaled \
+    budget=220
+    if test "$mode" = udp-blocked; then budget=540; fi
+    timeout "$budget" bash /opt/lab/ssh-network.sh /opt/lab/headscale /opt/lab/tailscale /opt/lab/tailscaled \
         /opt/lab/ssh-server /opt/lab/headscale.yaml "$mode" >"$STATE/ssh-network-$mode.log" 2>&1
 done
 

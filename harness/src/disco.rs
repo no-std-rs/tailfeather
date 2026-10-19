@@ -185,7 +185,7 @@ async fn exchange(
 
     let mut next_probe = 0u64;
     let mut stun_region = 0usize;
-    let mut stun_best = None;
+    let mut stun_best = tailfeather::stun::Selection::new(&netmap);
     while clock.millis() < deadline
         && !probe_stun(
             reactor,
@@ -218,7 +218,8 @@ async fn exchange(
         )
         .await?;
     }
-    if let Some((_, region, reflexive)) = stun_best
+    let region = stun_best.home();
+    if let Some(reflexive) = stun_best.reflexive()
         && apply_preferred_derp(&identity, &mut netmap, region)
     {
         let mut reflexive_text = heapless::String::<32>::new();
@@ -408,23 +409,27 @@ async fn probe_stun(
     clock: Clock,
     scan_deadline: u64,
     next_region: &mut usize,
-    best: &mut Option<(u64, u16, SocketAddrV4)>,
+    best: &mut tailfeather::stun::Selection,
 ) -> bool {
     const TIMEOUT_MS: u64 = 400;
     let mut response = [0u8; wirefeather::MAX_DATAGRAM_LEN];
-    while let Some(region) = netmap.derp.iter().nth(*next_region) {
-        if !region.can_be_home() {
-            *next_region += 1;
-            continue;
-        }
+    while let Some((region, relay)) = netmap
+        .derp
+        .iter()
+        .filter(|region| !region.no_measure_no_home)
+        .flat_map(|region| {
+            region
+                .nodes
+                .iter()
+                .filter(|node| node.stun_port != 0)
+                .map(move |relay| (region, relay))
+        })
+        .nth(*next_region)
+    {
         let remaining = scan_deadline.saturating_sub(clock.millis());
         if remaining == 0 {
             return true;
         }
-        let Some(relay) = region.nodes.iter().find(|node| node.stun_port != 0) else {
-            *next_region += 1;
-            continue;
-        };
         let Some(address) =
             crate::dns::resolve_v4(reactor, relay.host_name.as_str(), remaining).await
         else {
@@ -471,9 +476,7 @@ async fn probe_stun(
         };
         if let Some(reflexive) = reflexive {
             let elapsed = clock.millis().saturating_sub(started);
-            if best.is_none_or(|current| elapsed < current.0) {
-                *best = Some((elapsed, region.id, reflexive));
-            }
+            best.record(region, elapsed, reflexive);
         }
         *next_region += 1;
     }

@@ -69,15 +69,15 @@ impl Write for Socket {
 fn run<T>(
     future: impl Future<Output = io::Result<T>>,
     stop: &AtomicBool,
-    seconds: u64,
+    timeout: Option<Duration>,
 ) -> io::Result<T> {
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let mut future = std::pin::pin!(future);
     loop {
         if stop.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(io::ErrorKind::TimedOut.into());
         }
         if let Poll::Ready(result) = future
@@ -553,7 +553,7 @@ fn worker(
             .map_err(error)
         },
         stop,
-        15,
+        Some(Duration::from_secs(15)),
     )?;
     let client = run(
         async {
@@ -603,7 +603,7 @@ fn worker(
             Ok(client)
         },
         stop,
-        15,
+        Some(Duration::from_secs(15)),
     )?;
     let (mut reader, mut writer) = tls.split();
     let receiving = async {
@@ -682,7 +682,7 @@ fn worker(
             sending.as_mut().poll(cx)
         }),
         stop,
-        300,
+        None,
     )
 }
 

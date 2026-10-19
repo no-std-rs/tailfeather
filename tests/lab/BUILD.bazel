@@ -120,6 +120,6 @@ sh_test(
         "no-local",
     ],
     # Inner budgets: conformance 360s, WireGuard 120s, no-std 180s,
-    # SSH scenarios 660s, plus setup. The VM caps the total at 1800s.
+    # SSH scenarios 980s, plus setup. The VM caps the total at 1800s.
     timeout = "eternal",
 )

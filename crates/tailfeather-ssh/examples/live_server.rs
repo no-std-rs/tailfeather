@@ -306,7 +306,7 @@ fn control_session<
         local_endpoint: underlay.endpoint.clone(),
         relay_only: underlay.relay_only,
     };
-    std::thread::spawn(move || publish_updates(connect, publisher, underlay.publications));
+    std::thread::spawn(move || publish_updates(publisher, underlay.publications));
     loop {
         let event = blocking(stream.next(&mut http2, &mut staging)).unwrap();
         if event != transport::MapEvent::Applied {
@@ -367,42 +367,138 @@ struct Publisher {
     relay_only: bool,
 }
 
-fn publish_updates<S>(
-    connect: impl Fn() -> S,
-    config: Publisher,
-    updates: mpsc::Receiver<network::Discovery>,
-) where
-    S: tailfeather::embedded_io_async::Read + tailfeather::embedded_io_async::Write,
-{
-    // Establish lazily: a short connection test should not open an extra
-    // control session unless a refresh actually needs to publish something.
+fn publication_error(value: impl std::fmt::Debug) -> std::io::Error {
+    std::io::Error::other(format!("{value:?}"))
+}
+
+fn publication_socket(config: &Publisher) -> std::io::Result<Control> {
+    let addresses = if config.secure {
+        (config.authority.as_str(), 443).to_socket_addrs()?
+    } else {
+        config.authority.to_socket_addrs()?
+    };
+    let mut failure = std::io::Error::other("no control address");
+    for address in addresses.filter(SocketAddr::is_ipv4) {
+        let stream = match TcpStream::connect_timeout(&address, Duration::from_secs(10)) {
+            Ok(stream) => stream,
+            Err(error) => {
+                failure = error;
+                continue;
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_nodelay(true)?;
+        println!("PUBLISHER_CONNECTED local={}", stream.local_addr()?);
+        return Ok(Control(stream));
+    }
+    Err(failure)
+}
+
+fn publication_tls<'a>(
+    config: &Publisher,
+    read: &'a mut [u8],
+    write: &'a mut [u8],
+) -> std::io::Result<tailfeather::embedded_tls::TlsConnection<'a, Control, control::tls::Suite>> {
+    use tailfeather::{control::tls::*, embedded_tls::*};
+    let tls_config = TlsConfig::new()
+        .with_server_name(&config.authority)
+        .enable_rsa_signatures();
+    let mut connection = TlsConnection::new(publication_socket(config)?, read, write);
+    let mut rsa = RsaWorkspace::new();
+    blocking(connection.open(TlsContext::new(
+        &tls_config,
+        VerifyingProvider::<_, SystemClock>::new(Random::new(), None, &mut rsa),
+    )))
+    .map_err(publication_error)?;
+    Ok(connection)
+}
+
+fn publication_connection(
+    config: &Publisher,
+    updates: &mpsc::Receiver<network::Discovery>,
+    update: &mut network::Discovery,
+) -> std::io::Result<()> {
+    if config.secure {
+        // Buffers belong to this attempt and are reclaimed on every reconnect.
+        let mut read = [0; control::tls::TLS_READ_BUFFER];
+        let mut write = [0; control::tls::TLS_WRITE_BUFFER];
+        let key = blocking(transport::fetch_server_key(
+            &mut publication_tls(config, &mut read, &mut write)?,
+            &config.authority,
+        ))
+        .map_err(publication_error)?;
+        publication_session(
+            publication_tls(config, &mut read, &mut write)?,
+            &key,
+            config,
+            updates,
+            update,
+        )
+    } else {
+        let key = blocking(transport::fetch_server_key(
+            &mut publication_socket(config)?,
+            &config.authority,
+        ))
+        .map_err(publication_error)?;
+        publication_session(publication_socket(config)?, &key, config, updates, update)
+    }
+}
+
+fn publish_updates(config: Publisher, updates: mpsc::Receiver<network::Discovery>) {
+    // Establish lazily, retain the failed update, and coalesce newer mappings
+    // before retrying on a new verified TLS/Noise session.
     let Ok(mut update) = updates.recv() else {
         return;
     };
-    let key = blocking(transport::fetch_server_key(
-        &mut connect(),
-        &config.authority,
-    ))
-    .unwrap();
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        while let Ok(newest) = updates.try_recv() {
+            update = newest;
+        }
+        match publication_connection(&config, &updates, &mut update) {
+            Ok(()) => return, // The data-plane sender has shut down.
+            Err(error) => eprintln!("PUBLISHER_RETRY {error}"),
+        }
+        match updates.recv_timeout(backoff) {
+            Ok(newest) => update = newest,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
+fn publication_session<S>(
+    stream: S,
+    key: &tailfeather::keys::MachinePublic,
+    config: &Publisher,
+    updates: &mpsc::Receiver<network::Discovery>,
+    update: &mut network::Discovery,
+) -> std::io::Result<()>
+where
+    S: tailfeather::embedded_io_async::Read + tailfeather::embedded_io_async::Write,
+{
     let noise = blocking(transport::establish(
-        connect(),
+        stream,
         &config.authority,
         &config.identity,
-        &key,
+        key,
         &mut Random::new(),
     ))
-    .unwrap();
+    .map_err(publication_error)?;
     let mut http2 = if config.secure {
-        blocking(noise.into_https2()).unwrap()
+        blocking(noise.into_https2())
     } else {
-        blocking(noise.into_http2()).unwrap()
-    };
+        blocking(noise.into_http2())
+    }
+    .map_err(publication_error)?;
     let node_key = config.identity.node.public();
     let disco_key = config.identity.disco.public();
     loop {
         // Coalesce queued measurements to the newest mapping.
         while let Ok(newest) = updates.try_recv() {
-            update = newest;
+            *update = newest;
         }
         let mut endpoints = Vec::new();
         if !config.relay_only {
@@ -433,7 +529,7 @@ fn publish_updates<S>(
             endpoints: &refs,
         }
         .write(&mut body)
-        .unwrap();
+        .map_err(publication_error)?;
         let mut response = [0; 65536];
         let (status, _) = blocking(http2.request(
             "POST",
@@ -442,14 +538,19 @@ fn publish_updates<S>(
             body,
             &mut response,
         ))
-        .unwrap();
-        assert_eq!(status, 200);
+        .map_err(publication_error)?;
+        if status != 200 {
+            return Err(std::io::Error::other(format!(
+                "endpoint update HTTP {status}"
+            )));
+        }
         println!("PUBLISHED region={} endpoints={endpoints:?}", update.region);
         let Ok(next) = updates.recv() else {
             break;
         };
-        update = next;
+        *update = next;
     }
+    Ok(())
 }
 
 struct Stream {
@@ -673,6 +774,12 @@ fn main() {
                 .map(|v| v.parse::<usize>().unwrap())
         })
         .unwrap_or(1);
+    let timeout_seconds = std::env::args()
+        .find_map(|arg| {
+            arg.strip_prefix("--timeout-seconds=")
+                .map(|v| v.parse::<u64>().unwrap())
+        })
+        .unwrap_or(if sessions > 1 { 240 } else { 120 });
     let mut completed = 0usize;
     let mut direct_received = 0usize;
     let mut relay_received = 0usize;
@@ -681,7 +788,7 @@ fn main() {
     let mut active_peers: Vec<(NodePublic, u64)> = Vec::new();
     loop {
         assert!(
-            start.elapsed() < Duration::from_secs(if sessions > 1 { 240 } else { 120 }),
+            start.elapsed() < Duration::from_secs(timeout_seconds),
             "live test deadline"
         );
         let now = start.elapsed().as_millis() as u64;

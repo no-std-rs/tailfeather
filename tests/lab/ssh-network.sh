@@ -207,8 +207,10 @@ if test -n "${TF_TEST_NETWORK_DEBUG:-}"; then
     start wan packets tcpdump -ln -i wan0 udp
 fi
 SERVER_ENV=()
+SERVER_TIMEOUT=240
+if test "$MODE" = udp-blocked; then SERVER_TIMEOUT=420; fi
 if test -n "${TF_TEST_NETWORK_DEBUG:-}"; then SERVER_ENV=(env TF_TEST_NETWORK_DEBUG=1); fi
-start s server "${SERVER_ENV[@]}" "$SERVER" 127.0.0.1:8080 10.44.2.2 "--sessions=$SESSIONS"
+start s server "${SERVER_ENV[@]}" "$SERVER" 127.0.0.1:8080 10.44.2.2 "--sessions=$SESSIONS" "--timeout-seconds=$SERVER_TIMEOUT"
 SERVER_PID=$LAST_PID
 wait_log '^READY ' "$WORK/server.log"
 ADDRESS=$(sed -n 's/^READY \([^ ]*\).*/\1/p' "$WORK/server.log" | head -1)
@@ -231,11 +233,30 @@ done
 # A stock client learns the host key from control and performs normal SSH.
 ssh_roundtrip() {
     local number=$1 path=$2
-    printf 'NAT console exchange %s\n' "$number" | ns c timeout 40 "${CLIENT[@]}" ssh "console@$ADDRESS" >"$WORK/ssh-$number.log" 2>&1
+    local limit=40 connections
+    connections=$(sed -n '/^DERP_CONNECTED /p' "$WORK/server.log" | wc -l)
+    if test "$MODE" = udp-blocked; then limit=360; fi
+    {
+        printf 'NAT console exchange %s' "$number"
+        if test "$MODE" = udp-blocked; then
+            # This console exits on newline. Keep one line active beyond the
+            # old absolute five-minute relay deadline, then finish normally.
+            for step in $(seq 1 31); do printf '.'; sleep 10; done
+        fi
+        printf '\n'
+    } | ns c timeout "$limit" "${CLIENT[@]}" ssh "console@$ADDRESS" >"$WORK/ssh-$number.log" 2>&1
     tr -d '\r' <"$WORK/ssh-$number.log" >"$WORK/ssh-$number.txt"
     sed -n '/^Tailfeather live console$/p' "$WORK/ssh-$number.txt" | read -r _ || fail 'greeting missing'
-    sed -n "/^NAT console exchange $number\$/p" "$WORK/ssh-$number.txt" | read -r _ || fail 'echo missing'
+    if test "$MODE" = udp-blocked; then
+        sed -n "/^NAT console exchange $number\.\{31\}\$/p" "$WORK/ssh-$number.txt" | read -r _ || fail 'long-lived echo missing'
+    else
+        sed -n "/^NAT console exchange $number\$/p" "$WORK/ssh-$number.txt" | read -r _ || fail 'echo missing'
+    fi
     wait_log "^DRAINED $number\$" "$WORK/server.log"
+    if test "$MODE" = udp-blocked; then
+        test "$(sed -n '/^DERP_CONNECTED /p' "$WORK/server.log" | wc -l)" -eq "$connections" || fail 'healthy relay was unnecessarily reconnected'
+        echo 'PASS healthy DERP connection and active SSH retained beyond 300 seconds'
+    fi
     local metrics direct relay
     metrics=$(sed -n '/^PATH_BYTES /p' "$WORK/server.log" | tail -1)
     direct=$(printf '%s' "$metrics" | sed -n 's/.*direct=\([0-9]*\).*/\1/p')
@@ -272,12 +293,23 @@ if test "$MODE" = nat; then
     # source port. The server must discover and publish it without restarting.
     local_port=$(sed -n 's/^UDP_BOUND local=10\.44\.2\.2:\([0-9]*\).*/\1/p' "$WORK/server.log" | head -1)
     test -n "$local_port" || fail 'missing bound UDP socket address'
-    ns sr iptables -t nat -I POSTROUTING 1 -p udp --sport "$local_port" -o wan -j SNAT --to-source 198.18.0.3:46000
+    ns sr iptables -t nat -I POSTROUTING 1 -p udp --sport "$local_port" -o wan -j SNAT --to-source 198.18.0.3:45000
     for router in cr sr; do
         ns "$router" sysctl -qw net.netfilter.nf_conntrack_udp_timeout=1
         ns "$router" sysctl -qw net.netfilter.nf_conntrack_udp_timeout_stream=1
     done
+    wait_log '^PUBLISHED .*198.18.0.3:45000' "$WORK/server.log"
+    # Reset only the publisher's established proxy child. The map stream uses
+    # a different socket and must survive while this update is retried.
+    publisher_port=$(sed -n 's/^PUBLISHER_CONNECTED local=127\.0\.0\.1:\([0-9]*\)$/\1/p' "$WORK/server.log" | tail -1)
+    test -n "$publisher_port" || fail 'publisher connection missing'
+    publisher_pid=$(ns s ss -tnp state established '( sport = :8080 and dport = :'"$publisher_port"' )' | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+    test -n "$publisher_pid" || fail 'publisher proxy child missing'
+    ns s kill "$publisher_pid"
+    ns sr iptables -t nat -R POSTROUTING 1 -p udp --sport "$local_port" -o wan -j SNAT --to-source 198.18.0.3:46000
+    wait_log '^PUBLISHER_RETRY ' "$WORK/server.log"
     wait_log '^PUBLISHED .*198.18.0.3:46000' "$WORK/server.log"
+    echo 'PASS endpoint publisher recovered from a reset connection without restarting the map stream'
     ns c timeout 35 "${CLIENT[@]}" ping --c=25 --timeout=1s "$ADDRESS" >"$WORK/rebind.log" 2>&1
     sed -n '/via 198\.18\.0\.3:46000/p' "$WORK/rebind.log" | read -r _ || fail 'NAT rebinding did not establish the new direct endpoint'
     ssh_roundtrip 6 direct

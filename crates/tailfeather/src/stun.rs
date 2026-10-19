@@ -23,6 +23,55 @@ pub enum Error {
     AddressFamily,
 }
 
+/// Independently select a reflexive endpoint and an eligible home relay.
+/// Standalone STUN servers can discover a mapping without becoming a home.
+#[derive(Debug, Default)]
+pub struct Selection {
+    home: u16,
+    home_latency: Option<u64>,
+    reflexive: Option<(u64, core::net::SocketAddrV4)>,
+}
+impl Selection {
+    /// Use the first eligible relay when no relay answers STUN.
+    pub fn new<const N: usize>(map: &crate::netmap::Netmap<N>) -> Self {
+        Self {
+            home: map
+                .derp
+                .iter()
+                .find(|r| r.can_be_home())
+                .map_or(0, |r| r.id),
+            ..Self::default()
+        }
+    }
+
+    /// Record an source- and transaction-matched STUN response.
+    pub fn record(
+        &mut self,
+        region: &crate::netmap::DerpRegion,
+        latency: u64,
+        endpoint: core::net::SocketAddrV4,
+    ) {
+        if region.no_measure_no_home {
+            return;
+        }
+        if self.reflexive.is_none_or(|best| latency < best.0) {
+            self.reflexive = Some((latency, endpoint));
+        }
+        if region.can_be_home() && self.home_latency.is_none_or(|best| latency < best) {
+            self.home = region.id;
+            self.home_latency = Some(latency);
+        }
+    }
+
+    pub fn home(&self) -> u16 {
+        self.home
+    }
+
+    pub fn reflexive(&self) -> Option<core::net::SocketAddrV4> {
+        self.reflexive.map(|(_, endpoint)| endpoint)
+    }
+}
+
 /// Encode a binding request with Tailscale's `tailnode` software marker.
 pub fn request(transaction: [u8; TRANSACTION_ID_LEN]) -> [u8; REQUEST_LEN] {
     let mut packet = [0; REQUEST_LEN];
@@ -144,6 +193,29 @@ fn crc32(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_stun_mapping_and_home_latency_are_independent() {
+        let mut map = crate::netmap::Netmap::<1>::new();
+        let mut parser = crate::netmap::Parser::new();
+        parser.push(&mut map, br#"{"DERPMap":{"Regions":{"900":{"Nodes":[{"HostName":"stun","STUNOnly":true}]},"998":{"NoMeasureNoHome":true,"Nodes":[{"HostName":"excluded"}]},"999":{"Nodes":[{"HostName":"relay","STUNPort":-1}]},"1000":{"Nodes":[{"HostName":"backup"}]}}}}"#).unwrap();
+        parser.finish(&mut map).unwrap();
+        let endpoint = core::net::SocketAddrV4::new([203, 0, 113, 7].into(), 41641);
+        let slower = core::net::SocketAddrV4::new([203, 0, 113, 8].into(), 41642);
+        let mut selection = Selection::new(&map);
+        assert_eq!(selection.home(), 999);
+        assert_eq!(selection.reflexive(), None);
+        let region = |id| map.derp.iter().find(|r| r.id == id).unwrap();
+        selection.record(region(998), 0, slower);
+        assert_eq!(selection.reflexive(), None);
+        selection.record(region(900), 1, endpoint);
+        assert_eq!(selection.home(), 999);
+        assert_eq!(selection.reflexive(), Some(endpoint));
+        selection.record(region(999), 10, slower);
+        selection.record(region(1000), 5, slower);
+        assert_eq!(selection.home(), 1000);
+        assert_eq!(selection.reflexive(), Some(endpoint));
+    }
 
     fn success(transaction: [u8; 12], address: [u8; 4], port: u16) -> [u8; 40] {
         let cookie = COOKIE.to_be_bytes();
