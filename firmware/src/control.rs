@@ -888,7 +888,12 @@ async fn probe_stun(
 
     let mut best: Option<(u64, u16, core::net::SocketAddrV4)> = None;
     let mut response = [0; STUN_BUFFER];
-    for region in node.netmap().derp.iter().filter(|region| region.can_be_home()) {
+    for region in node
+        .netmap()
+        .derp
+        .iter()
+        .filter(|region| region.can_be_home())
+    {
         let Some(relay) = region.nodes.iter().find(|node| node.stun_port != 0) else {
             continue;
         };
