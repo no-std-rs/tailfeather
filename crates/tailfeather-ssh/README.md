@@ -193,8 +193,30 @@ The interactive variant gives the default client a controlling terminal. It
 reports the expected PTY-allocation warning, then completes the line-console
 exchange without changing client authentication or host-key verification.
 
-`live_server` is a test adapter with a process deadline and direct UDP paths.
-It accepts only a loopback HTTP coordinator; production adapters must verify
-control TLS, persist their identity and host key, and handle cancellation and
-reconnection. This test establishes real-client compatibility in a Headscale
-tailnet, rather than hosted-control or physical-device acceptance.
+Hosted Tailscale was also tested on 2026-10-19 with the installed, unmodified
+Tailscale 1.96.4 client. Two temporary nodes joined the hosted tailnet; a scoped
+`accept` rule allowed `console` between those nodes, with client key expiry
+disabled. The default interactive `tailscale ssh` verified the control-provided
+host key, received the greeting and echo, and exited zero. Temporary devices,
+auth keys, and the policy addition were removed afterward.
+
+The host fixture supports this control path with `--hosted`:
+
+```sh
+# Supply a disposable enrollment key in TF_TEST_AUTH_KEY via your credential store.
+cargo run -p tailfeather-ssh --example live_server -- --hosted <local-underlay-ipv4>
+```
+
+This uses Tailfeather's TLS 1.3 implementation and verifier, built-in trust
+anchors, hostname verification, and the system clock. The normal Noise/control
+registration and map stream run inside it. Endpoint and SSH-host-key updates
+are published using a separate non-streaming request, as hosted control
+requires. Hosted DERP maps include fractional coordinates; these unused coordinates
+are ignored while retained fields still reject non-integer forms. The example retains at most 32 peers, so keep the test tailnet within
+that bound and configure the supported SSH policy described above.
+
+`live_server` is a disposable test adapter with a process deadline and direct
+UDP paths. Plain HTTP control remains restricted to loopback. Production
+adapters must persist their identity and host key and handle cancellation,
+reconnection, and DERP transport. Hosted acceptance above covers a direct UDP
+path between processes on the same host; physical-device acceptance is separate.
