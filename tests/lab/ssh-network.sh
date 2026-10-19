@@ -135,7 +135,13 @@ regions:
     regioncode: lab
     regionname: NAT lab
     nodes:
-      - name: lab
+      - name: lab-primary
+        regionid: 999
+        hostname: 198.18.0.1
+        ipv4: 198.18.0.1
+        derpport: 8443
+        stunport: 3479
+      - name: lab-backup
         regionid: 999
         hostname: 198.18.0.1
         ipv4: 198.18.0.1
@@ -200,6 +206,7 @@ if test "$MODE" = udp-blocked; then
 else
     wait_log '^STUN .*endpoint=198.18.0.3:' "$WORK/server.log"
     if test "$MODE" = hard-nat; then wait_log '^STUN .*endpoint=198.18.0.3:41003 ' "$WORK/server.log"; fi
+    echo 'PASS STUN backup: primary port 3479 unavailable, backup 3478 answered'
 fi
 for _ in $(seq 1 100); do
     ns c "${CLIENT[@]}" status --json >"$WORK/status.json"

@@ -1173,6 +1173,7 @@ impl<const PEERS: usize> Node<PEERS> {
     /// Ask an authenticated peer to probe our current endpoints. CallMeMaybe
     /// travels only over DERP so both NATs can open their outbound mappings.
     /// The platform supplies the same endpoints it published to control.
+    /// At most the first eight candidates are advertised, as in the decoder.
     pub fn call_me_maybe(
         &mut self,
         peer: &NodePublic,
@@ -1190,10 +1191,8 @@ impl<const PEERS: usize> Node<PEERS> {
         let disco = path.disco.ok_or(NodeError::InvalidState)?;
         let region = path.relay_region.unwrap_or(path.home_derp);
         let mut candidates = Vec::new();
-        for endpoint in endpoints {
-            candidates
-                .push(*endpoint)
-                .map_err(|_| NodeError::Capacity)?;
+        for endpoint in endpoints.iter().take(crate::disco::message::MAX_ENDPOINTS) {
+            candidates.push(*endpoint).unwrap();
         }
         let message = crate::disco::Message::CallMeMaybe(crate::disco::CallMeMaybe {
             endpoints: candidates,
@@ -3045,7 +3044,11 @@ mod tests {
             result: Ok(()),
         })
         .unwrap();
-        let endpoints = ["198.51.100.20:50123".parse().unwrap()];
+        // More publishable interfaces than the wire candidate bound must not
+        // suppress the entire discovery message.
+        let endpoints: [SocketAddr; 10] = core::array::from_fn(|index| {
+            SocketAddr::from(([198, 51, 100, 20], 50123 + index as u16))
+        });
         assert!(matches!(
             node.call_me_maybe(&key, &endpoints, &mut Counter(20))
                 .unwrap(),
@@ -3076,7 +3079,7 @@ mod tests {
         else {
             panic!("wrong disco message");
         };
-        assert_eq!(call.endpoints.as_slice(), &endpoints);
+        assert_eq!(call.endpoints.as_slice(), &endpoints[..8]);
         node.set_direct_paths(false);
         assert!(
             node.call_me_maybe(&key, &endpoints, &mut Counter(21))

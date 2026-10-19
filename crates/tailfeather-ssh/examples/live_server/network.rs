@@ -134,15 +134,14 @@ impl Stun {
         // Finish DNS before starting the latency measurement, so DNS lookup
         // order cannot make the first region appear artificially slower.
         for region in map.derp.iter() {
-            let Some(relay) = region.nodes.iter().find(|n| n.stun_port != 0) else {
-                continue;
-            };
-            let Ok(addresses) = (relay.host_name.as_str(), relay.stun_port).to_socket_addrs()
-            else {
-                continue;
-            };
-            if let Some(source) = addresses.into_iter().find(SocketAddr::is_ipv4) {
-                targets.push((region.id, source));
+            for relay in region.nodes.iter().filter(|n| n.stun_port != 0) {
+                let Ok(addresses) = (relay.host_name.as_str(), relay.stun_port).to_socket_addrs()
+                else {
+                    continue;
+                };
+                if let Some(source) = addresses.into_iter().find(SocketAddr::is_ipv4) {
+                    targets.push((region.id, source));
+                }
             }
         }
         let mut random = Random::new();
