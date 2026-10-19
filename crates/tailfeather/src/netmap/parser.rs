@@ -262,6 +262,7 @@ impl Pending {
 struct PendingRegion {
     id: u16,
     code: heapless::String<16>,
+    no_measure_no_home: bool,
     nodes: heapless::Vec<DerpNode, { crate::netmap::MAX_DERP_NODES }>,
     stun_fallback: Option<DerpNode>,
     node_host: heapless::String<{ crate::netmap::MAX_DERP_HOSTNAME }>,
@@ -313,6 +314,7 @@ impl PendingRegion {
         Self {
             id: 0,
             code: heapless::String::new(),
+            no_measure_no_home: false,
             nodes: heapless::Vec::new(),
             stun_fallback: None,
             node_host: heapless::String::new(),
@@ -565,6 +567,7 @@ impl State {
                 let region = DerpRegion {
                     id: self.region.id,
                     code: self.region.code.clone(),
+                    no_measure_no_home: self.region.no_measure_no_home,
                     nodes: core::mem::take(&mut self.region.nodes),
                 };
                 if let Err(e) = netmap.derp.insert(region) {
@@ -1017,6 +1020,9 @@ impl State {
 
     fn on_bool<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>, value: bool) {
         match self.context() {
+            Context::DerpRegion if self.key == "NoMeasureNoHome" => {
+                self.region.no_measure_no_home = value;
+            }
             Context::PeerObject | Context::PatchObject if self.key == "Online" => {
                 self.pending.online = Some(value);
             }

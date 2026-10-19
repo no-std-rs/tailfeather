@@ -414,6 +414,25 @@ fn derp_regions_keep_two_relay_capable_nodes_and_skip_stun_only_entries() {
 }
 
 #[test]
+fn derp_no_measure_no_home_is_retained_and_resets_between_regions() {
+    let mut netmap = Netmap::<32>::new();
+    apply(
+        &mut netmap,
+        r#"{"DERPMap":{"Regions":{"1":{"NoMeasureNoHome":true,"Nodes":[{"HostName":"peer-only.example"}]},"2":{"Nodes":[{"HostName":"home.example"}]},"3":{"NoMeasureNoHome":false,"Nodes":[]}}}}"#,
+        1,
+    );
+    assert!(netmap.derp.region(1).unwrap().no_measure_no_home);
+    assert!(!netmap.derp.region(2).unwrap().no_measure_no_home);
+    assert!(!netmap.derp.region(3).unwrap().no_measure_no_home);
+    apply(
+        &mut netmap,
+        r#"{"DERPMap":{"Regions":{"1":{"Nodes":[{"HostName":"home-now.example"}]}}}}"#,
+        1,
+    );
+    assert!(!netmap.derp.region(1).unwrap().no_measure_no_home);
+}
+
+#[test]
 fn derp_and_stun_ports_follow_upstream_defaults() {
     for ports in ["", ",\"DERPPort\":0,\"STUNPort\":0"] {
         let mut netmap = Netmap::<32>::new();

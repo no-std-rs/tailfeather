@@ -674,7 +674,13 @@ impl<const PEERS: usize> Node<PEERS> {
     /// The next staged delta inherits it unless the control plane explicitly
     /// sends a replacement `HomeDERP`.
     pub fn prefer_derp(&mut self, region: u16) -> Result<(), NodeError> {
-        if region == 0 || self.netmap.derp.region(region).is_none() {
+        if region == 0
+            || self
+                .netmap
+                .derp
+                .region(region)
+                .is_none_or(|region| !region.can_be_home())
+        {
             return Err(NodeError::InvalidState);
         }
         self.netmap.home_derp = region;
@@ -1370,6 +1376,7 @@ impl<const PEERS: usize> Node<PEERS> {
             .netmap
             .derp
             .iter()
+            .filter(|region| region.can_be_home())
             .map(|region| region.id)
             .find(|region| *region != 0 && !required.contains(region));
         let peer_derp = self
@@ -2179,6 +2186,7 @@ mod tests {
             .insert(crate::netmap::DerpRegion {
                 id: 9,
                 code: heapless::String::try_from("test").unwrap(),
+                no_measure_no_home: false,
                 nodes,
             })
             .unwrap();
@@ -2691,6 +2699,7 @@ mod tests {
             crate::netmap::DerpRegion {
                 id,
                 code: heapless::String::try_from("test").unwrap(),
+                no_measure_no_home: false,
                 nodes,
             }
         }
@@ -2754,6 +2763,7 @@ mod tests {
             .insert(crate::netmap::DerpRegion {
                 id: 9,
                 code: heapless::String::try_from("test").unwrap(),
+                no_measure_no_home: false,
                 nodes,
             })
             .unwrap();
@@ -2791,6 +2801,7 @@ mod tests {
             crate::netmap::DerpRegion {
                 id,
                 code: heapless::String::try_from("test").unwrap(),
+                no_measure_no_home: false,
                 nodes,
             }
         }
@@ -2875,6 +2886,75 @@ mod tests {
     }
 
     #[test]
+    fn no_home_region_is_skipped_for_rendezvous_but_allowed_for_a_peer() {
+        let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+        persisted(&mut node);
+        let mut lease = Netmap::new();
+        lease.home_derp = 9;
+        let mut peer_only = relay_region(1);
+        peer_only.no_measure_no_home = true;
+        lease.derp.insert(peer_only).unwrap();
+        lease.derp.insert(relay_region(9)).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        assert!(matches!(node.prefer_derp(1), Err(NodeError::InvalidState)));
+        node.prefer_derp(9).unwrap();
+        assert!(matches!(
+            node.poll_derp().unwrap(),
+            Some(NodeAction::Derp(DerpCommand::Connect { region: 9, .. }))
+        ));
+        node.handle_derp_event(DerpEvent::Connected { region: 9 }, 0, &mut Counter(1))
+            .unwrap();
+        assert!(node.poll_derp().unwrap().is_none());
+        let mut lease = node.netmap().clone();
+        let mut peer = Peer::new(2, NodePrivate::from_bytes([2; 32]).public());
+        peer.home_derp = 1;
+        lease.peers.upsert(peer).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        assert!(matches!(
+            node.poll_derp().unwrap(),
+            Some(NodeAction::Derp(DerpCommand::Connect { region: 1, .. }))
+        ));
+    }
+
+    #[test]
+    fn standalone_stun_region_cannot_block_relay_backup_after_a_dial_failure() {
+        let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+        persisted(&mut node);
+        let mut lease = Netmap::new();
+        lease.home_derp = 9;
+        let mut stun = relay_region(1);
+        stun.nodes[0].port = 0;
+        lease.derp.insert(stun).unwrap();
+        let mut relay = relay_region(9);
+        let mut backup = relay.nodes[0].clone();
+        backup.port = 8443;
+        relay.nodes[0].port = 8444;
+        relay.nodes.push(backup).unwrap();
+        lease.derp.insert(relay).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        assert!(matches!(node.prefer_derp(1), Err(NodeError::InvalidState)));
+        assert!(
+            matches!(node.poll_derp().unwrap(), Some(NodeAction::Derp(DerpCommand::Connect { region: 9, endpoint })) if endpoint.port == 8444)
+        );
+        assert!(
+            matches!(node.handle_derp_event(DerpEvent::Disconnected { region: 9 }, 0, &mut Counter(1)).unwrap(), Some(NodeAction::Derp(DerpCommand::Connect { region: 9, endpoint })) if endpoint.port == 8443)
+        );
+        assert!(node.poll_derp().unwrap().is_none());
+    }
+
+    #[test]
     fn failed_home_derp_does_not_block_the_peer_region() {
         fn region(id: u16) -> crate::netmap::DerpRegion {
             let mut nodes = heapless::Vec::new();
@@ -2889,6 +2969,7 @@ mod tests {
             crate::netmap::DerpRegion {
                 id,
                 code: heapless::String::try_from("test").unwrap(),
+                no_measure_no_home: false,
                 nodes,
             }
         }
@@ -2945,6 +3026,7 @@ mod tests {
             crate::netmap::DerpRegion {
                 id,
                 code: heapless::String::try_from("test").unwrap(),
+                no_measure_no_home: false,
                 nodes,
             }
         }
@@ -3015,6 +3097,7 @@ mod tests {
         crate::netmap::DerpRegion {
             id,
             code: heapless::String::try_from("test").unwrap(),
+            no_measure_no_home: false,
             nodes,
         }
     }

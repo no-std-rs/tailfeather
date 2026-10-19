@@ -99,6 +99,7 @@ struct Probe {
     source: SocketAddr,
     transaction: [u8; 12],
     region: u16,
+    relay_capable: bool,
     sent: Instant,
 }
 
@@ -108,7 +109,8 @@ pub struct Stun {
     probes: Vec<Probe>,
     deadline: Option<Instant>,
     next_scan: Instant,
-    best: Option<(Duration, u16, SocketAddr)>,
+    best: Option<(Duration, u16)>,
+    reflexive: Option<(Duration, SocketAddr)>,
     fallback: u16,
 }
 impl Default for Stun {
@@ -123,29 +125,36 @@ impl Stun {
             deadline: None,
             next_scan: Instant::now() + Duration::from_secs(15),
             best: None,
+            reflexive: None,
             fallback: 0,
         }
     }
     fn start(&mut self, udp: &UdpSocket, map: &Netmap<PEERS>) {
         self.probes.clear();
         self.best = None;
-        self.fallback = map.derp.iter().next().map_or(0, |r| r.id);
+        self.reflexive = None;
+        self.fallback = map
+            .derp
+            .iter()
+            .find(|region| region.can_be_home())
+            .map_or(0, |region| region.id);
         let mut targets = Vec::new();
         // Finish DNS before starting the latency measurement, so DNS lookup
         // order cannot make the first region appear artificially slower.
-        for region in map.derp.iter() {
+        for region in map.derp.iter().filter(|region| !region.no_measure_no_home) {
+            let relay_capable = region.can_be_home();
             for relay in region.nodes.iter().filter(|n| n.stun_port != 0) {
                 let Ok(addresses) = (relay.host_name.as_str(), relay.stun_port).to_socket_addrs()
                 else {
                     continue;
                 };
                 if let Some(source) = addresses.into_iter().find(SocketAddr::is_ipv4) {
-                    targets.push((region.id, source));
+                    targets.push((region.id, source, relay_capable));
                 }
             }
         }
         let mut random = Random::new();
-        for (region, source) in targets {
+        for (region, source, relay_capable) in targets {
             let mut transaction = [0; 12];
             super::rand_core::RngCore::fill_bytes(&mut random, &mut transaction);
             let sent = Instant::now();
@@ -157,6 +166,7 @@ impl Stun {
                     source,
                     transaction,
                     region,
+                    relay_capable,
                     sent,
                 });
             }
@@ -184,8 +194,13 @@ impl Stun {
                 probe.region,
                 latency.as_micros()
             );
-            if self.best.is_none_or(|b| latency < b.0) {
-                self.best = Some((latency, probe.region, endpoint));
+            // A standalone STUN service can discover our mapping but cannot
+            // accept a DERP connection. Choose these two results independently.
+            if self.reflexive.is_none_or(|best| latency < best.0) {
+                self.reflexive = Some((latency, endpoint));
+            }
+            if probe.relay_capable && self.best.is_none_or(|best| latency < best.0) {
+                self.best = Some((latency, probe.region));
             }
         }
         true
@@ -203,7 +218,7 @@ impl Stun {
         self.probes.clear();
         Some(Discovery {
             region: self.best.map_or(self.fallback, |b| b.1),
-            reflexive: self.best.map(|b| b.2),
+            reflexive: self.reflexive.map(|best| best.1),
         })
     }
 }
@@ -669,4 +684,142 @@ fn worker(
         stop,
         300,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(stun: SocketAddr) -> Netmap<PEERS> {
+        // A standalone STUN service precedes a usable relay with STUN disabled.
+        let json = format!(
+            r#"{{"DERPMap":{{"Regions":{{"900":{{"Nodes":[{{"HostName":"127.0.0.1","STUNPort":{},"STUNOnly":true}}]}},"999":{{"Nodes":[{{"HostName":"127.0.0.1","DERPPort":443,"STUNPort":-1}}]}}}}}}}}"#,
+            stun.port()
+        );
+        let mut map = Netmap::new();
+        let mut parser = tailfeather::netmap::Parser::new();
+        parser.push(&mut map, json.as_bytes()).unwrap();
+        parser.finish(&mut map).unwrap();
+        map
+    }
+
+    fn response(transaction: [u8; 12]) -> [u8; 32] {
+        // Binding success, XOR-MAPPED-ADDRESS 203.0.113.7:41641.
+        let mut bytes = [
+            0x01, 0x01, 0x00, 0x0c, 0x21, 0x12, 0xa4, 0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x00, 0x20, 0x00, 0x08, 0, 1, 0x83, 0xbb, 0xea, 0x12, 0xd5, 0x45,
+        ];
+        bytes[8..20].copy_from_slice(&transaction);
+        bytes
+    }
+
+    #[test]
+    fn no_measure_no_home_region_is_neither_probed_nor_a_fallback_home() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut map = map(server.local_addr().unwrap());
+        let mut region = map.derp.region(900).unwrap().clone();
+        region.no_measure_no_home = true;
+        region.nodes[0].port = 443;
+        map.derp.insert(region).unwrap();
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut stun = Stun::new();
+        stun.start(&udp, &map);
+        assert_eq!(
+            server.recv_from(&mut [0; 64]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            stun.poll(&udp, &map),
+            Some(Discovery {
+                region: 999,
+                reflexive: None
+            })
+        );
+    }
+
+    #[test]
+    fn standalone_stun_discovers_an_endpoint_without_becoming_home_derp() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let source = server.local_addr().unwrap();
+        let map = map(source);
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut stun = Stun::new();
+        stun.start(&udp, &map);
+        let transaction = stun.probes[0].transaction;
+        assert!(stun.receive(&response(transaction), source));
+        let discovery = stun.poll(&udp, &map).unwrap();
+        assert_eq!(
+            discovery.reflexive,
+            Some("203.0.113.7:41641".parse().unwrap())
+        );
+        assert_eq!(discovery.region, 999);
+    }
+
+    #[test]
+    fn blocked_stun_falls_back_to_a_region_with_a_relay() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let map = map(server.local_addr().unwrap());
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut stun = Stun::new();
+        stun.start(&udp, &map);
+        stun.deadline = Some(Instant::now());
+        assert_eq!(
+            stun.poll(&udp, &map),
+            Some(Discovery {
+                region: 999,
+                reflexive: None
+            })
+        );
+    }
+
+    #[test]
+    fn fastest_reflexive_probe_and_home_relay_are_selected_independently() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut map = map(server.local_addr().unwrap());
+        let mut region = map.derp.region(999).unwrap().clone();
+        region.nodes[0].stun_port = relay.local_addr().unwrap().port();
+        map.derp.insert(region).unwrap();
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut stun = Stun::new();
+        stun.start(&udp, &map);
+        let transaction = stun
+            .probes
+            .iter()
+            .find(|p| p.region == 900)
+            .unwrap()
+            .transaction;
+        stun.receive(&response(transaction), server.local_addr().unwrap());
+        let probe = stun.probes.iter_mut().find(|p| p.region == 999).unwrap();
+        // A deterministic slower measurement without sleeping in the test.
+        probe.sent = Instant::now() - Duration::from_secs(1);
+        let mut packet = response(probe.transaction);
+        packet[27] ^= 3; // Different mapping: 41642 instead of 41641.
+        stun.receive(&packet, relay.local_addr().unwrap());
+        let discovery = stun.poll(&udp, &map).unwrap();
+        assert_eq!(discovery.region, 999);
+        assert_eq!(
+            discovery.reflexive,
+            Some("203.0.113.7:41641".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn wrong_source_or_transaction_cannot_supply_a_reflexive_endpoint() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let source = server.local_addr().unwrap();
+        let map = map(source);
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut stun = Stun::new();
+        stun.start(&udp, &map);
+        let transaction = stun.probes[0].transaction;
+        let wrong_source = SocketAddr::from(([127, 0, 0, 2], source.port()));
+        stun.receive(&response(transaction), wrong_source);
+        let mut wrong_transaction = transaction;
+        wrong_transaction[0] ^= 1;
+        stun.receive(&response(wrong_transaction), source);
+        stun.deadline = Some(Instant::now());
+        assert!(stun.poll(&udp, &map).unwrap().reflexive.is_none());
+    }
 }

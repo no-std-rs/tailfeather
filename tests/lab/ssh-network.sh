@@ -130,6 +130,18 @@ openssl x509 -in "$WORK/ca.pem" -outform DER -out "$WORK/ca.der"
 export SSL_CERT_FILE="$WORK/ca.pem" TF_TEST_CA_DER="$WORK/ca.der"
 cat >"$WORK/derp.json" <<'EOF'
 regions:
+  900:
+    regionid: 900
+    regioncode: stun
+    regionname: Standalone STUN
+    nomeasurenohome: true
+    nodes:
+      - name: stun-only
+        regionid: 900
+        hostname: 198.18.0.1
+        ipv4: 198.18.0.1
+        stunport: 3478
+        stunonly: true
   999:
     regionid: 999
     regioncode: lab
@@ -139,7 +151,7 @@ regions:
         regionid: 999
         hostname: 198.18.0.1
         ipv4: 198.18.0.1
-        derpport: 8443
+        derpport: 8444
         stunport: 3479
       - name: lab-backup
         regionid: 999
@@ -201,10 +213,13 @@ SERVER_PID=$LAST_PID
 wait_log '^READY ' "$WORK/server.log"
 ADDRESS=$(sed -n 's/^READY \([^ ]*\).*/\1/p' "$WORK/server.log" | head -1)
 wait_log '^DERP_CONNECTED ' "$WORK/server.log"
+wait_log '^DERP_CONNECTED region=999$' "$WORK/server.log"
+wait_log '^DISCOVERY region=999 ' "$WORK/server.log"
+echo 'PASS DERP backup: primary port 8444 unavailable, backup 8443 connected; STUN-only region excluded from home selection'
 if test "$MODE" = udp-blocked; then
     wait_log 'reflexive=None' "$WORK/server.log"
 else
-    wait_log '^STUN .*endpoint=198.18.0.3:' "$WORK/server.log"
+    wait_log '^STUN region=999 endpoint=198.18.0.3:' "$WORK/server.log"
     if test "$MODE" = hard-nat; then wait_log '^STUN .*endpoint=198.18.0.3:41003 ' "$WORK/server.log"; fi
     echo 'PASS STUN backup: primary port 3479 unavailable, backup 3478 answered'
 fi

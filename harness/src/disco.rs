@@ -413,6 +413,10 @@ async fn probe_stun(
     const TIMEOUT_MS: u64 = 400;
     let mut response = [0u8; wirefeather::MAX_DATAGRAM_LEN];
     while let Some(region) = netmap.derp.iter().nth(*next_region) {
+        if !region.can_be_home() {
+            *next_region += 1;
+            continue;
+        }
         let remaining = scan_deadline.saturating_sub(clock.millis());
         if remaining == 0 {
             return true;

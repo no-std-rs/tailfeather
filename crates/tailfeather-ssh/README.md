@@ -222,7 +222,12 @@ hole punching. Active relayed peers get bounded discovery retries; periodic
 STUN refreshes publish changed NAT mappings without interrupting the map stream.
 The core decoder accepts IPv4-mapped IPv6 STUN replies from dual-stack
 listeners and applies upstream's default ports (STUN 3478, DERP 443), while
-keeping this adapter's data plane IPv4.
+keeping this adapter's data plane IPv4. Standalone STUN services can discover
+the reflexive endpoint, while home selection and blocked-UDP fallback use a
+region with a relay service.
+`NoMeasureNoHome` regions are excluded from measurement, home selection and
+the compatibility rendezvous, while connections to peers using them remain
+allowed. The host adapter, no-std harness and firmware use this eligibility rule.
 
 DERP connections use the same verified TLS implementation, authenticated
 framing, ping/pong handling, bounded queues and reconnect backoff. Direct and
@@ -243,6 +248,8 @@ two independent filtering NAT routers in isolated namespaces inside a VM:
 | NAT public port changed | STUN and control publish the new port; direct SSH recovers |
 | All UDP blocked, including STUN | Automatic DERP fallback still serves SSH |
 | Endpoint-dependent NAT | STUN succeeds with a different mapping from peer UDP; SSH uses DERP |
+| Unavailable primary DERP and STUN | Retained backup services establish the connection and mapping |
+| Standalone STUN region before the relay region | It supplies endpoints but never becomes the home relay |
 
 Every exchange uses default `tailscale ssh`, verifies its control-provided host
 key, checks the actual greeting and echoed input, and requires client exit zero
