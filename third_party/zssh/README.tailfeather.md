@@ -11,6 +11,10 @@ a second set of implementations. The wrapper remains a separate thin crate.
 
 Local changes:
 
+- Canonicalize positive mpints before hashing, including a leading sign byte
+  after removing redundant zero bytes. X25519 secrets beginning `00 80..ff`
+  otherwise produce a different exchange hash from OpenSSH and fail signature
+  verification; an all-zero integer encodes as an empty string.
 - Reject all-zero X25519 shared secrets with a key-exchange-failed disconnect
   before signing the exchange or deriving session keys, as RFC 8731 requires.
 - Backport the window-aware copying write path from zssh 0.5.0: wait for space

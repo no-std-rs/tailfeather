@@ -24,7 +24,7 @@
 
 use crate::keys::{DiscoPublic, NodePublic};
 
-use crate::netmap::derp::{DEFAULT_DERP_PORT, DerpMap, DerpNode, DerpRegion};
+use crate::netmap::derp::{DEFAULT_DERP_PORT, DEFAULT_STUN_PORT, DerpMap, DerpNode, DerpRegion};
 use crate::netmap::dns::DnsConfig;
 use crate::netmap::peer::{Cidr, Cidr4, Peer, PeerTable};
 use crate::netmap::policy::{Destination, FilterRule, Network};
@@ -479,7 +479,7 @@ impl State {
                 self.region.node_host.clear();
                 self.region.node_cert.clear();
                 self.region.node_port = DEFAULT_DERP_PORT;
-                self.region.node_stun = 0;
+                self.region.node_stun = DEFAULT_STUN_PORT;
                 self.region.node_flags = 0;
             }
             Context::PacketFilterArray => {
@@ -977,13 +977,15 @@ impl State {
             },
             Context::DerpNode => match key {
                 "DERPPort" => match u16::try_from(value) {
-                    Ok(port) if port != 0 => self.region.node_port = port,
+                    Ok(0) => self.region.node_port = DEFAULT_DERP_PORT,
+                    Ok(port) => self.region.node_port = port,
                     _ => self.fail(Error::MalformedField(MalformedField::DerpPort)),
                 },
-                // Upstream uses -1 for nodes without STUN. It is not malformed;
-                // zero marks the node unusable for a latency/reflexive probe.
+                // Normalize upstream's default and disabled representations.
+                // The retained map uses zero only for a disabled endpoint.
                 "STUNPort" if value == -1 => self.region.node_stun = 0,
                 "STUNPort" => match u16::try_from(value) {
+                    Ok(0) => self.region.node_stun = DEFAULT_STUN_PORT,
                     Ok(port) => self.region.node_stun = port,
                     Err(_) => self.fail(Error::MalformedField(MalformedField::StunPort)),
                 },

@@ -6,7 +6,7 @@ runfile() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$PWD" "$
 
 ROOTFS="" SMOLVM="" LIBKRUNFW="" GUEST="" HEADSCALE="" TAILSCALE="" TAILSCALED=""
 CONFORMANCE="" HARNESS="" RESPONDER="" INTEROP="" NOSTD_INTEROP="" EXPECTATIONS="" VECTORS=""
-HEADSCALE_CONFIG=""
+HEADSCALE_CONFIG="" SSH_SERVER="" SSH_NETWORK=""
 APKS=()
 for arg in "$@"; do
     case "$arg" in
@@ -24,6 +24,8 @@ for arg in "$@"; do
         --nostd-interop=*) NOSTD_INTEROP=$(runfile "${arg#*=}") ;;
         --expectations=*) EXPECTATIONS=$(runfile "${arg#*=}") ;;
         --vectors=*) VECTORS=$(runfile "${arg#*=}") ;;
+        --ssh-server=*) SSH_SERVER=$(runfile "${arg#*=}") ;;
+        --ssh-network=*) SSH_NETWORK=$(runfile "${arg#*=}") ;;
         --headscale-config=*) HEADSCALE_CONFIG=$(runfile "${arg#*=}") ;;
         --apk=*) APKS+=("$(runfile "${arg#*=}")") ;;
         *) fail "unknown argument: $arg" ;;
@@ -32,7 +34,7 @@ done
 
 for input in "$ROOTFS" "$SMOLVM" "$LIBKRUNFW" "$GUEST" "$HEADSCALE" "$TAILSCALE" "$TAILSCALED" \
     "$CONFORMANCE" "$HARNESS" "$RESPONDER" "$INTEROP" "$NOSTD_INTEROP" "$EXPECTATIONS" "$VECTORS" \
-    "$HEADSCALE_CONFIG"; do
+    "$HEADSCALE_CONFIG" "$SSH_SERVER" "$SSH_NETWORK"; do
     test -r "$input" || fail "missing runfile: $input"
 done
 test -r /dev/kvm && test -w /dev/kvm || fail "/dev/kvm is unavailable"
@@ -73,13 +75,15 @@ cp "$TAILSCALE" "$GUEST_ROOT/opt/lab/tailscale"
 cp "$TAILSCALED" "$GUEST_ROOT/opt/lab/tailscaled"
 cp "$CONFORMANCE" "$GUEST_ROOT/opt/lab/conformance"
 cp "$HARNESS" "$GUEST_ROOT/opt/lab/harness"
+cp "$SSH_SERVER" "$GUEST_ROOT/opt/lab/ssh-server"
+cp "$SSH_NETWORK" "$GUEST_ROOT/opt/lab/ssh-network.sh"
 cp "$RESPONDER" "$GUEST_ROOT/opt/lab/responder"
 cp "$INTEROP" "$GUEST_ROOT/opt/lab/interop-wireguard.sh"
 cp "$NOSTD_INTEROP" "$GUEST_ROOT/opt/lab/nostd-interop.sh"
 cp "$EXPECTATIONS" "$GUEST_ROOT/opt/lab/lab.json"
 cp "$HEADSCALE_CONFIG" "$GUEST_ROOT/opt/lab/headscale.yaml"
 cp -RL "$(dirname "$VECTORS")"/. "$GUEST_ROOT/opt/lab/vectors/"
-chmod 755 "$GUEST_ROOT"/opt/lab/{guest-controller.sh,headscale,tailscale,tailscaled,conformance,harness,responder,interop-wireguard.sh,nostd-interop.sh}
+chmod 755 "$GUEST_ROOT"/opt/lab/{guest-controller.sh,headscale,tailscale,tailscaled,conformance,harness,responder,interop-wireguard.sh,nostd-interop.sh,ssh-server,ssh-network.sh}
 
 SMOLVM_SOURCE=$(cd "$(dirname "$SMOLVM")" && pwd)
 SMOLVM_DIR="$WORK/smolvm"
@@ -118,7 +122,7 @@ SMOLVM_BOOT_DEBUG=1 \
     --image "$GUEST_ROOT" \
     --cpus 4 \
     --mem 2048 \
-    --timeout 720s \
+    --timeout 1800s \
     --no-init-cache \
     -- /opt/lab/guest-controller.sh || status=$?
 
