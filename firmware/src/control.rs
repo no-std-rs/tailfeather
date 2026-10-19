@@ -914,24 +914,31 @@ async fn probe_stun(
             if socket.send_to(&request, endpoint).await.is_err() {
                 continue;
             }
-            let (len, source) = match select(
-                socket.recv_from(&mut response),
-                Timer::after(Duration::from_millis(400)),
-            )
-            .await
-            {
-                Either::First(Ok(received)) => received,
-                Either::First(Err(_)) | Either::Second(()) => continue,
+            let deadline = started + Duration::from_millis(400);
+            let reflexive = loop {
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                let (len, source) =
+                    match select(socket.recv_from(&mut response), Timer::at(deadline)).await {
+                        Either::First(Ok(received)) => received,
+                        Either::First(Err(_)) | Either::Second(()) => break None,
+                    };
+                // Late replies from a previous server, stale transactions and
+                // peer datagrams cannot shorten this probe's receive window.
+                if source.endpoint != endpoint {
+                    continue;
+                }
+                if let Ok((address, port)) =
+                    tailfeather::stun::response(&response[..len], transaction)
+                {
+                    break Some(core::net::SocketAddrV4::new(address.into(), port));
+                }
             };
-            if source.endpoint != endpoint {
-                continue;
-            }
-            let Ok((address, port)) = tailfeather::stun::response(&response[..len], transaction)
-            else {
+            let Some(reflexive) = reflexive else {
                 continue;
             };
             let elapsed = Instant::now().duration_since(started).as_millis();
-            let reflexive = core::net::SocketAddrV4::new(address.into(), port);
             selection.record(region, elapsed, reflexive);
         }
     }

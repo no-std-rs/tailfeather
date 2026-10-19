@@ -934,6 +934,20 @@ impl<const PEERS: usize> Node<PEERS> {
     }
 
     fn reconcile_peers(&mut self) -> Result<(), NodeError> {
+        if self.netmap.home_derp != 0
+            && self
+                .netmap
+                .derp
+                .region(self.netmap.home_derp)
+                .is_none_or(|region| !region.can_be_home())
+        {
+            self.netmap.home_derp = self
+                .netmap
+                .derp
+                .iter()
+                .find(|region| region.can_be_home())
+                .map_or(0, |region| region.id);
+        }
         self.tunnel.retain_peers(|key| {
             self.netmap
                 .peers
@@ -2883,6 +2897,40 @@ mod tests {
                 ..
             }) if region == 3
         ));
+    }
+
+    #[test]
+    fn control_provided_ineligible_home_is_replaced_on_both_map_paths() {
+        for stun_only in [false, true] {
+            for reconnected in [false, true] {
+                let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+                persisted(&mut node);
+                let mut lease = Netmap::new();
+                lease.home_derp = 1;
+                let mut excluded = relay_region(1);
+                if stun_only {
+                    excluded.nodes[0].port = 0;
+                } else {
+                    excluded.no_measure_no_home = true;
+                }
+                lease.derp.insert(excluded).unwrap();
+                lease.derp.insert(relay_region(9)).unwrap();
+                if reconnected {
+                    node.adopt_reconnected_map(&mut lease).unwrap();
+                } else {
+                    node.handle_control_event(ControlEvent::MapFinished {
+                        lease: &mut lease,
+                        result: Ok(()),
+                    })
+                    .unwrap();
+                }
+                assert_eq!(node.netmap().home_derp, 9);
+                assert!(matches!(
+                    node.poll_derp().unwrap(),
+                    Some(NodeAction::Derp(DerpCommand::Connect { region: 9, .. }))
+                ));
+            }
+        }
     }
 
     #[test]

@@ -103,6 +103,36 @@ struct Probe {
     sent: Instant,
 }
 
+type StunTarget = (u16, String, u16);
+type ResolvedStun = (u16, SocketAddr);
+
+fn stun_targets(map: &Netmap<PEERS>) -> Vec<StunTarget> {
+    map.derp
+        .iter()
+        .filter(|r| !r.no_measure_no_home)
+        .flat_map(|region| {
+            region
+                .nodes
+                .iter()
+                .filter(|n| n.stun_port != 0)
+                .map(move |node| (region.id, node.host_name.to_string(), node.stun_port))
+        })
+        .collect()
+}
+
+fn resolve_stun(targets: Vec<StunTarget>) -> Vec<ResolvedStun> {
+    targets
+        .into_iter()
+        .filter_map(|(region, host, port)| {
+            (host.as_str(), port)
+                .to_socket_addrs()
+                .ok()?
+                .find(SocketAddr::is_ipv4)
+                .map(|source| (region, source))
+        })
+        .collect()
+}
+
 /// Binding lifetime and NAT mappings can change while the control stream stays
 /// up. Refresh on the data socket and publish a changed mapping independently.
 pub struct Stun {
@@ -112,6 +142,7 @@ pub struct Stun {
     best: Option<(Duration, u16)>,
     reflexive: Option<(Duration, SocketAddr)>,
     fallback: u16,
+    resolving: Option<Receiver<Vec<ResolvedStun>>>,
 }
 impl Default for Stun {
     fn default() -> Self {
@@ -127,34 +158,42 @@ impl Stun {
             best: None,
             reflexive: None,
             fallback: 0,
+            resolving: None,
         }
     }
     fn start(&mut self, udp: &UdpSocket, map: &Netmap<PEERS>) {
+        // Initial discovery runs before the reactor starts. Refreshes below
+        // resolve on a worker so DNS cannot block SSH or transport timers.
+        self.start_resolved(udp, map, resolve_stun(stun_targets(map)));
+    }
+    fn schedule_resolution(
+        &mut self,
+        map: &Netmap<PEERS>,
+        resolve: impl FnOnce(Vec<StunTarget>) -> Vec<ResolvedStun> + Send + 'static,
+    ) {
+        let targets = stun_targets(map);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.resolving = Some(receiver);
+        // At most one DNS worker exists per scanner, even if resolution stalls.
+        std::thread::spawn(move || {
+            let _ = sender.send(resolve(targets));
+        });
+    }
+    fn start_resolved(&mut self, udp: &UdpSocket, map: &Netmap<PEERS>, targets: Vec<ResolvedStun>) {
         self.probes.clear();
         self.best = None;
         self.reflexive = None;
         self.fallback = map
             .derp
             .iter()
-            .find(|region| region.can_be_home())
-            .map_or(0, |region| region.id);
-        let mut targets = Vec::new();
-        // Finish DNS before starting the latency measurement, so DNS lookup
-        // order cannot make the first region appear artificially slower.
-        for region in map.derp.iter().filter(|region| !region.no_measure_no_home) {
-            let relay_capable = region.can_be_home();
-            for relay in region.nodes.iter().filter(|n| n.stun_port != 0) {
-                let Ok(addresses) = (relay.host_name.as_str(), relay.stun_port).to_socket_addrs()
-                else {
-                    continue;
-                };
-                if let Some(source) = addresses.into_iter().find(SocketAddr::is_ipv4) {
-                    targets.push((region.id, source, relay_capable));
-                }
-            }
-        }
+            .find(|r| r.can_be_home())
+            .map_or(0, |r| r.id);
         let mut random = Random::new();
-        for (region, source, relay_capable) in targets {
+        for (region, source) in targets {
+            let Some(current) = map.derp.region(region).filter(|r| !r.no_measure_no_home) else {
+                continue;
+            };
+            let relay_capable = current.can_be_home();
             let mut transaction = [0; 12];
             super::rand_core::RngCore::fill_bytes(&mut random, &mut transaction);
             let sent = Instant::now();
@@ -206,8 +245,24 @@ impl Stun {
         true
     }
     pub fn poll(&mut self, udp: &UdpSocket, map: &Netmap<PEERS>) -> Option<Discovery> {
-        if self.deadline.is_none() && Instant::now() >= self.next_scan {
-            self.start(udp, map);
+        if self.deadline.is_none() {
+            if let Some(receiver) = &self.resolving {
+                match receiver.try_recv() {
+                    Ok(targets) => {
+                        self.resolving = None;
+                        self.start_resolved(udp, map, targets);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.resolving = None;
+                        self.next_scan = Instant::now() + Duration::from_secs(15);
+                        return None;
+                    }
+                }
+            } else if Instant::now() >= self.next_scan {
+                self.schedule_resolution(map, resolve_stun);
+                return None;
+            }
         }
         let deadline = self.deadline?;
         if !self.probes.is_empty() && Instant::now() < deadline {
@@ -714,6 +769,48 @@ mod tests {
     }
 
     #[test]
+    fn pending_dns_does_not_block_the_reactor_and_late_results_are_revalidated() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let source = server.local_addr().unwrap();
+        let mut map = map(source);
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut stun = Stun::new();
+        let (started, waiting) = mpsc::sync_channel(1);
+        let (release, gate) = mpsc::sync_channel(1);
+        stun.schedule_resolution(&map, move |_| {
+            started.send(()).unwrap();
+            gate.recv().unwrap();
+            vec![(900, source)]
+        });
+        waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(stun.poll(&udp, &map).is_none());
+        assert!(stun.probes.is_empty());
+        // A map update can exclude the region before its DNS answer arrives.
+        let mut excluded = map.derp.region(900).unwrap().clone();
+        excluded.no_measure_no_home = true;
+        map.derp.insert(excluded).unwrap();
+        release.send(()).unwrap();
+        let end = Instant::now() + Duration::from_secs(1);
+        let discovery = loop {
+            if let Some(discovery) = stun.poll(&udp, &map) {
+                break discovery;
+            }
+            assert!(Instant::now() < end, "resolver did not finish");
+            std::thread::yield_now();
+        };
+        assert_eq!(discovery.region, 999);
+        assert!(discovery.reflexive.is_none());
+        server.set_nonblocking(true).unwrap();
+        assert_eq!(
+            server.recv_from(&mut [0; 64]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
     fn no_measure_no_home_region_is_neither_probed_nor_a_fallback_home() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         server.set_nonblocking(true).unwrap();
@@ -741,14 +838,23 @@ mod tests {
     #[test]
     fn standalone_stun_discovers_an_endpoint_without_becoming_home_derp() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let source = server.local_addr().unwrap();
-        let map = map(source);
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let map = map(server.local_addr().unwrap());
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut stun = Stun::new();
-        stun.start(&udp, &map);
-        let transaction = stun.probes[0].transaction;
-        assert!(stun.receive(&response(transaction), source));
-        let discovery = stun.poll(&udp, &map).unwrap();
+        udp.set_nonblocking(true).unwrap();
+        let responder = std::thread::spawn(move || {
+            let mut request = [0; 64];
+            let (len, source) = server.recv_from(&mut request).unwrap();
+            assert_eq!(len, tailfeather::stun::REQUEST_LEN);
+            assert_eq!(&request[24..32], b"tailnode");
+            server
+                .send_to(&response(request[8..20].try_into().unwrap()), source)
+                .unwrap();
+        });
+        let discovery = discover(&udp, &map);
+        responder.join().unwrap();
         assert_eq!(
             discovery.reflexive,
             Some("203.0.113.7:41641".parse().unwrap())

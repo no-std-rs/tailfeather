@@ -253,7 +253,10 @@ two independent filtering NAT routers in isolated namespaces inside a VM:
 | All UDP blocked, including STUN | Automatic DERP fallback serves a 310-second SSH session without reconnecting |
 | Endpoint-dependent NAT | STUN succeeds with a different mapping from peer UDP; SSH uses DERP |
 | Unavailable primary DERP and STUN | Retained backup services establish the connection and mapping |
-| Standalone STUN region before the relay region | It supplies endpoints but never becomes the home relay |
+| Excluded standalone STUN region before the relay region | `NoMeasureNoHome` keeps it unmeasured and out of home selection |
+
+Separate host-network and shared-selector regressions exercise a measurable
+standalone STUN region, including independent endpoint and home selection.
 
 Every exchange uses default `tailscale ssh`, verifies its control-provided host
 key, checks the actual greeting and echoed input, and requires client exit zero
