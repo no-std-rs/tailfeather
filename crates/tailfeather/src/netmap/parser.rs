@@ -24,7 +24,7 @@
 
 use crate::keys::{DiscoPublic, NodePublic};
 
-use crate::netmap::derp::{DEFAULT_DERP_PORT, DerpMap, DerpNode, DerpRegion};
+use crate::netmap::derp::{DEFAULT_DERP_PORT, DEFAULT_STUN_PORT, DerpMap, DerpNode, DerpRegion};
 use crate::netmap::dns::DnsConfig;
 use crate::netmap::peer::{Cidr, Cidr4, Peer, PeerTable};
 use crate::netmap::policy::{Destination, FilterRule, Network};
@@ -262,6 +262,7 @@ impl Pending {
 struct PendingRegion {
     id: u16,
     code: heapless::String<16>,
+    no_measure_no_home: bool,
     nodes: heapless::Vec<DerpNode, { crate::netmap::MAX_DERP_NODES }>,
     stun_fallback: Option<DerpNode>,
     node_host: heapless::String<{ crate::netmap::MAX_DERP_HOSTNAME }>,
@@ -313,6 +314,7 @@ impl PendingRegion {
         Self {
             id: 0,
             code: heapless::String::new(),
+            no_measure_no_home: false,
             nodes: heapless::Vec::new(),
             stun_fallback: None,
             node_host: heapless::String::new(),
@@ -479,7 +481,7 @@ impl State {
                 self.region.node_host.clear();
                 self.region.node_cert.clear();
                 self.region.node_port = DEFAULT_DERP_PORT;
-                self.region.node_stun = 0;
+                self.region.node_stun = DEFAULT_STUN_PORT;
                 self.region.node_flags = 0;
             }
             Context::PacketFilterArray => {
@@ -565,6 +567,7 @@ impl State {
                 let region = DerpRegion {
                     id: self.region.id,
                     code: self.region.code.clone(),
+                    no_measure_no_home: self.region.no_measure_no_home,
                     nodes: core::mem::take(&mut self.region.nodes),
                 };
                 if let Err(e) = netmap.derp.insert(region) {
@@ -977,13 +980,15 @@ impl State {
             },
             Context::DerpNode => match key {
                 "DERPPort" => match u16::try_from(value) {
-                    Ok(port) if port != 0 => self.region.node_port = port,
+                    Ok(0) => self.region.node_port = DEFAULT_DERP_PORT,
+                    Ok(port) => self.region.node_port = port,
                     _ => self.fail(Error::MalformedField(MalformedField::DerpPort)),
                 },
-                // Upstream uses -1 for nodes without STUN. It is not malformed;
-                // zero marks the node unusable for a latency/reflexive probe.
+                // Normalize upstream's default and disabled representations.
+                // The retained map uses zero only for a disabled endpoint.
                 "STUNPort" if value == -1 => self.region.node_stun = 0,
                 "STUNPort" => match u16::try_from(value) {
+                    Ok(0) => self.region.node_stun = DEFAULT_STUN_PORT,
                     Ok(port) => self.region.node_stun = port,
                     Err(_) => self.fail(Error::MalformedField(MalformedField::StunPort)),
                 },
@@ -1015,6 +1020,9 @@ impl State {
 
     fn on_bool<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>, value: bool) {
         match self.context() {
+            Context::DerpRegion if self.key == "NoMeasureNoHome" => {
+                self.region.no_measure_no_home = value;
+            }
             Context::PeerObject | Context::PatchObject if self.key == "Online" => {
                 self.pending.online = Some(value);
             }

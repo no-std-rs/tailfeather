@@ -23,6 +23,55 @@ pub enum Error {
     AddressFamily,
 }
 
+/// Independently select a reflexive endpoint and an eligible home relay.
+/// Standalone STUN servers can discover a mapping without becoming a home.
+#[derive(Debug, Default)]
+pub struct Selection {
+    home: u16,
+    home_latency: Option<u64>,
+    reflexive: Option<(u64, core::net::SocketAddrV4)>,
+}
+impl Selection {
+    /// Use the first eligible relay when no relay answers STUN.
+    pub fn new<const N: usize>(map: &crate::netmap::Netmap<N>) -> Self {
+        Self {
+            home: map
+                .derp
+                .iter()
+                .find(|r| r.can_be_home())
+                .map_or(0, |r| r.id),
+            ..Self::default()
+        }
+    }
+
+    /// Record an source- and transaction-matched STUN response.
+    pub fn record(
+        &mut self,
+        region: &crate::netmap::DerpRegion,
+        latency: u64,
+        endpoint: core::net::SocketAddrV4,
+    ) {
+        if region.no_measure_no_home {
+            return;
+        }
+        if self.reflexive.is_none_or(|best| latency < best.0) {
+            self.reflexive = Some((latency, endpoint));
+        }
+        if region.can_be_home() && self.home_latency.is_none_or(|best| latency < best) {
+            self.home = region.id;
+            self.home_latency = Some(latency);
+        }
+    }
+
+    pub fn home(&self) -> u16 {
+        self.home
+    }
+
+    pub fn reflexive(&self) -> Option<core::net::SocketAddrV4> {
+        self.reflexive.map(|(_, endpoint)| endpoint)
+    }
+}
+
 /// Encode a binding request with Tailscale's `tailnode` software marker.
 pub fn request(transaction: [u8; TRANSACTION_ID_LEN]) -> [u8; REQUEST_LEN] {
     let mut packet = [0; REQUEST_LEN];
@@ -81,22 +130,35 @@ pub fn response(
         }
         match kind {
             XOR_MAPPED_ADDRESS => {
-                if len != 8 {
-                    return Err(Error::Attribute);
-                }
-                if packet[value_start + 1] != 1 {
-                    return Err(Error::AddressFamily);
-                }
+                let family = *packet.get(value_start + 1).ok_or(Error::Attribute)?;
+                let address_len = match family {
+                    1 if len == 8 => 4,
+                    2 if len == 20 => 16,
+                    1 | 2 => return Err(Error::Attribute),
+                    _ => return Err(Error::AddressFamily),
+                };
                 let port = u16::from_be_bytes([
                     packet[value_start + 2] ^ cookie[0],
                     packet[value_start + 3] ^ cookie[1],
                 ]);
-                let address = [
-                    packet[value_start + 4] ^ cookie[0],
-                    packet[value_start + 5] ^ cookie[1],
-                    packet[value_start + 6] ^ cookie[2],
-                    packet[value_start + 7] ^ cookie[3],
-                ];
+                let mut decoded = [0; 16];
+                for index in 0..address_len {
+                    let mask = if index < 4 {
+                        cookie[index]
+                    } else {
+                        transaction[index - 4]
+                    };
+                    decoded[index] = packet[value_start + 4 + index] ^ mask;
+                }
+                let address = if address_len == 4 {
+                    decoded[..4].try_into().unwrap()
+                } else if decoded[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255] {
+                    // A dual-stack STUN listener can encode an IPv4 sender as
+                    // ::ffff:a.b.c.d. Upstream Unmap()s it before publication.
+                    decoded[12..].try_into().unwrap()
+                } else {
+                    return Err(Error::AddressFamily);
+                };
                 mapped = Some((address, port));
             }
             FINGERPRINT => {
@@ -131,6 +193,29 @@ fn crc32(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_stun_mapping_and_home_latency_are_independent() {
+        let mut map = crate::netmap::Netmap::<1>::new();
+        let mut parser = crate::netmap::Parser::new();
+        parser.push(&mut map, br#"{"DERPMap":{"Regions":{"900":{"Nodes":[{"HostName":"stun","STUNOnly":true}]},"998":{"NoMeasureNoHome":true,"Nodes":[{"HostName":"excluded"}]},"999":{"Nodes":[{"HostName":"relay","STUNPort":-1}]},"1000":{"Nodes":[{"HostName":"backup"}]}}}}"#).unwrap();
+        parser.finish(&mut map).unwrap();
+        let endpoint = core::net::SocketAddrV4::new([203, 0, 113, 7].into(), 41641);
+        let slower = core::net::SocketAddrV4::new([203, 0, 113, 8].into(), 41642);
+        let mut selection = Selection::new(&map);
+        assert_eq!(selection.home(), 999);
+        assert_eq!(selection.reflexive(), None);
+        let region = |id| map.derp.iter().find(|r| r.id == id).unwrap();
+        selection.record(region(998), 0, slower);
+        assert_eq!(selection.reflexive(), None);
+        selection.record(region(900), 1, endpoint);
+        assert_eq!(selection.home(), 999);
+        assert_eq!(selection.reflexive(), Some(endpoint));
+        selection.record(region(999), 10, slower);
+        selection.record(region(1000), 5, slower);
+        assert_eq!(selection.home(), 1000);
+        assert_eq!(selection.reflexive(), Some(endpoint));
+    }
 
     fn success(transaction: [u8; 12], address: [u8; 4], port: u16) -> [u8; 40] {
         let cookie = COOKIE.to_be_bytes();
@@ -182,6 +267,22 @@ mod tests {
             response(&packet[..32], transaction),
             Ok(([203, 0, 113, 7], 41_641))
         );
+    }
+
+    #[test]
+    fn upstream_dual_stack_listener_response_unmaps_ipv4() {
+        // tailscale/net/stun.Response with a dual-stack UDP sender address.
+        let packet = [
+            0x01, 0x01, 0x00, 0x18, 0x21, 0x12, 0xa4, 0x42, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09,
+            0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x00, 0x20, 0x00, 0x14, 0x00, 0x02, 0x83, 0xbb,
+            0x21, 0x12, 0xa4, 0x42, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0xf6, 0xf6, 0xc2, 0x09,
+            0x78, 0x0e,
+        ];
+        assert_eq!(response(&packet, [9; 12]), Ok(([203, 0, 113, 7], 41641)));
+        assert_eq!(response(&packet, [8; 12]), Err(Error::Transaction));
+        let mut native_v6 = packet;
+        native_v6[28] ^= 1;
+        assert_eq!(response(&native_v6, [9; 12]), Err(Error::AddressFamily));
     }
 
     #[test]

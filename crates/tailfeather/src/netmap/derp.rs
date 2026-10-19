@@ -10,6 +10,8 @@ use crate::netmap::{CapacityError, Error, MAX_DERP_HOSTNAME, MAX_DERP_NODES, MAX
 
 /// The port a DERP node listens on when it does not say otherwise.
 pub const DEFAULT_DERP_PORT: u16 = 443;
+/// Upstream uses this port when STUNPort is omitted or zero; -1 disables it.
+pub const DEFAULT_STUN_PORT: u16 = 3478;
 /// Distinct certificate-name overrides retained across the DERP map. Most
 /// relays either omit `CertName` or repeat `HostName`, so only exceptions use
 /// this bounded table.
@@ -61,7 +63,18 @@ impl DerpCertName {
 pub struct DerpRegion {
     pub id: u16,
     pub code: heapless::String<16>,
+    /// Exclude from measurement and home selection, but allow peer-directed
+    /// connections when a peer advertises this region as its home.
+    pub no_measure_no_home: bool,
     pub nodes: heapless::Vec<DerpNode, MAX_DERP_NODES>,
+}
+
+impl DerpRegion {
+    /// Whether this region can be selected as our home or compatibility relay.
+    /// A peer may still explicitly name a NoMeasureNoHome region as its home.
+    pub fn can_be_home(&self) -> bool {
+        !self.no_measure_no_home && self.nodes.iter().any(|node| node.port != 0)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -161,6 +174,7 @@ mod tests {
         DerpRegion {
             id,
             code: heapless::String::try_from("lab").unwrap(),
+            no_measure_no_home: false,
             nodes: heapless::Vec::new(),
         }
     }

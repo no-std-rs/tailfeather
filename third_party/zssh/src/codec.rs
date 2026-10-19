@@ -225,6 +225,10 @@ impl<H: Digest> ObjectHasher<H> {
     }
 
     pub fn hash_mpint(&mut self, value: &[u8]) {
+        // Canonical positive mpints omit redundant leading zeros, retaining a
+        // single sign byte when the first significant byte has its high bit set.
+        let offset = value.iter().position(|&b| b != 0).unwrap_or(value.len());
+        let value = &value[offset..];
         if value.is_empty() {
             self.hash_uint32(0);
         } else if value[0] & 0x80 != 0 {
@@ -232,9 +236,8 @@ impl<H: Digest> ObjectHasher<H> {
             self.hash_byte(0x00);
             self.hash_byte_array(value);
         } else {
-            let offset = value.iter().position(|&b| b != 0).unwrap_or(0);
-            self.hash_uint32(into_u32(value.len() - offset));
-            self.hash_byte_array(&value[offset..]);
+            self.hash_uint32(into_u32(value.len()));
+            self.hash_byte_array(value);
         }
     }
 
@@ -252,5 +255,32 @@ impl<H: Digest> ObjectHasher<H> {
 
     pub fn into_digest(self) -> Output<H> {
         self.hasher.finalize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::Sha256;
+
+    #[test]
+    fn positive_mpints_use_canonical_ssh_encoding() {
+        // Independent wire encodings, including shared secrets whose leading
+        // zero previously caused an incorrect SSH exchange signature.
+        for (value, encoded) in [
+            (&b""[..], &b"\x00\x00\x00\x00"[..]),
+            (&b"\x00\x00"[..], &b"\x00\x00\x00\x00"[..]),
+            (&b"\x00\x7f"[..], &b"\x00\x00\x00\x01\x7f"[..]),
+            (&b"\x80"[..], &b"\x00\x00\x00\x02\x00\x80"[..]),
+            (&b"\x00\x80"[..], &b"\x00\x00\x00\x02\x00\x80"[..]),
+            (
+                &b"\x00\x00\xff\x01"[..],
+                &b"\x00\x00\x00\x03\x00\xff\x01"[..],
+            ),
+        ] {
+            let mut hasher = ObjectHasher::new(Sha256::new());
+            hasher.hash_mpint(value);
+            assert_eq!(hasher.into_digest(), Sha256::digest(encoded));
+        }
     }
 }

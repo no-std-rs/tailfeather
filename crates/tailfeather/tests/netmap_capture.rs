@@ -414,6 +414,42 @@ fn derp_regions_keep_two_relay_capable_nodes_and_skip_stun_only_entries() {
 }
 
 #[test]
+fn derp_no_measure_no_home_is_retained_and_resets_between_regions() {
+    let mut netmap = Netmap::<32>::new();
+    apply(
+        &mut netmap,
+        r#"{"DERPMap":{"Regions":{"1":{"NoMeasureNoHome":true,"Nodes":[{"HostName":"peer-only.example"}]},"2":{"Nodes":[{"HostName":"home.example"}]},"3":{"NoMeasureNoHome":false,"Nodes":[]}}}}"#,
+        1,
+    );
+    assert!(netmap.derp.region(1).unwrap().no_measure_no_home);
+    assert!(!netmap.derp.region(2).unwrap().no_measure_no_home);
+    assert!(!netmap.derp.region(3).unwrap().no_measure_no_home);
+    apply(
+        &mut netmap,
+        r#"{"DERPMap":{"Regions":{"1":{"Nodes":[{"HostName":"home-now.example"}]}}}}"#,
+        1,
+    );
+    assert!(!netmap.derp.region(1).unwrap().no_measure_no_home);
+}
+
+#[test]
+fn derp_and_stun_ports_follow_upstream_defaults() {
+    for ports in ["", ",\"DERPPort\":0,\"STUNPort\":0"] {
+        let mut netmap = Netmap::<32>::new();
+        apply(
+            &mut netmap,
+            &format!(
+                r#"{{"DERPMap":{{"Regions":{{"9":{{"Nodes":[{{"HostName":"relay.example"{ports}}}]}}}}}}}}"#
+            ),
+            1,
+        );
+        let node = &netmap.derp.region(9).unwrap().nodes[0];
+        assert_eq!(node.port, 443);
+        assert_eq!(node.stun_port, 3478);
+    }
+}
+
+#[test]
 fn derp_hostnames_keep_the_previously_supported_capacity() {
     let mut netmap = Netmap::<32>::new();
     let hostname = "relay-with-a-custom-deployment-name.example.test";
@@ -463,7 +499,7 @@ fn a_stun_only_node_is_retained_when_relays_offer_no_stun_endpoint() {
     let mut netmap = Netmap::<32>::new();
     apply(
         &mut netmap,
-        r#"{"DERPMap":{"Regions":{"9":{"RegionID":9,"RegionCode":"test","Nodes":[{"HostName":"relay.example","DERPPort":443},{"HostName":"backup.example","DERPPort":444},{"HostName":"stun.example","STUNPort":3478,"STUNOnly":true}]}}}}"#,
+        r#"{"DERPMap":{"Regions":{"9":{"RegionID":9,"RegionCode":"test","Nodes":[{"HostName":"relay.example","DERPPort":443,"STUNPort":-1},{"HostName":"backup.example","DERPPort":444,"STUNPort":-1},{"HostName":"stun.example","STUNPort":3478,"STUNOnly":true}]}}}}"#,
         32,
     );
     let region = netmap.derp.region(9).unwrap();
