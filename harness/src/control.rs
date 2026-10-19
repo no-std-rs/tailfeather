@@ -296,9 +296,9 @@ async fn handshake<'r>(
     let request = upgrade::write_upgrade_request(host, &initiation[..len], &mut request)?;
     stream.write_all(request).await?;
 
-    // Read until the blank line. The Noise response may already be in the same
-    // segment, which is why the parser reports where the headers ended instead
-    // of consuming everything it was handed.
+    // Stop exactly at the blank line. A speculative read can also consume the
+    // Noise response and encrypted early records; retaining only the 51-byte
+    // response would discard those records and lose the record nonce sequence.
     let mut buffer = [0u8; HTTP_BUFFER];
     let mut filled = 0;
     let parsed = loop {
@@ -307,7 +307,7 @@ async fn handshake<'r>(
             Err(tailfeather::noise::Error::Incomplete) => {}
             Err(e) => return Err(e.into()),
         }
-        let n = stream.read(&mut buffer[filled..]).await?;
+        let n = stream.read(&mut buffer[filled..filled + 1]).await?;
         filled += n;
         if filled == buffer.len() {
             return Err(ControlError::ResponseTooLong);

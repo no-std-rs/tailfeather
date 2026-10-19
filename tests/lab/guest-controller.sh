@@ -169,5 +169,11 @@ timeout 30 /opt/lab/interop-wireguard.sh harness-rekey /opt/lab/harness >"$STATE
 echo "guest-controller: running no-std WireGuard interop"
 timeout 180 "$CONFORMANCE_ROOT/scripts/nostd-interop.sh" /opt/lab/harness >"$STATE/nostd-interop.log" 2>&1
 
+for mode in nat udp-blocked hard-nat; do
+    echo "guest-controller: running SSH network acceptance ($mode)"
+    timeout 220 bash /opt/lab/ssh-network.sh /opt/lab/headscale /opt/lab/tailscale /opt/lab/tailscaled \
+        /opt/lab/ssh-server /opt/lab/headscale.yaml "$mode" >"$STATE/ssh-network-$mode.log" 2>&1
+done
+
 trap - EXIT HUP INT TERM
 diagnostics

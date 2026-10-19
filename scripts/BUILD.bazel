@@ -29,6 +29,14 @@ krunfw_kernel(
         "-e", "NF_TABLES_IPV4",
         "-e", "NETFILTER_XTABLES",
         "-e", "NFT_COMPAT",
+        # Separate filtering NATs for real Tailscale SSH hole-punch/fallback tests.
+        "-e", "BRIDGE",
+        "-e", "NF_CONNTRACK",
+        "-e", "NF_NAT",
+        "-e", "NFT_CT",
+        "-e", "NFT_NAT",
+        "-e", "NETFILTER_XT_MATCH_CONNTRACK",
+        "-e", "NETFILTER_XT_NAT",
         "-e", "NETFILTER_XT_MARK",
         "-e", "NETFILTER_XT_MATCH_U32",
         # The uprobe E2E reuses this artifact and requires writable tracefs.

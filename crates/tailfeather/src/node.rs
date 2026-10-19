@@ -1047,6 +1047,15 @@ impl<const PEERS: usize> Node<PEERS> {
         } else {
             path.relay_region.unwrap_or(0)
         };
+        self.route_relay(key, region, packet)
+    }
+
+    fn route_relay(
+        &mut self,
+        key: NodePublic,
+        region: u16,
+        packet: &[u8],
+    ) -> Result<NodeAction, NodeError> {
         if region == 0 {
             return Err(NodeError::NoPath);
         }
@@ -1161,8 +1170,52 @@ impl<const PEERS: usize> Node<PEERS> {
         Ok(())
     }
 
+    /// Ask an authenticated peer to probe our current endpoints. CallMeMaybe
+    /// travels only over DERP so both NATs can open their outbound mappings.
+    /// The platform supplies the same endpoints it published to control.
+    pub fn call_me_maybe(
+        &mut self,
+        peer: &NodePublic,
+        endpoints: &[SocketAddr],
+        rng: &mut impl crate::disco::packet::Rng,
+    ) -> Result<Option<NodeAction>, NodeError> {
+        if !self.direct_paths || endpoints.is_empty() {
+            return Ok(None);
+        }
+        let path = self
+            .paths
+            .iter()
+            .find(|path| &path.key == peer)
+            .ok_or(NodeError::UnknownPeer)?;
+        let disco = path.disco.ok_or(NodeError::InvalidState)?;
+        let region = path.relay_region.unwrap_or(path.home_derp);
+        let mut candidates = Vec::new();
+        for endpoint in endpoints {
+            candidates
+                .push(*endpoint)
+                .map_err(|_| NodeError::Capacity)?;
+        }
+        let message = crate::disco::Message::CallMeMaybe(crate::disco::CallMeMaybe {
+            endpoints: candidates,
+        });
+        let mut plaintext = [0; crate::disco::MAX_PACKET];
+        let len = message.encode(&mut plaintext)?;
+        let mut packet = [0; crate::disco::MAX_PACKET];
+        let len = crate::disco::seal(
+            &self.identity.disco,
+            &self.identity.disco.public(),
+            &disco,
+            &plaintext[..len],
+            rng,
+            &mut packet,
+        )?;
+        self.route_relay(*peer, region, &packet[..len]).map(Some)
+    }
+
     /// Emit at most one authenticated direct-path probe. Three unanswered
-    /// attempts bound discovery before the existing DERP fallback takes over.
+    /// attempts bound each discovery round before DERP fallback takes over.
+    /// Peers observed on a relay get a fresh round after a ten-second pause,
+    /// allowing a previously blocked or expired NAT mapping to recover.
     pub fn poll_disco(
         &mut self,
         now_ms: u64,
@@ -1170,6 +1223,17 @@ impl<const PEERS: usize> Node<PEERS> {
     ) -> Result<Option<NodeAction>, NodeError> {
         if !self.direct_paths {
             return Ok(None);
+        }
+        for path in &mut self.paths {
+            if !path.direct_healthy
+                && path.relay_region.is_some()
+                && !path.advertised.is_empty()
+                && usize::from(path.disco_attempts) >= path.advertised.len().saturating_mul(3)
+                && now_ms >= path.disco_deadline_ms.saturating_add(10_000)
+            {
+                path.disco_attempts = 0;
+                path.disco_tx = None;
+            }
         }
         let Some(index) = self.paths.iter().position(|path| {
             !path.direct_healthy
@@ -2962,6 +3026,98 @@ mod tests {
             _ => unreachable!(),
         };
         node.persistence_result(generation, true).unwrap();
+    }
+
+    #[test]
+    fn outbound_call_me_maybe_uses_the_peer_relay_and_current_endpoints() {
+        let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+        persisted(&mut node);
+        let key = NodePrivate::from_bytes([77; 32]).public();
+        let disco = DiscoPrivate::from_bytes([88; 32]);
+        let mut lease = Netmap::new();
+        let mut peer = Peer::new(7, key);
+        peer.disco_key = Some(disco.public());
+        peer.home_derp = 9;
+        lease.peers.upsert(peer).unwrap();
+        lease.derp.insert(relay_region(9)).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        let endpoints = ["198.51.100.20:50123".parse().unwrap()];
+        assert!(matches!(
+            node.call_me_maybe(&key, &endpoints, &mut Counter(20))
+                .unwrap(),
+            Some(NodeAction::Derp(DerpCommand::Connect { region: 9, .. }))
+        ));
+        let Some(NodeAction::Derp(DerpCommand::Send {
+            region,
+            peer,
+            packet,
+        })) = node
+            .handle_derp_event(DerpEvent::Connected { region: 9 }, 0, &mut Counter(21))
+            .unwrap()
+        else {
+            panic!("CallMeMaybe must use DERP");
+        };
+        assert_eq!(region, 9);
+        assert_eq!(peer, key);
+        let mut plaintext = [0; crate::disco::MAX_PACKET];
+        let opened = crate::disco::open(
+            &disco,
+            &node.identity.disco.public(),
+            packet.as_slice(),
+            &mut plaintext,
+        )
+        .unwrap();
+        let crate::disco::Message::CallMeMaybe(call) =
+            crate::disco::Message::decode(&plaintext[..opened.len]).unwrap()
+        else {
+            panic!("wrong disco message");
+        };
+        assert_eq!(call.endpoints.as_slice(), &endpoints);
+        node.set_direct_paths(false);
+        assert!(
+            node.call_me_maybe(&key, &endpoints, &mut Counter(21))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exhausted_direct_probes_restart_for_a_peer_seen_on_a_relay() {
+        let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+        persisted(&mut node);
+        let key = NodePrivate::from_bytes([77; 32]).public();
+        let mut peer = Peer::new(7, key);
+        peer.disco_key = Some(DiscoPrivate::from_bytes([88; 32]).public());
+        peer.home_derp = 9;
+        peer.endpoints
+            .push("198.51.100.20:50123".parse().unwrap())
+            .unwrap();
+        let mut lease = Netmap::new();
+        lease.peers.upsert(peer).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        for now in [0, 1000, 2000] {
+            assert!(matches!(
+                node.poll_disco(now, &mut Counter(20)).unwrap(),
+                Some(NodeAction::DirectTransmit { .. })
+            ));
+        }
+        assert!(node.poll_disco(3000, &mut Counter(21)).unwrap().is_none());
+        // Inactive peers do not get an unbounded background probe loop.
+        assert!(node.poll_disco(12_999, &mut Counter(21)).unwrap().is_none());
+        node.observe_relay(key, 9).unwrap();
+        assert!(node.poll_disco(12_999, &mut Counter(21)).unwrap().is_none());
+        assert!(matches!(
+            node.poll_disco(13_000, &mut Counter(22)).unwrap(),
+            Some(NodeAction::DirectTransmit { .. })
+        ));
     }
 
     #[test]

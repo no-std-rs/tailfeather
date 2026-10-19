@@ -81,22 +81,35 @@ pub fn response(
         }
         match kind {
             XOR_MAPPED_ADDRESS => {
-                if len != 8 {
-                    return Err(Error::Attribute);
-                }
-                if packet[value_start + 1] != 1 {
-                    return Err(Error::AddressFamily);
-                }
+                let family = *packet.get(value_start + 1).ok_or(Error::Attribute)?;
+                let address_len = match family {
+                    1 if len == 8 => 4,
+                    2 if len == 20 => 16,
+                    1 | 2 => return Err(Error::Attribute),
+                    _ => return Err(Error::AddressFamily),
+                };
                 let port = u16::from_be_bytes([
                     packet[value_start + 2] ^ cookie[0],
                     packet[value_start + 3] ^ cookie[1],
                 ]);
-                let address = [
-                    packet[value_start + 4] ^ cookie[0],
-                    packet[value_start + 5] ^ cookie[1],
-                    packet[value_start + 6] ^ cookie[2],
-                    packet[value_start + 7] ^ cookie[3],
-                ];
+                let mut decoded = [0; 16];
+                for index in 0..address_len {
+                    let mask = if index < 4 {
+                        cookie[index]
+                    } else {
+                        transaction[index - 4]
+                    };
+                    decoded[index] = packet[value_start + 4 + index] ^ mask;
+                }
+                let address = if address_len == 4 {
+                    decoded[..4].try_into().unwrap()
+                } else if decoded[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255] {
+                    // A dual-stack STUN listener can encode an IPv4 sender as
+                    // ::ffff:a.b.c.d. Upstream Unmap()s it before publication.
+                    decoded[12..].try_into().unwrap()
+                } else {
+                    return Err(Error::AddressFamily);
+                };
                 mapped = Some((address, port));
             }
             FINGERPRINT => {
@@ -182,6 +195,22 @@ mod tests {
             response(&packet[..32], transaction),
             Ok(([203, 0, 113, 7], 41_641))
         );
+    }
+
+    #[test]
+    fn upstream_dual_stack_listener_response_unmaps_ipv4() {
+        // tailscale/net/stun.Response with a dual-stack UDP sender address.
+        let packet = [
+            0x01, 0x01, 0x00, 0x18, 0x21, 0x12, 0xa4, 0x42, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09,
+            0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x00, 0x20, 0x00, 0x14, 0x00, 0x02, 0x83, 0xbb,
+            0x21, 0x12, 0xa4, 0x42, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0xf6, 0xf6, 0xc2, 0x09,
+            0x78, 0x0e,
+        ];
+        assert_eq!(response(&packet, [9; 12]), Ok(([203, 0, 113, 7], 41641)));
+        assert_eq!(response(&packet, [8; 12]), Err(Error::Transaction));
+        let mut native_v6 = packet;
+        native_v6[28] ^= 1;
+        assert_eq!(response(&native_v6, [9; 12]), Err(Error::AddressFamily));
     }
 
     #[test]

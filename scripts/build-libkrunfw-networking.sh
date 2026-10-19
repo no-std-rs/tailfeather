@@ -154,7 +154,8 @@ KBUILD_TOOLS=(
 )
 
 make -C "$KERNEL" "${KBUILD_TOOLS[@]}" olddefconfig
-for option in BPF_EVENTS DEBUG_FS FTRACE KPROBES TRACING UPROBE_EVENTS; do
+for option in BPF_EVENTS DEBUG_FS FTRACE KPROBES TRACING UPROBE_EVENTS \
+    BRIDGE NF_CONNTRACK NF_NAT NFT_CT NFT_NAT NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_NAT; do
     grep -qx "CONFIG_${option}=y" "$KERNEL/.config" || {
         echo "libkrunfw networking kernel is missing CONFIG_${option}=y" >&2
         exit 1

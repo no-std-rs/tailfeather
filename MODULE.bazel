@@ -190,6 +190,12 @@ http_file(name = "apk_openssl", downloaded_file_path = "openssl-3.3.7-r2.apk", s
 http_file(name = "apk_readline", downloaded_file_path = "readline-8.2.13-r0.apk", sha256 = "fa4ff2347886f5516d021b9064a00259b29fc6e2608eac5588a339de244acf12", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/readline-8.2.13-r0.apk"])
 http_file(name = "apk_socat", downloaded_file_path = "socat-1.8.1.3-r0.apk", sha256 = "01652284adced99e2f8fe74d24746c176ba50fce1a507a08f4fbe3c95c41c22e", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/socat-1.8.1.3-r0.apk"])
 
+# Stock OpenSSH for the offline NAT/DERP SSH acceptance lab.
+http_file(name = "apk_openssh_client_default", downloaded_file_path = "openssh-client-default-9.9_p2-r0.apk", sha256 = "1280bc7be47f88342880cda6270a4b736f9daab2eab9d2b0bce8826589b39e2d", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/openssh-client-default-9.9_p2-r0.apk"])
+http_file(name = "apk_openssh_client_common", downloaded_file_path = "openssh-client-common-9.9_p2-r0.apk", sha256 = "0f2d8bad8eff07e282c42e52bfd15602094b7f1bced21127685f1bcc231aba76", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/openssh-client-common-9.9_p2-r0.apk"])
+http_file(name = "apk_openssh_keygen", downloaded_file_path = "openssh-keygen-9.9_p2-r0.apk", sha256 = "a0bdfc8424a9346c22bfc0f9c9fa15471bb10147b1cea5d9559f116eca70d9d3", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/openssh-keygen-9.9_p2-r0.apk"])
+http_file(name = "apk_libedit", downloaded_file_path = "libedit-20240808.3.1-r0.apk", sha256 = "975bd0133e92a3df828adabd4bf6654fa7d1a05727963dd4dfcdcf0ed8fbe20e", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libedit-20240808.3.1-r0.apk"])
+
 http_file(
     name = "libkrunfw_source",
     downloaded_file_path = "libkrunfw-v5.5.0.tar.gz",
