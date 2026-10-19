@@ -669,7 +669,7 @@ async fn bootstrap<'a>(
             .netmap()
             .derp
             .iter()
-            .find(|region| region.nodes.iter().any(|node| node.port != 0))
+            .find(|region| region.can_be_home())
             .map(|region| region.id);
         if node.netmap().home_derp == 0
             && let Some(region) = fallback
