@@ -7,6 +7,7 @@ const program = workflow().releasePlease();
 const crates = ["wirefeather", "tailfeather", "tailfeather-gateway"];
 
 export function configure(): void {
+  configuration.titlePolicy();
   program.configure();
   configuration.workflow("crate-publishing", ["workflow_run", "runnerless_completion"]);
 }
