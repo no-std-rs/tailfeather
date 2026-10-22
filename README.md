@@ -86,3 +86,7 @@ and [`tailfeather-main` prerelease](https://github.com/no-std-rs/tailfeather/rel
 follow tested main builds and Tailfeather release PRs.
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+
+Native applications can embed the rootless Windows, macOS and Linux
+[Tailfeather hosted runtime](hosted/README.md), including ephemeral sessions,
+private-CA Headscale control and userspace TCP without an OS VPN service.

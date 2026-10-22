@@ -1,0 +1,26 @@
+name: Hosted runtime
+on:
+  pull_request:
+    paths: ['hosted/**', 'crates/tailfeather/**', 'crates/wirefeather/**', '.github/workflows/hosted.yml']
+  push:
+    branches: [main]
+    paths: ['hosted/**', 'crates/tailfeather/**', 'crates/wirefeather/**', '.github/workflows/hosted.yml']
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --manifest-path hosted/Cargo.toml --check
+      - run: cargo test --manifest-path hosted/Cargo.toml --locked
+      - run: cargo clippy --manifest-path hosted/Cargo.toml --locked --all-targets -- -D warnings
+      - if: runner.os == 'Linux'
+        run: cargo test --locked -p tailfeather control::register
