@@ -87,6 +87,7 @@ pub struct NetStack {
     iface: Option<Interface>,
     pub sockets: SocketSet<'static>,
     address: Option<Ipv4Addr>,
+    pub close_failed: bool,
 }
 
 impl NetStack {
@@ -97,6 +98,7 @@ impl NetStack {
             iface: None,
             sockets: SocketSet::new(Vec::new()),
             address: None,
+            close_failed: false,
         }
     }
 
@@ -192,6 +194,12 @@ impl NetStack {
         })
     }
 
+    pub fn drained(&self) -> bool {
+        self.sockets.iter().all(|(_, socket)| {
+            let smoltcp::socket::Socket::Tcp(socket) = socket;
+            socket.state() == tcp::State::Listen
+        })
+    }
     pub fn remote_addresses(&self) -> Vec<Ipv4Addr> {
         self.sockets
             .iter()

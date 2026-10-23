@@ -46,7 +46,10 @@ Dropping the last client shuts down the node. Dropping a listener stops new
 acceptance. This adapter exposes IPv4 TCP, not system-wide networking or UDP
 application sockets. Peer capacity follows the core's 32-peer limit.
 TCP write shutdown preserves the response reader. Fully dropped streams release
-half-closed sockets within one second, including when the peer never sends FIN.
+half-closed sockets after acknowledging queued data and FIN, with bounded close
+deadlines even when the peer stops responding. Call `Client::drain().await` after
+dropping application streams and before dropping the client to retain final writes.
+Drain returns an error if a close fails or its 15-second deadline expires.
 Directional ACLs govern incoming connection attempts; TCP continuation packets
 still require cryptokey source validation and the TCP stack's sequence checks.
 

@@ -50,10 +50,19 @@ fn main() {
         }).await.unwrap();
         assert_eq!(payload,received);
         println!("PASS: 1 MiB {mode} transfer in {:?}",transferred.elapsed());
+        from.write_all(b"final-write").await.unwrap();
+        drop(from);
+        client.drain().await.unwrap();
+        drop(client);
+        let mut final_bytes=[0;11];
+        tokio::time::timeout(Duration::from_secs(5),to.read_exact(&mut final_bytes)).await.unwrap().unwrap();
+        assert_eq!(&final_bytes,b"final-write");
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5),to.read(&mut final_bytes)).await.unwrap().unwrap(),0);
+        println!("PASS: final bytes and FIN drain before the client node shuts down");
         if std::env::args().any(|arg|arg=="--offline-direct") {
             println!("PASS: direct TCP works with control and DERP offline");return;
         }
-        drop(from);drop(to);drop(listener);drop(client);drop(server);
+        drop(to);drop(listener);drop(server);
         let client=Client::start(config(&root,"hosted-client",String::new())).unwrap();
         assert_eq!(tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap(),client_ip);
         println!("PASS: session identity reconnects without an auth key and keeps its address");

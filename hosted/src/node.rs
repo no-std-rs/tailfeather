@@ -621,6 +621,7 @@ async fn packets(
     let net = std::rc::Rc::new(RefCell::new(crate::netstack::NetStack::new(1)));
     let mut local_port = 49152u16;
     let mut outgoing = VecDeque::new();
+    let mut drain: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>> = None;
     let mut punches: Vec<(tailfeather::keys::NodePublic, u64, u8)> = Vec::new();
     let mut candidate_generation = node.candidate_generation.get();
     let mut listeners: Vec<(
@@ -798,10 +799,25 @@ async fn packets(
             actions,
             node.borrow_mut().poll_tunnel_timers(now).ok().flatten(),
         );
+        if drain.as_ref().is_some_and(|reply| reply.is_closed()) {
+            drain.take();
+        }
+        if drain.is_some() && net.borrow().drained() {
+            let failed = std::mem::take(&mut net.borrow_mut().close_failed);
+            let _ = drain.take().unwrap().send(if failed {
+                Err(std::io::Error::other("TCP close was not acknowledged"))
+            } else {
+                Ok(())
+            });
+        }
         tokio::select! {
             _=actions.ready.notified()=>{},
             received=udp.recv_from(&mut datagram)=>{let (len,from)=received.map_err(|_|"UDP receive")?;if node.receive_stun(&datagram[..len],from){continue;}enqueue(actions,node.borrow_mut().handle_direct_from(&datagram[..len],from.into(),reactor.clock_millis(),&mut OsRng).ok().flatten());}
             command=commands.recv()=>match command {
+                Some(crate::Command::Drain { reply }) => {
+                    if drain.as_ref().is_some_and(|reply| !reply.is_closed()) { let _ = reply.send(Err(std::io::Error::other("TCP drain already pending"))); }
+                    else { drain=Some(reply); }
+                }
                 Some(crate::Command::Connect {address,port,reply})=>{
                     if let Some(own)=status.borrow().address {net.borrow_mut().set_address(own,reactor.clock_millis(),seed);}
                     let result=net.borrow_mut().connect(address,port,local_port);

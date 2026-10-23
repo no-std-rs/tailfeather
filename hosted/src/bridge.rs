@@ -136,11 +136,38 @@ async fn bridge(runtime: Shared, handle: TcpHandle, stream: DuplexStream) {
             let _ = to_ssh.shutdown().await;
         }
     };
-    tokio::select! {
-        _ = async { tokio::join!(outbound, inbound); } => {},
-        _ = abandoned.notified() => {},
-    }
-    runtime.borrow_mut().remove(handle);
+    let copying = async {
+        tokio::join!(outbound, inbound);
+    };
+    tokio::pin!(copying);
+    let copied = tokio::select! {
+        _ = &mut copying => true,
+        _ = abandoned.notified() => tokio::time::timeout(std::time::Duration::from_secs(5), &mut copying).await.is_ok(),
+    };
+    // Keep queued bytes and FIN alive until the peer acknowledges them. Removing
+    // the socket immediately can discard the final SSH disconnect message.
+    let closed = copied
+        && tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let done = runtime.borrow_mut().tcp(handle).is_none_or(|socket| {
+                    matches!(
+                        socket.state(),
+                        smoltcp::socket::tcp::State::Closed
+                            | smoltcp::socket::tcp::State::FinWait2
+                            | smoltcp::socket::tcp::State::TimeWait
+                    ) && socket.send_queue() == 0
+                });
+                if done {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+    let mut net = runtime.borrow_mut();
+    net.close_failed |= !closed;
+    net.remove(handle);
 }
 
 #[cfg(test)]

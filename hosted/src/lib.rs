@@ -35,6 +35,9 @@ pub struct Status {
     pub error: Option<&'static str>,
 }
 enum Command {
+    Drain {
+        reply: oneshot::Sender<io::Result<()>>,
+    },
     Connect {
         address: Ipv4Addr,
         port: u16,
@@ -182,6 +185,26 @@ impl Client {
             .await
             .map_err(|_| io::Error::other("node stopped"))??;
         Ok(Listener { receiver })
+    }
+    /// After dropping streams, wait for their final bytes and FINs to be
+    /// acknowledged before dropping this client. Stop creating connections
+    /// while draining. A failed close or a 15-second deadline returns an error.
+    pub async fn drain(&self) -> io::Result<()> {
+        let (reply, received) = oneshot::channel();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            self.inner
+                .commands
+                .as_ref()
+                .expect("live client sender")
+                .send(Command::Drain { reply })
+                .await
+                .map_err(|_| io::Error::other("node stopped"))?;
+            received
+                .await
+                .map_err(|_| io::Error::other("node stopped"))?
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP drain deadline"))?
     }
     /// TCP is carried inside WireGuard and follows the coordinator's policy.
     pub async fn connect(&self, address: Ipv4Addr, port: u16) -> io::Result<DuplexStream> {
