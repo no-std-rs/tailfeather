@@ -102,7 +102,7 @@ impl Client {
         let (shutdown, stopped) = oneshot::channel();
         let worker = std::thread::Builder::new()
             .name("tailfeather".into())
-            .stack_size(8 * 1024 * 1024)
+            .stack_size(WORKER_STACK)
             .spawn(move || {
                 let _lock = lock;
                 match tokio::runtime::Builder::new_current_thread()
@@ -270,6 +270,18 @@ rng!(tailfeather::keys::Rng);
 rng!(tailfeather::tunnel::Rng);
 rng!(tailfeather::disco::packet::Rng);
 rng!(tailfeather::derp::client::Rng);
+
+// Netmaps and their staging copies remain fixed-size, including in debug builds.
+const WORKER_STACK: usize = 64 * 1024 * 1024;
+#[cfg(test)]
+fn on_worker_stack(test: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
+        .spawn(test)
+        .unwrap()
+        .join()
+        .unwrap();
+}
 
 #[cfg(test)]
 mod loopback_tests;
