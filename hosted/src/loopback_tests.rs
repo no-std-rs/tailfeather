@@ -163,7 +163,15 @@ impl Side {
                     self.node.netmap().peers.iter(),
                     own
                 ));
-                self.net.deliver(packet.as_slice());
+                if self
+                    .node
+                    .netmap()
+                    .packet_filter
+                    .allows_ipv4(packet.as_slice())
+                    || logic::tcp_continuation(packet.as_slice())
+                {
+                    self.net.deliver(packet.as_slice());
+                }
             }
             NodeAction::Derp(DerpCommand::Disconnect { .. })
             | NodeAction::Control(_)
@@ -237,8 +245,14 @@ fn tcp_crosses_relay_only_wireguard_from_a_cold_start() {
     let mut rng = Counter(42);
     let mut browser = Side::new(1, &mut rng);
     let mut server = Side::new(2, &mut rng);
-    browser.apply(netmap("100.64.0.1/32", server.key, "100.64.0.2/32"), 0, 11);
-    server.apply(netmap("100.64.0.2/32", browser.key, "100.64.0.1/32"), 0, 12);
+    let mut client_map = netmap("100.64.0.1/32", server.key, "100.64.0.2/32");
+    let mut server_map = netmap("100.64.0.2/32", browser.key, "100.64.0.1/32");
+    tailfeather::netmap::Parser::new()
+        .push(&mut client_map, br#"{"PacketFilter":[]}"#)
+        .unwrap();
+    tailfeather::netmap::Parser::new().push(&mut server_map, br#"{"PacketFilter":[{"SrcIPs":["100.64.0.1"],"DstPorts":[{"IP":"100.64.0.2","Ports":{"First":22,"Last":22}}]}]}"#).unwrap();
+    browser.apply(client_map, 0, 11);
+    server.apply(server_map, 0, 12);
 
     let mut listener = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0; 4096]),

@@ -71,6 +71,23 @@ pub fn inbound_allowed<'a>(
     destination == own && route_ipv4(peers, source) == Some(*sender)
 }
 
+/// TCP continuation packets cannot initiate a new session. As in Tailscale's
+/// ingress filter, let the TCP stack validate their established connection and
+/// sequence state; only an initial SYN needs the directional ACL rule.
+pub fn tcp_continuation(bytes: &[u8]) -> bool {
+    use smoltcp::wire::{IpProtocol, Ipv4Packet, TcpPacket};
+    let Ok(ip) = Ipv4Packet::new_checked(bytes) else {
+        return false;
+    };
+    if ip.next_header() != IpProtocol::Tcp || ip.more_frags() || ip.frag_offset() != 0 {
+        return false;
+    }
+    let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
+        return false;
+    };
+    !tcp.syn() || tcp.ack()
+}
+
 /// The next TAI64N timestamp for a WireGuard initiation.
 ///
 /// Responders reject an initiation whose timestamp is not strictly newer than

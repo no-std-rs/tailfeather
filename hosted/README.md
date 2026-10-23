@@ -42,6 +42,10 @@ commands to 16 and packet queues to 128. TCP buffers are 64 KiB per direction.
 Dropping the last client shuts down the node. Dropping a listener stops new
 acceptance. This adapter exposes IPv4 TCP, not system-wide networking or UDP
 application sockets. Peer capacity follows the core's 32-peer limit.
+TCP write shutdown preserves the response reader. Fully dropped streams release
+half-closed sockets within one second, including when the peer never sends FIN.
+Directional ACLs govern incoming connection attempts; TCP continuation packets
+still require cryptokey source validation and the TCP stack's sequence checks.
 
 Run `cargo test --manifest-path hosted/Cargo.toml --locked` and strict Clippy for
 all targets. `examples/headscale.rs` additionally runs registration, private-CA
@@ -64,7 +68,9 @@ establishes a new TCP connection and transfers 1 MiB using direct UDP while both
 control and DERP are offline, skipping the reconnect tests that need the server.
 
 A new discovery cycle replaces previous candidates, and changed candidates
-restart bounded hole-punch announcements for active peers. Stateful actor
+restart bounded hole-punch announcements for active peers. NAT discovery refreshes
+at control heartbeats after a 30-second interval; changed endpoints are published
+even when the preferred relay stays the same. Stateful actor
 commands keep FIFO order and bypass backpressured packet sends. Relay writes
 have a 15-second deadline; tunnel TCP connection establishment allows 90 seconds
 for relay failover, independently of the native TCP dial deadline.

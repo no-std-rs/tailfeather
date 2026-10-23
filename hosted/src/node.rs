@@ -24,6 +24,7 @@ pub struct Shared {
     probe: RefCell<Option<Probe>>,
     endpoints: RefCell<Vec<std::string::String>>,
     candidate_generation: Cell<u64>,
+    local_candidate: Cell<Option<core::net::SocketAddrV4>>,
     direct: bool,
 }
 struct Probe {
@@ -118,7 +119,7 @@ fn node_error(_: tailfeather::NodeError) -> Error {
     "node state"
 }
 pub fn enqueue(actions: &Actions, action: Option<NodeAction>) {
-    let Some(action) = action else {
+    let Some(action) = action.filter(|a| !matches!(a, NodeAction::StatusChanged(_))) else {
         return;
     };
     let mut queue = actions.borrow_mut();
@@ -174,6 +175,7 @@ pub async fn run(
         probe: RefCell::new(None),
         endpoints: RefCell::new(Vec::new()),
         candidate_generation: Cell::new(0),
+        local_candidate: Cell::new(None),
         direct: !config.relay_only,
     };
     let actions = Actions::default();
@@ -272,7 +274,9 @@ async fn control_session(
         if let Ok(std::net::SocketAddr::V4(local)) = socket.0.local_addr()
             && let Ok(bound) = node.udp.local_addr()
         {
-            node.candidate(core::net::SocketAddrV4::new(*local.ip(), bound.port()));
+            let candidate = core::net::SocketAddrV4::new(*local.ip(), bound.port());
+            node.local_candidate.set(Some(candidate));
+            node.candidate(candidate);
         }
         let tls = crate::tls::connect(socket, authority.host(), ca, &mut read, &mut write);
         let mut stream = match exec::select(tls, reactor.sleep(20000)).await {
@@ -417,6 +421,8 @@ async fn control_session(
     // stream. Unknown is distinct from explicitly advertising no home.
     let mut published_home = None;
     let mut selected_home = 0;
+    let mut published_generation = 0;
+    let mut next_discovery = tokio::time::Instant::now();
     loop {
         if !maps.has_pending_update() {
             node.borrow().seed_staging(&mut staging);
@@ -436,9 +442,18 @@ async fn control_session(
                     })
                     .map_err(node_error)?,
             );
-            refresh_home(reactor, node, &mut selected_home).await?;
             publish(node, status)?;
-            if published_home != Some(selected_home) {
+        }
+        // A control heartbeat is also a safe boundary for bounded rediscovery:
+        // no HTTP/2 read is cancelled halfway through consuming a frame.
+        let discover = tokio::time::Instant::now() >= next_discovery;
+        if matches!(event, MapEvent::Applied) || discover {
+            refresh_home(reactor, node, &mut selected_home, discover).await?;
+            if discover {
+                next_discovery = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            }
+            let generation = node.candidate_generation.get();
+            if published_home != Some(selected_home) || published_generation != generation {
                 let endpoints = node.endpoints.borrow().clone();
                 let endpoint_refs: Vec<_> = endpoints.iter().map(|s| s.as_str()).collect();
                 let request = MapRequest {
@@ -478,12 +493,18 @@ async fn control_session(
                     _ => return Err("endpoint update"),
                 }
                 published_home = Some(selected_home);
+                published_generation = generation;
                 tracing::debug!("POCKETBOOT TAILNET_HOME_PUBLISHED region={selected_home}");
             }
         }
     }
 }
-async fn refresh_home(reactor: &Reactor, node: &Shared, selected: &mut u16) -> Result<(), Error> {
+async fn refresh_home(
+    reactor: &Reactor,
+    node: &Shared,
+    selected: &mut u16,
+    discover: bool,
+) -> Result<(), Error> {
     if *selected != 0
         && node
             .borrow()
@@ -494,7 +515,7 @@ async fn refresh_home(reactor: &Reactor, node: &Shared, selected: &mut u16) -> R
     {
         *selected = 0;
     }
-    if *selected == 0 {
+    if *selected == 0 || discover {
         *selected = select_home(reactor, node).await;
     }
     node.borrow_mut()
@@ -508,6 +529,12 @@ async fn select_home(reactor: &Reactor, node: &Shared) -> u16 {
     if !node.direct {
         return best.home();
     }
+    let mut candidates: Vec<_> = node
+        .local_candidate
+        .get()
+        .into_iter()
+        .map(|a| a.to_string())
+        .collect();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
     'regions: for region in snapshot.derp.iter() {
         for relay in region.nodes.iter().filter(|n| n.stun_port != 0) {
@@ -543,12 +570,20 @@ async fn select_home(reactor: &Reactor, node: &Shared) -> u16 {
                 let limit = deadline
                     .min(tokio::time::Instant::now() + std::time::Duration::from_millis(200));
                 if let Ok(Some(mapped)) = tokio::time::timeout_at(limit, probe).await {
-                    node.candidate(mapped);
+                    let text = mapped.to_string();
+                    if candidates.len() < 8 && !candidates.contains(&text) {
+                        candidates.push(text);
+                    }
                     best.record(region, reactor.clock_millis() - started, mapped);
                 }
                 node.probe.borrow_mut().take();
             }
         }
+    }
+    if *node.endpoints.borrow() != candidates {
+        *node.endpoints.borrow_mut() = candidates;
+        node.candidate_generation
+            .set(node.candidate_generation.get().wrapping_add(1));
     }
     // These reflexive candidates belong to the actual data socket and can be
     // published alongside its local interface address.
@@ -621,7 +656,8 @@ async fn packets(
                     let bytes = packet.as_slice();
                     let allowed = {
                         let n = node.borrow();
-                        n.netmap().packet_filter.allows_ipv4(bytes)
+                        (n.netmap().packet_filter.allows_ipv4(bytes)
+                            || crate::logic::tcp_continuation(bytes))
                             && n.netmap().addresses.iter().any(|a| match a.address {
                                 IpAddr::V4(own) => crate::logic::inbound_allowed(
                                     bytes,
@@ -803,6 +839,7 @@ mod tests {
             probe: RefCell::new(None),
             endpoints: RefCell::new(Vec::new()),
             candidate_generation: Cell::new(0),
+            local_candidate: Cell::new(None),
             direct: true,
         }
     }
@@ -859,37 +896,52 @@ mod tests {
                     })
                     .unwrap();
                 let respond = async {
-                    let mut request = [0; 512];
-                    let (len, source) = server.recv_from(&mut request).await.unwrap();
-                    assert!(len >= 20);
-                    let std::net::SocketAddr::V4(source) = source else {
-                        unreachable!()
-                    };
-                    let mut response = [0u8; 32];
-                    response[..2].copy_from_slice(&0x0101u16.to_be_bytes());
-                    response[2..4].copy_from_slice(&12u16.to_be_bytes());
-                    response[4..20].copy_from_slice(&request[4..20]);
-                    response[20..22].copy_from_slice(&0x0020u16.to_be_bytes());
-                    response[22..24].copy_from_slice(&8u16.to_be_bytes());
-                    response[25] = 1;
-                    response[26..28].copy_from_slice(&(source.port() ^ 0x2112).to_be_bytes());
-                    response[28..32]
-                        .copy_from_slice(&(u32::from(*source.ip()) ^ 0x2112a442).to_be_bytes());
-                    server.send_to(&response, source).await.unwrap();
-                    let (len, from) = node.udp.recv_from(&mut request).await.unwrap();
-                    assert!(node.receive_stun(&request[..len], from));
+                    for delta in 0..2u16 {
+                        let mut request = [0; 512];
+                        let (len, source) = server.recv_from(&mut request).await.unwrap();
+                        assert!(len >= 20);
+                        let std::net::SocketAddr::V4(source) = source else {
+                            unreachable!()
+                        };
+                        let mut response = [0u8; 32];
+                        response[..2].copy_from_slice(&0x0101u16.to_be_bytes());
+                        response[2..4].copy_from_slice(&12u16.to_be_bytes());
+                        response[4..20].copy_from_slice(&request[4..20]);
+                        response[20..22].copy_from_slice(&0x0020u16.to_be_bytes());
+                        response[22..24].copy_from_slice(&8u16.to_be_bytes());
+                        response[25] = 1;
+                        response[26..28].copy_from_slice(
+                            &(source.port().wrapping_add(delta) ^ 0x2112).to_be_bytes(),
+                        );
+                        response[28..32]
+                            .copy_from_slice(&(u32::from(*source.ip()) ^ 0x2112a442).to_be_bytes());
+                        server.send_to(&response, source).await.unwrap();
+                        let (len, from) = node.udp.recv_from(&mut request).await.unwrap();
+                        assert!(node.receive_stun(&request[..len], from));
+                    }
                 };
                 let reactor = Reactor::new();
-                let (home, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                    tokio::join!(select_home(&reactor, &node), respond)
+                let discover = async {
+                    let mut selected = 7;
+                    refresh_home(&reactor, &node, &mut selected, true)
+                        .await
+                        .unwrap();
+                    assert_eq!(selected, 7);
+                    let first = node.endpoints.borrow().clone();
+                    assert_eq!(first, [node.udp.local_addr().unwrap().to_string()]);
+                    refresh_home(&reactor, &node, &mut selected, true)
+                        .await
+                        .unwrap();
+                    let mut mapped = node.udp.local_addr().unwrap();
+                    mapped.set_port(mapped.port().wrapping_add(1));
+                    assert_eq!(node.endpoints.borrow().as_slice(), [mapped.to_string()]);
+                    assert_ne!(*node.endpoints.borrow(), first);
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    tokio::join!(discover, respond)
                 })
                 .await
                 .unwrap();
-                assert_eq!(home, 7);
-                assert_eq!(
-                    node.endpoints.borrow().as_slice(),
-                    [node.udp.local_addr().unwrap().to_string()]
-                );
             });
     }
     #[test]
@@ -968,11 +1020,27 @@ mod tests {
                             result: Ok(()),
                         })
                         .unwrap();
-                    refresh_home(&reactor, &node, &mut selected).await.unwrap();
+                    refresh_home(&reactor, &node, &mut selected, false)
+                        .await
+                        .unwrap();
                     assert_eq!(selected, expected);
                     assert_eq!(node.borrow().netmap().home_derp, expected);
                 }
             });
+    }
+    #[test]
+    fn map_status_bursts_cannot_exhaust_the_action_queue() {
+        let actions = Actions::default();
+        for _ in 0..100 {
+            enqueue(
+                &actions,
+                Some(NodeAction::StatusChanged(
+                    tailfeather::NodeStatus::Registered,
+                )),
+            );
+        }
+        assert!(!actions.overflow.get());
+        assert!(actions.borrow_mut().is_empty());
     }
     #[test]
     fn saturated_packet_queue_keeps_stateful_relay_commands() {
