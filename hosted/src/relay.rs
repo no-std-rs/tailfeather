@@ -87,7 +87,6 @@ pub async fn worker(
             slot.ready.notified().await;
             continue;
         };
-        slot.stop.set(false);
         let stopped = async {
             loop {
                 if slot.stop.get() {
@@ -96,9 +95,13 @@ pub async fn worker(
                 slot.stopped.notified().await;
             }
         };
-        let result = tokio::select! {
-            result=connection(reactor,node,actions,slot,region,&endpoint,ca)=>result,
-            _=stopped=>Ok(()),
+        let result = if slot.stop.get() {
+            Ok(())
+        } else {
+            tokio::select! {
+                result=connection(reactor,node,actions,slot,region,&endpoint,ca)=>result,
+                _=stopped=>Ok(()),
+            }
         };
         if result.is_err() {
             tracing::debug!("POCKETBOOT TAILNET_RELAY_RETRY region={region}");

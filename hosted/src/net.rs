@@ -90,10 +90,28 @@ impl UdpSocket {
         self.0.send_to(data, to).await
     }
     pub async fn recv_from(&self, data: &mut [u8]) -> io::Result<(usize, SocketAddrV4)> {
-        let (len, from) = self.0.recv_from(data).await?;
-        match from {
-            std::net::SocketAddr::V4(v) => Ok((len, v)),
-            _ => Err(io::Error::other("IPv6 unsupported")),
+        loop {
+            let (len, from) = match self.0.recv_from(data).await {
+                Ok(value) => value,
+                // ICMP from an unreachable discovery/STUN peer is not a
+                // failure of the shared data socket (notably WSAECONNRESET).
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::NetworkUnreachable
+                            | io::ErrorKind::HostUnreachable
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match from {
+                std::net::SocketAddr::V4(v) => return Ok((len, v)),
+                _ => continue,
+            }
         }
     }
 }

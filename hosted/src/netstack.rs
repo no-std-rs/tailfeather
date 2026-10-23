@@ -157,6 +157,19 @@ impl NetStack {
         if self.sockets.iter().count() >= 16 {
             return Err("TCP session capacity reached".into());
         }
+        let first = local_port.max(49152);
+        let local_port = (0..16u32)
+            .map(|offset| 49152 + ((u32::from(first) - 49152 + offset) % 16384) as u16)
+            .find(|candidate| {
+                !self.sockets.iter().any(|(_, socket)| {
+                    let smoltcp::socket::Socket::Tcp(socket) = socket;
+                    socket
+                        .local_endpoint()
+                        .is_some_and(|endpoint| endpoint.port == *candidate)
+                        || socket.listen_endpoint().port == *candidate
+                })
+            })
+            .ok_or("no free TCP source port")?;
         let iface = self
             .iface
             .as_mut()
@@ -176,6 +189,19 @@ impl NetStack {
         })
     }
 
+    pub fn remote_addresses(&self) -> Vec<Ipv4Addr> {
+        self.sockets
+            .iter()
+            .filter_map(|(_, socket)| {
+                let smoltcp::socket::Socket::Tcp(socket) = socket;
+                socket
+                    .remote_endpoint()
+                    .map(|endpoint| match endpoint.addr {
+                        IpAddress::Ipv4(address) => address,
+                    })
+            })
+            .collect()
+    }
     pub fn listen(&mut self, port: u16) -> Result<TcpHandle, String> {
         if self.sockets.iter().count() >= 16 {
             return Err("TCP session capacity reached".into());
@@ -213,6 +239,24 @@ fn instant(now_ms: u64) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wrapping_source_port_selection_preserves_active_four_tuples() {
+        let mut net = NetStack::new(1);
+        net.set_address("100.64.0.1".parse().unwrap(), 0, 1);
+        let remote = "100.64.0.2".parse().unwrap();
+        let first = net.connect(remote, 2222, 49152).unwrap();
+        let last = net.connect(remote, 2222, 65535).unwrap();
+        let wrapped = net.connect(remote, 2222, 49152).unwrap();
+        assert_eq!(
+            net.tcp(first).unwrap().local_endpoint().unwrap().port,
+            49152
+        );
+        assert_eq!(net.tcp(last).unwrap().local_endpoint().unwrap().port, 65535);
+        assert_eq!(
+            net.tcp(wrapped).unwrap().local_endpoint().unwrap().port,
+            49153
+        );
+    }
     #[test]
     fn address_changes_keep_passive_listeners_and_end_old_connections() {
         let mut net = NetStack::new(1);
