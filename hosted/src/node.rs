@@ -23,6 +23,7 @@ pub struct Shared {
     udp: UdpSocket,
     probe: RefCell<Option<Probe>>,
     endpoints: RefCell<Vec<std::string::String>>,
+    candidate_generation: Cell<u64>,
     direct: bool,
 }
 struct Probe {
@@ -45,7 +46,14 @@ impl Shared {
         let mut endpoints = self.endpoints.borrow_mut();
         if endpoints.len() < 8 && !endpoints.contains(&text) {
             endpoints.push(text);
+            self.candidate_generation
+                .set(self.candidate_generation.get().wrapping_add(1));
         }
+    }
+    fn reset_candidates(&self) {
+        self.endpoints.borrow_mut().clear();
+        self.candidate_generation
+            .set(self.candidate_generation.get().wrapping_add(1));
     }
     fn receive_stun(&self, bytes: &[u8], from: core::net::SocketAddrV4) -> bool {
         let mapped = self.probe.borrow().as_ref().and_then(|p| {
@@ -73,6 +81,14 @@ pub struct Actions {
 impl Actions {
     fn borrow_mut(&self) -> std::cell::RefMut<'_, VecDeque<NodeAction>> {
         self.queue.borrow_mut()
+    }
+    fn pop(&self) -> Option<NodeAction> {
+        let mut queue = self.queue.borrow_mut();
+        if let Some(index) = queue.iter().position(|action| !droppable(action)) {
+            queue.remove(index)
+        } else {
+            queue.pop_front()
+        }
     }
 }
 fn droppable(action: &NodeAction) -> bool {
@@ -143,6 +159,7 @@ pub async fn run(
         udp,
         probe: RefCell::new(None),
         endpoints: RefCell::new(Vec::new()),
+        candidate_generation: Cell::new(0),
         direct: !config.relay_only,
     };
     let actions = Actions::default();
@@ -237,6 +254,7 @@ async fn control_session(
     write!(host, "{}:{}", authority.host(), authority.port()).map_err(|_| "host")?;
     let key = {
         let socket = tcp(reactor, authority.host(), authority.port()).await?;
+        node.reset_candidates();
         if let Ok(std::net::SocketAddr::V4(local)) = socket.0.local_addr()
             && let Ok(bound) = node.udp.local_addr()
         {
@@ -532,6 +550,7 @@ async fn packets(
     let mut timestamp = crate::time::Timestamp::default();
     let mut outgoing = VecDeque::new();
     let mut punches: Vec<(tailfeather::keys::NodePublic, u64, u8)> = Vec::new();
+    let mut candidate_generation = node.candidate_generation.get();
     let mut listeners: Vec<(
         u16,
         crate::netstack::TcpHandle,
@@ -550,7 +569,7 @@ async fn packets(
                 .set_address(address, reactor.clock_millis(), seed);
         }
         for _ in 0..64 {
-            let Some(action) = actions.borrow_mut().pop_front() else {
+            let Some(action) = actions.pop() else {
                 break;
             };
             match action {
@@ -652,6 +671,10 @@ async fn packets(
             }
         }
         if node.direct {
+            if candidate_generation != node.candidate_generation.get() {
+                punches.clear();
+                candidate_generation = node.candidate_generation.get();
+            }
             let active: Vec<_> = net
                 .borrow()
                 .remote_addresses()
@@ -742,6 +765,7 @@ mod tests {
                 .unwrap(),
             probe: RefCell::new(None),
             endpoints: RefCell::new(Vec::new()),
+            candidate_generation: Cell::new(0),
             direct: true,
         }
     }
@@ -830,6 +854,45 @@ mod tests {
                     [node.udp.local_addr().unwrap().to_string()]
                 );
             });
+    }
+    #[test]
+    fn discovery_replaces_old_candidates_even_after_filling_capacity() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let node = fixture().await;
+                for n in 1..=8 {
+                    node.candidate(format!("192.0.2.{n}:1234").parse().unwrap());
+                }
+                assert_eq!(node.endpoints.borrow().len(), 8);
+                let generation = node.candidate_generation.get();
+                node.reset_candidates();
+                node.candidate("198.51.100.7:5678".parse().unwrap());
+                assert_eq!(node.endpoints.borrow().as_slice(), ["198.51.100.7:5678"]);
+                assert_ne!(node.candidate_generation.get(), generation);
+            });
+    }
+    #[test]
+    fn a_disconnect_bypasses_a_saturated_relay_send() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let server=std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).unwrap();server.set_nonblocking(true).unwrap();
+            let node=fixture().await;let actions=Actions::default();let slots=[crate::relay::Slot::new(),crate::relay::Slot::new()];
+            let connect=tailfeather::DerpCommand::Connect {region:7,endpoint:tailfeather::Endpoint::new("127.0.0.1",server.local_addr().unwrap().port()).unwrap()};
+            assert!(crate::relay::dispatch(&slots,connect,&node,&actions,0).is_none());
+            let peer=node.borrow().identity().node.public();
+            let send=||tailfeather::DerpCommand::Send{region:7,peer,packet:tailfeather::SecretBuffer::try_from_slice(&[1;20]).unwrap()};
+            for _ in 0..15 { assert!(crate::relay::dispatch(&slots,send(),&node,&actions,0).is_none()); }
+            enqueue(&actions,Some(NodeAction::Derp(send())));
+            enqueue(&actions,Some(NodeAction::Derp(tailfeather::DerpCommand::Disconnect{region:7})));
+            let (_keep,mut commands)=tokio::sync::mpsc::channel(1);
+            let (status,_watch)=tokio::sync::watch::channel(crate::Status::default());
+            let reactor=Reactor::new();
+            let actors=async {tokio::join!(packets(&reactor,&node,&actions,&node.udp,&slots,&mut commands,&status),crate::relay::worker(&reactor,&node,&actions,&slots[0],&[]))};
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(50),actors).await.is_err());
+            assert!(matches!(server.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        });
     }
     #[test]
     fn saturated_packet_queue_keeps_stateful_relay_commands() {

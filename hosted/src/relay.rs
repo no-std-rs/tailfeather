@@ -188,6 +188,14 @@ impl Frames {
         self.filled -= n;
     }
 }
+async fn send<S: Write>(stream: &mut S, bytes: &[u8]) -> Result<(), Error> {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        stream.write_all(bytes).await.map_err(|_| "relay write")?;
+        stream.flush().await.map_err(|_| "relay flush")
+    })
+    .await
+    .map_err(|_| "relay write deadline")?
+}
 async fn connection(
     reactor: &Reactor,
     node: &Shared,
@@ -302,11 +310,7 @@ async fn connection(
             let len = client
                 .send_packet(&peer, packet.as_slice(), &mut output)
                 .map_err(|_| "relay packet size")?;
-            stream
-                .write_all(&output[..len])
-                .await
-                .map_err(|_| "relay send")?;
-            stream.flush().await.map_err(|_| "relay flush")?;
+            send(&mut stream, &output[..len]).await?;
         }
         actions.ready.notify_one();
         // Frames retains partial read progress when a notification cancels it.
@@ -336,11 +340,7 @@ async fn connection(
                 FrameType::Ping => {
                     let len = Client::write_pong(frame, frames.payload(frame), &mut output)
                         .map_err(|_| "relay ping")?;
-                    stream
-                        .write_all(&output[..len])
-                        .await
-                        .map_err(|_| "relay pong")?;
-                    stream.flush().await.map_err(|_| "relay flush")?;
+                    send(&mut stream, &output[..len]).await?;
                 }
                 FrameType::PeerGone => {
                     if let Ok(peer) = Client::read_peer_gone(frame, frames.payload(frame)) {
@@ -366,6 +366,34 @@ mod tests {
         async fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
             tokio::io::AsyncReadExt::read(&mut self.0, out).await
         }
+    }
+    #[test]
+    fn a_stalled_relay_write_has_a_finite_deadline() {
+        struct Blocked;
+        impl embedded_io_async::ErrorType for Blocked {
+            type Error = std::io::Error;
+        }
+        impl Write for Blocked {
+            async fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                std::future::pending().await
+            }
+            async fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let started = tokio::time::Instant::now();
+                assert_eq!(
+                    send(&mut Blocked, b"packet").await,
+                    Err("relay write deadline")
+                );
+                assert_eq!(started.elapsed(), std::time::Duration::from_secs(15));
+            });
     }
     #[test]
     fn oversized_frames_are_drained_across_cancelled_reads() {

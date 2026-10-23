@@ -8,7 +8,7 @@ pub async fn connect(
     handle: TcpHandle,
     reply: tokio::sync::oneshot::Sender<io::Result<DuplexStream>>,
 ) {
-    let established = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+    let established = tokio::time::timeout(std::time::Duration::from_secs(90), async {
         loop {
             if reply.is_closed() {
                 return false;

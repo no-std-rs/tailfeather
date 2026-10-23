@@ -62,3 +62,9 @@ The Headscale fixture runner also accepts `--direct --offline-direct`. After it
 prints `READY`, stop the fixture and create `continue` in its directory. It then
 establishes a new TCP connection and transfers 1 MiB using direct UDP while both
 control and DERP are offline, skipping the reconnect tests that need the server.
+
+A new discovery cycle replaces previous candidates, and changed candidates
+restart bounded hole-punch announcements for active peers. Stateful actor
+commands keep FIFO order and bypass backpressured packet sends. Relay writes
+have a 15-second deadline; tunnel TCP connection establishment allows 90 seconds
+for relay failover, independently of the native TCP dial deadline.
