@@ -77,6 +77,7 @@ pub struct Actions {
     queue: RefCell<VecDeque<NodeAction>>,
     overflow: Cell<bool>,
     pub ready: tokio::sync::Notify,
+    space: tokio::sync::Notify,
 }
 impl Actions {
     fn borrow_mut(&self) -> std::cell::RefMut<'_, VecDeque<NodeAction>> {
@@ -84,10 +85,23 @@ impl Actions {
     }
     fn pop(&self) -> Option<NodeAction> {
         let mut queue = self.queue.borrow_mut();
-        if let Some(index) = queue.iter().position(|action| !droppable(action)) {
+        let action = if let Some(index) = queue.iter().position(|action| !droppable(action)) {
             queue.remove(index)
         } else {
             queue.pop_front()
+        };
+        if queue.len() < 16 {
+            self.space.notify_waiters();
+        }
+        action
+    }
+    pub async fn wait_for_space(&self) {
+        loop {
+            let full = self.queue.borrow().len() >= 16;
+            if !full {
+                return;
+            }
+            self.space.notified().await;
         }
     }
 }
@@ -291,7 +305,10 @@ async fn control_session(
         Either::First(Ok(s)) => s,
         _ => return Err("control Noise"),
     };
-    let mut http = noise.into_https2().await.map_err(|_| "HTTP/2")?;
+    let mut http = tokio::time::timeout(std::time::Duration::from_secs(20), noise.into_https2())
+        .await
+        .map_err(|_| "HTTP/2 initialization deadline")?
+        .map_err(|_| "HTTP/2")?;
     let public = identity.node.public();
     let disco = identity.disco.public();
     let mut body = [0u8; 2048];
@@ -348,7 +365,7 @@ async fn control_session(
     let result = RegisterResponse::parse(
         core::str::from_utf8(&response[..len]).map_err(|_| "register encoding")?,
     );
-    if http_status == 429 || http_status >= 500 {
+    if matches!(http_status, 408 | 429) || http_status >= 500 {
         return Err("registration unavailable");
     }
     if http_status != 200 || !result.is_success() {
@@ -388,9 +405,13 @@ async fn control_session(
         endpoints: &endpoint_refs,
     };
     let request = request.write(&mut body).map_err(|_| "map size")?;
-    let mut maps = MapStream::<PEERS>::start(&mut http, &host, request)
-        .await
-        .map_err(|_| "map start")?;
+    let mut maps = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        MapStream::<PEERS>::start(&mut http, &host, request),
+    )
+    .await
+    .map_err(|_| "map start deadline")?
+    .map_err(|_| "map start")?;
     let mut staging = tailfeather::netmap::Netmap::new();
     let mut published_home = 0;
     let mut selected_home = 0;
@@ -568,7 +589,8 @@ async fn packets(
             net.borrow_mut()
                 .set_address(address, reactor.clock_millis(), seed);
         }
-        for _ in 0..64 {
+        let queued = actions.borrow_mut().len();
+        for _ in 0..queued {
             let Some(action) = actions.pop() else {
                 break;
             };
@@ -607,8 +629,8 @@ async fn packets(
                         actions,
                         reactor.clock_millis(),
                     ) {
-                        actions.borrow_mut().push_front(NodeAction::Derp(command));
-                        break;
+                        actions.borrow_mut().push_back(NodeAction::Derp(command));
+                        continue;
                     }
                 }
                 _ => {}

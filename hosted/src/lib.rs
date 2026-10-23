@@ -52,8 +52,24 @@ pub struct Client {
     inner: Arc<Inner>,
 }
 struct Inner {
-    commands: mpsc::Sender<Command>,
+    commands: Option<mpsc::Sender<Command>>,
     status: watch::Receiver<Status>,
+    shutdown: Option<oneshot::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.commands.take();
+        if let Some(worker) = self.worker.take() {
+            // A subscriber may drop its last client from a worker log callback.
+            if worker.thread().id() != std::thread::current().id() {
+                let _ = worker.join();
+            }
+        }
+    }
 }
 impl Client {
     /// State is authority-bound; corrupt or mismatched state is never reset.
@@ -80,7 +96,8 @@ impl Client {
             .map_err(|_| io::Error::other("network identity already in use"))?;
         let (commands, receiver) = mpsc::channel(16);
         let (status_tx, status) = watch::channel(Status::default());
-        std::thread::Builder::new()
+        let (shutdown, stopped) = oneshot::channel();
+        let worker = std::thread::Builder::new()
             .name("tailfeather".into())
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
@@ -90,8 +107,17 @@ impl Client {
                     .build()
                 {
                     Ok(runtime) => {
-                        let result = tokio::task::LocalSet::new()
-                            .block_on(&runtime, node::run(config, receiver, status_tx.clone()));
+                        let local = tokio::task::LocalSet::new();
+                        let result = local.block_on(&runtime, async {
+                            tokio::select! {
+                                result=node::run(config,receiver,status_tx.clone())=>result,
+                                _=stopped=>Ok(()),
+                            }
+                        });
+                        drop(local);
+                        // OS DNS lookups may outlive cancellation, but cannot
+                        // keep this node's state lock or worker alive.
+                        runtime.shutdown_background();
                         if let Err(error) = result {
                             status_tx.send_replace(Status {
                                 address: None,
@@ -108,7 +134,12 @@ impl Client {
                 }
             })?;
         Ok(Self {
-            inner: Arc::new(Inner { commands, status }),
+            inner: Arc::new(Inner {
+                commands: Some(commands),
+                status,
+                shutdown: Some(shutdown),
+                worker: Some(worker),
+            }),
         })
     }
     pub fn status(&self) -> Status {
@@ -138,6 +169,8 @@ impl Client {
         let (reply, received) = oneshot::channel();
         self.inner
             .commands
+            .as_ref()
+            .expect("live client sender")
             .send(Command::Listen {
                 port,
                 incoming,
@@ -156,6 +189,8 @@ impl Client {
         let (reply, received) = oneshot::channel();
         self.inner
             .commands
+            .as_ref()
+            .expect("live client sender")
             .send(Command::Connect {
                 address,
                 port,
@@ -215,3 +250,34 @@ rng!(tailfeather::derp::client::Rng);
 
 #[cfg(test)]
 mod loopback_tests;
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[test]
+    fn dropping_the_last_clone_releases_identity_before_restart() {
+        let root = tempfile::tempdir().unwrap();
+        for _ in 0..10 {
+            let node = Client::start(Config {
+                directory: root.path().into(),
+                control_url: "https://127.0.0.1:9".into(),
+                hostname: "fixture".into(),
+                auth_key: "fixture-only".into(),
+                control_ca_der: Vec::new(),
+                relay_only: true,
+                ephemeral: true,
+            })
+            .unwrap();
+            let clone = node.clone();
+            drop(node);
+            drop(clone);
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.path().join("lock"))
+                .unwrap();
+            lock.try_lock()
+                .expect("final client drop releases the worker lock");
+        }
+    }
+}

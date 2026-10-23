@@ -54,7 +54,6 @@ fn main() {
             println!("PASS: direct TCP works with control and DERP offline");return;
         }
         drop(from);drop(to);drop(listener);drop(client);drop(server);
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let client=Client::start(config(&root,"hosted-client",String::new())).unwrap();
         assert_eq!(tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap(),client_ip);
         println!("PASS: session identity reconnects without an auth key and keeps its address");

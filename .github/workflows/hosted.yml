@@ -24,3 +24,6 @@ jobs:
       - run: cargo clippy --manifest-path hosted/Cargo.toml --locked --all-targets -- -D warnings
       - if: runner.os == 'Linux'
         run: cargo test --locked -p tailfeather control::register
+      - if: runner.os == 'Linux'
+        name: Real Headscale direct and DERP networking
+        run: python3 hosted/tools/test-headscale.py

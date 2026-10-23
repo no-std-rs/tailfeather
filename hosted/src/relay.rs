@@ -127,6 +127,7 @@ struct Frames {
     bytes: [u8; FRAME],
     filled: usize,
     discard: usize,
+    activity: std::rc::Rc<Cell<tokio::time::Instant>>,
 }
 impl Frames {
     fn new() -> Self {
@@ -134,6 +135,7 @@ impl Frames {
             bytes: [0; FRAME],
             filled: 0,
             discard: 0,
+            activity: std::rc::Rc::new(Cell::new(tokio::time::Instant::now())),
         }
     }
     async fn read<S: Read>(&mut self, stream: &mut S) -> Result<Frame, Error> {
@@ -155,6 +157,9 @@ impl Frames {
                     }
                     self.discard -= n;
                 }
+                if self.discard == 0 {
+                    self.activity.set(tokio::time::Instant::now());
+                }
                 continue;
             }
             if self.filled >= frame::HEADER_LEN {
@@ -166,6 +171,7 @@ impl Frames {
                     continue;
                 }
                 if self.filled >= frame::HEADER_LEN + frame.length {
+                    self.activity.set(tokio::time::Instant::now());
                     return Ok(frame);
                 }
             }
@@ -195,6 +201,15 @@ async fn send<S: Write>(stream: &mut S, bytes: &[u8]) -> Result<(), Error> {
     })
     .await
     .map_err(|_| "relay write deadline")?
+}
+async fn receive_liveness(activity: &Cell<tokio::time::Instant>) {
+    let interval = std::time::Duration::from_secs(90);
+    loop {
+        tokio::time::sleep_until(activity.get() + interval).await;
+        if tokio::time::Instant::now() >= activity.get() + interval {
+            return;
+        }
+    }
 }
 async fn connection(
     reactor: &Reactor,
@@ -296,62 +311,78 @@ async fn connection(
             .flatten(),
     );
     tracing::debug!("POCKETBOOT TAILNET_RELAY_CONNECTED region={region}");
-    loop {
-        if slot.stop.get() {
-            return Ok(());
-        }
-        // Drain a bounded batch immediately, then service reads or a queue
-        // notification. No per-packet polling delay throttles relay traffic.
-        for _ in 0..16 {
-            let next = slot.queue.borrow_mut().pop_front();
-            let Some(DerpCommand::Send { peer, packet, .. }) = next else {
-                break;
-            };
-            let len = client
-                .send_packet(&peer, packet.as_slice(), &mut output)
-                .map_err(|_| "relay packet size")?;
-            send(&mut stream, &output[..len]).await?;
-        }
-        actions.ready.notify_one();
-        // Frames retains partial read progress when a notification cancels it.
-        let result = exec::select(frames.read(&mut stream), slot.ready.notified()).await;
-        if let Either::First(frame) = result {
-            let frame = frame?;
-            match frame.kind {
-                FrameType::RecvPacket => {
-                    let (peer, payload) = Client::read_packet(frame, frames.payload(frame))
-                        .map_err(|_| "relay packet")?;
-                    enqueue(
-                        actions,
-                        node.borrow_mut()
-                            .handle_derp_event(
-                                DerpEvent::Packet {
-                                    region,
-                                    peer,
-                                    payload,
-                                },
-                                reactor.clock_millis(),
-                                &mut OsRng,
-                            )
-                            .ok()
-                            .flatten(),
-                    );
-                }
-                FrameType::Ping => {
-                    let len = Client::write_pong(frame, frames.payload(frame), &mut output)
-                        .map_err(|_| "relay ping")?;
-                    send(&mut stream, &output[..len]).await?;
-                }
-                FrameType::PeerGone => {
-                    if let Ok(peer) = Client::read_peer_gone(frame, frames.payload(frame)) {
-                        node.borrow_mut().forget_relay(&peer, region);
-                    }
-                }
-                FrameType::Restarting => return Ok(()),
-                _ => {}
+    let activity = frames.activity.clone();
+    activity.set(tokio::time::Instant::now());
+    let transfer = async {
+        loop {
+            if slot.stop.get() {
+                return Ok(());
             }
-            frames.consume(frame);
+            // Drain a bounded batch immediately, then service reads or a queue
+            // notification. No per-packet polling delay throttles relay traffic.
+            for _ in 0..16 {
+                let next = slot.queue.borrow_mut().pop_front();
+                let Some(DerpCommand::Send { peer, packet, .. }) = next else {
+                    break;
+                };
+                let len = client
+                    .send_packet(&peer, packet.as_slice(), &mut output)
+                    .map_err(|_| "relay packet size")?;
+                send(&mut stream, &output[..len]).await?;
+            }
+            actions.ready.notify_one();
+            // Stop decoding before the actor high-water mark; dropping
+            // local decoded TCP packets here needlessly collapses its window.
+            // Queue notifications must interrupt the capacity wait too, so
+            // outgoing sends can free actor space while reads are throttled.
+            let read = async {
+                actions.wait_for_space().await;
+                frames.read(&mut stream).await
+            };
+            // Frames retains partial read progress when a notification cancels it.
+            let result = exec::select(read, slot.ready.notified()).await;
+            if let Either::First(frame) = result {
+                let frame = frame?;
+                match frame.kind {
+                    FrameType::RecvPacket => {
+                        let (peer, payload) = Client::read_packet(frame, frames.payload(frame))
+                            .map_err(|_| "relay packet")?;
+                        enqueue(
+                            actions,
+                            node.borrow_mut()
+                                .handle_derp_event(
+                                    DerpEvent::Packet {
+                                        region,
+                                        peer,
+                                        payload,
+                                    },
+                                    reactor.clock_millis(),
+                                    &mut OsRng,
+                                )
+                                .ok()
+                                .flatten(),
+                        );
+                    }
+                    FrameType::Ping => {
+                        let len = Client::write_pong(frame, frames.payload(frame), &mut output)
+                            .map_err(|_| "relay ping")?;
+                        send(&mut stream, &output[..len]).await?;
+                    }
+                    FrameType::PeerGone => {
+                        if let Ok(peer) = Client::read_peer_gone(frame, frames.payload(frame)) {
+                            node.borrow_mut().forget_relay(&peer, region);
+                        }
+                    }
+                    FrameType::Restarting => return Ok(()),
+                    _ => {}
+                }
+                frames.consume(frame);
+            }
         }
+    };
+    tokio::select! {
+        result=transfer=>result,
+        _=receive_liveness(&activity)=>Err("relay receive liveness deadline"),
     }
 }
 
@@ -366,6 +397,54 @@ mod tests {
         async fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
             tokio::io::AsyncReadExt::read(&mut self.0, out).await
         }
+    }
+    #[test]
+    fn drained_valid_extension_frames_count_as_receive_activity() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tokio::io::AsyncWriteExt;
+                let started = tokio::time::Instant::now();
+                let (input, mut output) = tokio::io::duplex(16384);
+                let mut input = Input(input);
+                let mut frames = Frames::new();
+                let activity = frames.activity.clone();
+                let writer = async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let mut frame = vec![0; 5005];
+                    let n = frame::write(FrameType::Health, &vec![1; 5000], &mut frame).unwrap();
+                    output.write_all(&frame[..n]).await.unwrap();
+                    std::future::pending::<()>().await;
+                };
+                tokio::select! {
+                    _=frames.read(&mut input)=>panic!("extension frame should be skipped"),
+                    _=writer=>unreachable!(),
+                    _=receive_liveness(&activity)=>{},
+                }
+                assert_eq!(started.elapsed(), std::time::Duration::from_secs(150));
+            });
+    }
+    #[test]
+    fn a_silent_relay_expires_after_the_last_received_frame() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let started = tokio::time::Instant::now();
+                let activity = Cell::new(started);
+                let inbound = async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    activity.set(tokio::time::Instant::now());
+                    std::future::pending::<()>().await;
+                };
+                tokio::select! {_=receive_liveness(&activity)=>{},_=inbound=>unreachable!()}
+                assert_eq!(started.elapsed(), std::time::Duration::from_secs(150));
+            });
     }
     #[test]
     fn a_stalled_relay_write_has_a_finite_deadline() {

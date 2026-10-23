@@ -68,3 +68,16 @@ restart bounded hole-punch announcements for active peers. Stateful actor
 commands keep FIFO order and bypass backpressured packet sends. Relay writes
 have a 15-second deadline; tunnel TCP connection establishment allows 90 seconds
 for relay failover, independently of the native TCP dial deadline.
+
+Dropping the final client signals cancellation and joins its worker before the
+identity lock is released to the caller. Cancellation does not wait for detached
+OS DNS lookups. The Headscale fixture restarts the same identity immediately,
+without a timing sleep. Silent established DERP sessions expire 90 seconds after
+the last received frame, including when outbound notifications continue.
+
+`python3 hosted/tools/test-headscale.py` runs both production-path scenarios
+against a digest-pinned disposable Headscale container with a generated CA.
+It needs Docker (or `CONTAINER_ENGINE=podman`), OpenSSL and free loopback ports
+18443/13478. Linux CI runs it after the native tests; fixture keys never leave
+its private temporary directory. This includes the 1 MiB transfer regression
+and immediate no-key reconnect without a restart sleep.

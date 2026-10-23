@@ -53,12 +53,15 @@ impl Device for Tunnel {
     type TxToken<'a> = Tx<'a>;
 
     fn receive(&mut self, _: Instant) -> Option<(Rx, Tx<'_>)> {
+        if self.tx.len() >= QUEUE_LIMIT {
+            return None;
+        }
         let packet = self.rx.pop_front()?;
         Some((Rx(packet), Tx(self)))
     }
 
     fn transmit(&mut self, _: Instant) -> Option<Tx<'_>> {
-        Some(Tx(self))
+        (self.tx.len() < QUEUE_LIMIT).then_some(Tx(self))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
