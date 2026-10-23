@@ -4,7 +4,8 @@ use crate::{
     net::{TcpStream, UdpSocket},
 };
 use core::{cell::RefCell, fmt::Write, net::IpAddr};
-use heapless::{Deque, String};
+use heapless::String;
+use std::{cell::Cell, collections::VecDeque};
 use tailfeather::control::{
     Hostinfo, MapRequest, RegisterRequest, RegisterResponse,
     authority::Authority,
@@ -12,18 +13,55 @@ use tailfeather::control::{
 };
 use tailfeather::{ControlCommand, ControlEvent, Node, NodeAction, PersistState};
 pub const PEERS: usize = 32;
+const HOST_OS: &str = if cfg!(target_os = "macos") {
+    "darwin"
+} else {
+    std::env::consts::OS
+};
 pub type Shared = RefCell<Node<PEERS>>;
-pub type Actions = RefCell<Deque<NodeAction, 32>>;
+#[derive(Default)]
+pub struct Actions {
+    queue: RefCell<VecDeque<NodeAction>>,
+    overflow: Cell<bool>,
+    pub ready: tokio::sync::Notify,
+}
+impl Actions {
+    fn borrow_mut(&self) -> std::cell::RefMut<'_, VecDeque<NodeAction>> {
+        self.queue.borrow_mut()
+    }
+}
+fn droppable(action: &NodeAction) -> bool {
+    matches!(
+        action,
+        NodeAction::DirectTransmit { .. }
+            | NodeAction::DeliveredIpv4 { .. }
+            | NodeAction::Derp(tailfeather::DerpCommand::Send { .. })
+    )
+}
 pub type Error = &'static str;
 fn node_error(_: tailfeather::NodeError) -> Error {
     "node state"
 }
 pub fn enqueue(actions: &Actions, action: Option<NodeAction>) {
-    if let Some(action) = action
-        && actions.borrow_mut().push_back(action).is_err()
-    {
-        tracing::debug!("POCKETBOOT TAILNET_QUEUE_FULL");
+    let Some(action) = action else {
+        return;
+    };
+    let mut queue = actions.borrow_mut();
+    if queue.len() == 32 {
+        if droppable(&action) {
+            return;
+        }
+        if let Some(index) = queue.iter().position(droppable) {
+            queue.remove(index);
+        } else {
+            // Stateful commands cannot be lost while leaving a live node that
+            // believes they ran. Surface capacity exhaustion to its caller.
+            actions.overflow.set(true);
+            return;
+        }
     }
+    queue.push_back(action);
+    actions.ready.notify_one();
 }
 pub async fn run(
     config: crate::Config,
@@ -53,7 +91,7 @@ pub async fn run(
         tailfeather::Endpoint::new(authority.host(), authority.port()).map_err(node_error)?,
     );
     let node = RefCell::new(node);
-    let actions = RefCell::new(Deque::new());
+    let actions = Actions::default();
     let udp = UdpSocket::bind(&reactor, core::net::Ipv4Addr::UNSPECIFIED, 0)
         .await
         .map_err(|_| "UDP bind")?;
@@ -116,6 +154,9 @@ async fn control_loop(
         }
         let session = control_session(reactor, node, actions, authority, status, config);
         if let Err(stage) = session.await {
+            if stage == "registration rejected" {
+                return Err(stage);
+            }
             tracing::debug!("POCKETBOOT TAILNET_CONTROL_RETRY stage={stage}");
             node.borrow_mut().control_failed(reactor.clock_millis(), 0);
             reactor.sleep(1000).await;
@@ -191,7 +232,7 @@ async fn control_session(
             auth_key: n.registration_auth_key(auth),
             hostinfo: Hostinfo {
                 hostname,
-                os: std::env::consts::OS,
+                os: HOST_OS,
                 version: concat!("tailfeather-hosted-", env!("CARGO_PKG_VERSION")),
                 ..Default::default()
             },
@@ -235,6 +276,9 @@ async fn control_session(
     let result = RegisterResponse::parse(
         core::str::from_utf8(&response[..len]).map_err(|_| "register encoding")?,
     );
+    if http_status == 429 || http_status >= 500 {
+        return Err("registration unavailable");
+    }
     if http_status != 200 || !result.is_success() {
         return Err("registration rejected");
     }
@@ -260,7 +304,7 @@ async fn control_session(
         disco_key: &disco,
         hostinfo: Hostinfo {
             hostname,
-            os: std::env::consts::OS,
+            os: HOST_OS,
             version: concat!("tailfeather-hosted-", env!("CARGO_PKG_VERSION")),
             ..Default::default()
         },
@@ -312,8 +356,8 @@ async fn control_session(
                     hostinfo: Hostinfo {
                         hostname,
                         preferred_derp: selected_home,
-                        os: std::env::consts::OS,
-                        version: env!("CARGO_PKG_VERSION"),
+                        os: HOST_OS,
+                        version: concat!("tailfeather-hosted-", env!("CARGO_PKG_VERSION")),
                         ..Default::default()
                     },
                     stream: false,
@@ -362,8 +406,12 @@ async fn select_home(reactor: &Reactor, node: &Shared) -> u16 {
         let Some(relay) = region.nodes.iter().find(|n| n.stun_port != 0) else {
             continue;
         };
-        let Some(ip) = resolve_v4(&relay.host_name).await else {
-            continue;
+        let remaining =
+            std::time::Duration::from_millis(deadline.saturating_sub(reactor.clock_millis()));
+        let ip = match tokio::time::timeout(remaining, resolve_v4(&relay.host_name)).await {
+            Ok(Some(ip)) => ip,
+            Ok(None) => continue,
+            Err(_) => break,
         };
         let to = core::net::SocketAddrV4::new(ip, relay.stun_port);
         let mut transaction = [0; 12];
@@ -376,8 +424,11 @@ async fn select_home(reactor: &Reactor, node: &Shared) -> u16 {
         {
             continue;
         }
-        if let Either::First(Ok((len, from))) =
-            exec::select(socket.recv_from(&mut response), reactor.sleep(200)).await
+        if let Either::First(Ok((len, from))) = exec::select(
+            socket.recv_from(&mut response),
+            reactor.sleep(200.min(deadline.saturating_sub(reactor.clock_millis()))),
+        )
+        .await
             && from == to
             && let Ok((ip, port)) = tailfeather::stun::response(&response[..len], transaction)
         {
@@ -421,6 +472,8 @@ async fn packets(
     let mut datagram = [0; 2048];
     let net = std::rc::Rc::new(RefCell::new(crate::netstack::NetStack::new(1)));
     let mut local_port = 49152u16;
+    let mut timestamp = crate::time::Timestamp::default();
+    let mut outgoing = VecDeque::new();
     let mut listeners: Vec<(
         u16,
         crate::netstack::TcpHandle,
@@ -431,6 +484,9 @@ async fn packets(
     let seed = u64::from_ne_bytes(random);
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
     loop {
+        if actions.overflow.get() {
+            return Err("node action capacity exceeded");
+        }
         if let Some(address) = status.borrow().address {
             net.borrow_mut()
                 .set_address(address, reactor.clock_millis(), seed);
@@ -451,25 +507,32 @@ async fn packets(
                     let bytes = packet.as_slice();
                     let allowed = {
                         let n = node.borrow();
-                        bytes.len() >= 20
-                            && bytes[0] >> 4 == 4
-                            && n.netmap().packet_filter.allows_ipv4(bytes)
-                            && n.netmap().peers.iter().any(|p| {
-                                p.node_key == peer
-                                    && p.addresses
-                                        .iter()
-                                        .any(|a| a.address.octets() == bytes[12..16])
+                        n.netmap().packet_filter.allows_ipv4(bytes)
+                            && n.netmap().addresses.iter().any(|a| match a.address {
+                                IpAddr::V4(own) => crate::logic::inbound_allowed(
+                                    bytes,
+                                    &peer,
+                                    n.netmap().peers.iter(),
+                                    own,
+                                ),
+                                _ => false,
                             })
-                            && n.netmap().addresses.iter().any(
-                                |a| matches!(a.address,IpAddr::V4(v) if v.octets()==bytes[16..20]),
-                            )
                     };
                     if allowed {
                         net.borrow_mut().deliver(bytes);
                     }
                 }
                 NodeAction::Derp(command) => {
-                    crate::relay::dispatch(slots, command, node, actions, reactor.clock_millis())
+                    if let Some(command) = crate::relay::dispatch(
+                        slots,
+                        command,
+                        node,
+                        actions,
+                        reactor.clock_millis(),
+                    ) {
+                        actions.borrow_mut().push_front(NodeAction::Derp(command));
+                        break;
+                    }
                 }
                 _ => {}
             }
@@ -508,18 +571,18 @@ async fn packets(
             }
         }
         let now = reactor.clock_millis();
-        for packet in net.borrow_mut().poll(now) {
-            let peer = node
-                .borrow()
-                .netmap()
-                .peers
-                .iter()
-                .find(|p| {
-                    p.addresses
-                        .iter()
-                        .any(|a| a.address.octets() == packet[16..20])
-                })
-                .map(|p| p.node_key);
+        if outgoing.is_empty() {
+            outgoing.extend(net.borrow_mut().poll(now));
+        }
+        // Keep generated TCP packets until the bounded actor queues have room;
+        // large windows must not turn into systematic local packet loss.
+        while actions.borrow_mut().len() < 16 {
+            let Some(packet) = outgoing.pop_front() else {
+                break;
+            };
+            let peer = crate::logic::ipv4_addresses(&packet).and_then(|(_, destination)| {
+                crate::logic::route_ipv4(node.borrow().netmap().peers.iter(), destination)
+            });
             if let Some(peer) = peer {
                 enqueue(
                     actions,
@@ -538,7 +601,7 @@ async fn packets(
         enqueue(
             actions,
             node.borrow_mut()
-                .poll_tunnel(now, &crate::time::tai64n(), &mut OsRng)
+                .poll_tunnel(now, &timestamp.next(), &mut OsRng)
                 .ok()
                 .flatten(),
         );
@@ -547,6 +610,7 @@ async fn packets(
             node.borrow_mut().poll_tunnel_timers(now).ok().flatten(),
         );
         tokio::select! {
+            _=actions.ready.notified()=>{},
             received=udp.recv_from(&mut datagram)=>{let (len,from)=received.map_err(|_|"UDP receive")?;enqueue(actions,node.borrow_mut().handle_direct_from(&datagram[..len],from.into(),reactor.clock_millis(),&mut OsRng).ok().flatten());}
             command=commands.recv()=>match command {
                 Some(crate::Command::Connect {address,port,reply})=>{
@@ -584,4 +648,51 @@ pub async fn resolve_v4(host: &str) -> Option<std::net::Ipv4Addr> {
             _ => None,
         })
         .next()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn saturated_packet_queue_keeps_stateful_relay_commands() {
+        let actions = Actions::default();
+        let key = tailfeather::keys::Identity::generate(&mut OsRng)
+            .node
+            .public();
+        for _ in 0..32 {
+            enqueue(
+                &actions,
+                Some(NodeAction::DeliveredIpv4 {
+                    peer: key,
+                    packet: tailfeather::SecretBuffer::try_from_slice(&[0; 20]).unwrap(),
+                }),
+            );
+        }
+        enqueue(
+            &actions,
+            Some(NodeAction::Derp(tailfeather::DerpCommand::Connect {
+                region: 7,
+                endpoint: tailfeather::Endpoint::new("relay.invalid", 443).unwrap(),
+            })),
+        );
+        assert_eq!(actions.borrow_mut().len(), 32);
+        assert!(matches!(
+            actions.borrow_mut().back(),
+            Some(NodeAction::Derp(tailfeather::DerpCommand::Connect {
+                region: 7,
+                ..
+            }))
+        ));
+        assert!(!actions.overflow.get());
+        for _ in 0..33 {
+            enqueue(
+                &actions,
+                Some(NodeAction::Derp(tailfeather::DerpCommand::Disconnect {
+                    region: 7,
+                })),
+            );
+        }
+        assert!(actions.overflow.get());
+        assert_eq!(actions.borrow_mut().len(), 32);
+    }
 }

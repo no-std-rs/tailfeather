@@ -117,7 +117,14 @@ impl NetStack {
         let _ = iface.routes_mut().add_default_ipv4_route(GATEWAY);
         for (_, socket) in self.sockets.iter_mut() {
             let smoltcp::socket::Socket::Tcp(socket) = socket;
+            // Passive listeners are wildcard-bound and remain valid on the
+            // new interface. Reset a half-open accept back to listening too.
+            let listen = matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived)
+                .then(|| socket.listen_endpoint());
             socket.abort();
+            if let Some(endpoint) = listen {
+                let _ = socket.listen(endpoint);
+            }
         }
         self.iface = Some(iface);
         self.address = Some(address);
@@ -201,4 +208,22 @@ impl NetStack {
 
 fn instant(now_ms: u64) -> Instant {
     Instant::from_millis(now_ms as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn address_changes_keep_passive_listeners_and_end_old_connections() {
+        let mut net = NetStack::new(1);
+        net.set_address("100.64.0.1".parse().unwrap(), 0, 1);
+        let listener = net.listen(2222).unwrap();
+        let outgoing = net
+            .connect("100.64.0.2".parse().unwrap(), 2222, 49152)
+            .unwrap();
+        net.set_address("100.64.0.3".parse().unwrap(), 1, 1);
+        assert_eq!(net.tcp(listener).unwrap().state(), tcp::State::Listen);
+        assert_eq!(net.tcp(listener).unwrap().listen_endpoint().port, 2222);
+        assert_eq!(net.tcp(outgoing).unwrap().state(), tcp::State::Closed);
+    }
 }

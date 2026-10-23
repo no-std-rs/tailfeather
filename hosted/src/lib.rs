@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 mod bridge;
 mod exec;
+mod logic;
 mod net;
 mod netstack;
 mod node;

@@ -36,10 +36,22 @@ fn main() {
         to.write_all(b"round-trip").await.unwrap();
         let mut echoed=[0;10];tokio::time::timeout(Duration::from_secs(10),from.read_exact(&mut echoed)).await.unwrap().unwrap();assert_eq!(&echoed,b"round-trip");
         println!("PASS: userspace TCP binary round trip over real private-CA Headscale DERP");
+        let payload=vec![0x5a;1024*1024];let mut received=vec![0;payload.len()];
+        let transferred=tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(10),async {
+            let (sent,read)=tokio::join!(from.write_all(&payload),to.read_exact(&mut received));
+            sent.unwrap();read.unwrap();
+        }).await.unwrap();
+        assert_eq!(payload,received);
+        println!("PASS: 1 MiB DERP transfer in {:?}",transferred.elapsed());
         drop(from);drop(to);drop(listener);drop(client);drop(server);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let client=Client::start(config(&root,"hosted-client",String::new())).unwrap();
         assert_eq!(tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap(),client_ip);
-        println!("PASS: durable identity reconnects without an auth key and keeps its address");
+        println!("PASS: session identity reconnects without an auth key and keeps its address");
+        let rejected=Client::start(config(&root,"hosted-rejected","fixture-invalid-key".into())).unwrap();
+        let error=tokio::time::timeout(Duration::from_secs(10),rejected.ready()).await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(),"registration rejected");
+        println!("PASS: rejected preauth key returns an error instead of hanging ready()");
     });
 }

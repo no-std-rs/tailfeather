@@ -18,6 +18,7 @@ pub struct Slot {
     region: Cell<Option<u16>>,
     queue: RefCell<Deque<DerpCommand, 16>>,
     stop: Cell<bool>,
+    ready: tokio::sync::Notify,
 }
 impl Slot {
     pub fn new() -> Self {
@@ -25,6 +26,7 @@ impl Slot {
             region: Cell::new(None),
             queue: RefCell::new(Deque::new()),
             stop: Cell::new(false),
+            ready: tokio::sync::Notify::new(),
         }
     }
 }
@@ -34,7 +36,7 @@ pub fn dispatch(
     node: &Shared,
     actions: &Actions,
     now: u64,
-) {
+) -> Option<DerpCommand> {
     let region = match &command {
         DerpCommand::Connect { region, .. }
         | DerpCommand::Send { region, .. }
@@ -54,9 +56,10 @@ pub fn dispatch(
         slot.region.set(Some(region));
         if matches!(command, DerpCommand::Disconnect { .. }) {
             slot.stop.set(true);
-        } else if slot.queue.borrow_mut().push_back(command).is_err() {
-            tracing::debug!("POCKETBOOT TAILNET_RELAY_QUEUE_FULL region={region}");
+        } else if let Err(command) = slot.queue.borrow_mut().push_back(command) {
+            return Some(command);
         }
+        slot.ready.notify_one();
     } else {
         enqueue(
             actions,
@@ -66,6 +69,7 @@ pub fn dispatch(
                 .flatten(),
         );
     }
+    None
 }
 pub async fn worker(
     reactor: &Reactor,
@@ -77,7 +81,7 @@ pub async fn worker(
     loop {
         let next = slot.queue.borrow_mut().pop_front();
         let Some(DerpCommand::Connect { region, endpoint }) = next else {
-            reactor.sleep(20).await;
+            slot.ready.notified().await;
             continue;
         };
         slot.stop.set(false);
@@ -252,8 +256,13 @@ async fn connection(
         if slot.stop.get() {
             return Ok(());
         }
-        let next = slot.queue.borrow_mut().pop_front();
-        if let Some(DerpCommand::Send { peer, packet, .. }) = next {
+        // Drain a bounded batch immediately, then service reads or a queue
+        // notification. No per-packet polling delay throttles relay traffic.
+        for _ in 0..16 {
+            let next = slot.queue.borrow_mut().pop_front();
+            let Some(DerpCommand::Send { peer, packet, .. }) = next else {
+                break;
+            };
             let len = client
                 .send_packet(&peer, packet.as_slice(), &mut output)
                 .map_err(|_| "relay packet size")?;
@@ -263,9 +272,9 @@ async fn connection(
                 .map_err(|_| "relay send")?;
             stream.flush().await.map_err(|_| "relay flush")?;
         }
-        // The stream and frame reader retain partial record/frame progress.
-        // Complete writes above are never raced against a cancellable read.
-        let result = exec::select(frames.read(&mut stream), reactor.sleep(20)).await;
+        actions.ready.notify_one();
+        // Frames retains partial read progress when a notification cancels it.
+        let result = exec::select(frames.read(&mut stream), slot.ready.notified()).await;
         if let Either::First(frame) = result {
             let frame = frame?;
             match frame.kind {

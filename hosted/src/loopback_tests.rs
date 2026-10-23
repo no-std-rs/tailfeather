@@ -12,8 +12,7 @@ use tailfeather::keys::{Identity, NodePublic, Rng};
 use tailfeather::netmap::{Cidr, Cidr4, DerpNode, DerpRegion, Netmap, Peer};
 use tailfeather::{ControlEvent, DerpCommand, DerpEvent, Node, NodeAction};
 
-#[path = "logic.rs"]
-mod logic;
+use crate::logic;
 use crate::netstack::NetStack;
 
 const REGION: u16 = 7;

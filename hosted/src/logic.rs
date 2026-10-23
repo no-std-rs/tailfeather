@@ -96,3 +96,64 @@ pub fn next_tai64n(last: &mut [u8; 12], unix_ms: u64) -> [u8; 12] {
     *last = next;
     next
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tailfeather::{keys::Identity, netmap::Cidr};
+    fn peer(byte: u8, address: &str, route: &str) -> Peer {
+        struct R(u8);
+        impl tailfeather::keys::Rng for R {
+            fn fill_bytes(&mut self, bytes: &mut [u8]) {
+                for b in bytes {
+                    self.0 = self.0.wrapping_add(17);
+                    *b = self.0;
+                }
+            }
+        }
+        let mut p = Peer::new(byte as u64, Identity::generate(&mut R(byte)).node.public());
+        p.addresses
+            .push(Cidr4::from_cidr(Cidr::parse(address).unwrap()).unwrap())
+            .unwrap();
+        p.allowed_ips
+            .push(Cidr4::from_cidr(Cidr::parse(route).unwrap()).unwrap())
+            .unwrap();
+        p
+    }
+    #[test]
+    fn subnet_and_exit_routes_use_the_same_cryptokey_source_rule() {
+        let exit = peer(1, "100.64.0.1/32", "0.0.0.0/0");
+        let subnet = peer(2, "100.64.0.2/32", "192.168.1.0/24");
+        let direct = peer(3, "100.64.0.3/32", "100.64.0.3/32");
+        let peers = [&exit, &subnet, &direct];
+        assert_eq!(
+            route_ipv4(peers, "192.168.1.45".parse().unwrap()),
+            Some(subnet.node_key)
+        );
+        assert_eq!(
+            route_ipv4(peers, "8.8.8.8".parse().unwrap()),
+            Some(exit.node_key)
+        );
+        assert_eq!(
+            route_ipv4(peers, "100.64.0.3".parse().unwrap()),
+            Some(direct.node_key)
+        );
+        let own = "100.64.9.1".parse().unwrap();
+        let mut packet = [0u8; 20];
+        packet[0] = 0x45;
+        packet[12..16].copy_from_slice(&[192, 168, 1, 45]);
+        packet[16..20].copy_from_slice(&[100, 64, 9, 1]);
+        assert!(inbound_allowed(&packet, &subnet.node_key, peers, own));
+        assert!(!inbound_allowed(&packet, &exit.node_key, peers, own));
+        packet[12..16].copy_from_slice(&[100, 64, 0, 3]);
+        assert!(!inbound_allowed(&packet, &exit.node_key, peers, own));
+    }
+    #[test]
+    fn timestamps_remain_newer_when_wall_time_rolls_back() {
+        let mut last = [0; 12];
+        let first = next_tai64n(&mut last, 1_700_000_000_000);
+        let second = next_tai64n(&mut last, 1_699_999_000_000);
+        assert!(second > first);
+        assert!(next_tai64n(&mut last, 1_699_999_000_000) > second);
+    }
+}
