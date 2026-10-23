@@ -672,10 +672,11 @@ impl<const PEERS: usize> Node<PEERS> {
 
     /// Apply the relay selected by the platform's authenticated STUN probes.
     /// The next staged delta inherits it unless the control plane explicitly
-    /// sends a replacement `HomeDERP`.
+    /// sends a replacement `HomeDERP`. Zero clears a previously selected home
+    /// when the current map has no eligible region.
     pub fn prefer_derp(&mut self, region: u16) -> Result<(), NodeError> {
-        if region == 0
-            || self
+        if region != 0
+            && self
                 .netmap
                 .derp
                 .region(region)

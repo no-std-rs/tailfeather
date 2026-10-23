@@ -434,9 +434,9 @@ async fn control_session(
                     })
                     .map_err(node_error)?,
             );
-            refresh_home(reactor, node, &mut selected_home, &mut published_home).await?;
+            refresh_home(reactor, node, &mut selected_home).await?;
             publish(node, status)?;
-            if selected_home != 0 && published_home != selected_home {
+            if published_home != selected_home {
                 let endpoints = node.endpoints.borrow().clone();
                 let endpoint_refs: Vec<_> = endpoints.iter().map(|s| s.as_str()).collect();
                 let request = MapRequest {
@@ -446,6 +446,7 @@ async fn control_session(
                     hostinfo: Hostinfo {
                         hostname,
                         preferred_derp: selected_home,
+                        report_no_derp: selected_home == 0,
                         os: HOST_OS,
                         version: concat!("tailfeather-hosted-", env!("CARGO_PKG_VERSION")),
                         ..Default::default()
@@ -480,12 +481,7 @@ async fn control_session(
         }
     }
 }
-async fn refresh_home(
-    reactor: &Reactor,
-    node: &Shared,
-    selected: &mut u16,
-    published: &mut u16,
-) -> Result<(), Error> {
+async fn refresh_home(reactor: &Reactor, node: &Shared, selected: &mut u16) -> Result<(), Error> {
     if *selected != 0
         && node
             .borrow()
@@ -495,16 +491,13 @@ async fn refresh_home(
             .is_none_or(|region| !region.can_be_home())
     {
         *selected = 0;
-        *published = 0;
     }
     if *selected == 0 {
         *selected = select_home(reactor, node).await;
     }
-    if *selected != 0 {
-        node.borrow_mut()
-            .prefer_derp(*selected)
-            .map_err(node_error)?;
-    }
+    node.borrow_mut()
+        .prefer_derp(*selected)
+        .map_err(node_error)?;
     Ok(())
 }
 async fn select_home(reactor: &Reactor, node: &Shared) -> u16 {
@@ -948,7 +941,6 @@ mod tests {
                 node.direct = false;
                 let reactor = Reactor::new();
                 let mut selected = 7;
-                let mut published = 7;
                 for (id, excluded, expected) in [(8, false, 8), (8, true, 0), (7, false, 7)] {
                     let mut nodes = heapless::Vec::new();
                     nodes
@@ -974,11 +966,9 @@ mod tests {
                             result: Ok(()),
                         })
                         .unwrap();
-                    refresh_home(&reactor, &node, &mut selected, &mut published)
-                        .await
-                        .unwrap();
+                    refresh_home(&reactor, &node, &mut selected).await.unwrap();
                     assert_eq!(selected, expected);
-                    assert_eq!(published, 0);
+                    assert_eq!(node.borrow().netmap().home_derp, expected);
                 }
             });
     }

@@ -211,6 +211,13 @@ async fn receive_liveness(activity: &Cell<tokio::time::Instant>) {
         }
     }
 }
+fn authority(endpoint: &Endpoint) -> String {
+    if endpoint.port == 443 {
+        endpoint.host.to_string()
+    } else {
+        format!("{}:{}", endpoint.host, endpoint.port)
+    }
+}
 async fn connection(
     reactor: &Reactor,
     node: &Shared,
@@ -243,7 +250,8 @@ async fn connection(
     let mut output = [0u8; FRAME];
     let mut frames = Frames::new();
     let client = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        let req = tailfeather::derp::client::write_upgrade_request(&endpoint.host, &mut output)
+        let authority = authority(endpoint);
+        let req = tailfeather::derp::client::write_upgrade_request(&authority, &mut output)
             .map_err(|_| "relay upgrade")?;
         stream
             .write_all(req)
@@ -426,6 +434,22 @@ mod tests {
                 }
                 assert_eq!(started.elapsed(), std::time::Duration::from_secs(150));
             });
+    }
+    #[test]
+    fn upgrade_authority_includes_a_nondefault_port() {
+        for (port, expected) in [
+            (443, "Host: relay.example\r\n"),
+            (18443, "Host: relay.example:18443\r\n"),
+        ] {
+            let endpoint = Endpoint::new("relay.example", port).unwrap();
+            let mut buffer = [0; 512];
+            let request = tailfeather::derp::client::write_upgrade_request(
+                &authority(&endpoint),
+                &mut buffer,
+            )
+            .unwrap();
+            assert!(std::str::from_utf8(request).unwrap().contains(expected));
+        }
     }
     #[test]
     fn a_silent_relay_expires_after_the_last_received_frame() {
