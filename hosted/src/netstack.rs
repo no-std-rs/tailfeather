@@ -3,14 +3,16 @@
 //! encapsulate for the owning peer; packets the node decrypts are queued for
 //! smoltcp to receive.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Packet, TcpPacket,
+};
 
 /// The tunnel's inner MTU, which is also what peers expect of Tailscale.
 pub const MTU: usize = 1280;
@@ -81,6 +83,39 @@ pub struct TcpHandle {
     socket: SocketHandle,
 }
 
+struct TcpFrame {
+    source: IpEndpoint,
+    destination: IpEndpoint,
+    fin_end: Option<i32>,
+    ack: Option<i32>,
+}
+fn tcp_frame(bytes: &[u8]) -> Option<TcpFrame> {
+    let ip = Ipv4Packet::new_checked(bytes).ok()?;
+    if ip.next_header() != IpProtocol::Tcp
+        || ip.more_frags()
+        || ip.frag_offset() != 0
+        || !ip.verify_checksum()
+    {
+        return None;
+    }
+    let source = IpAddress::Ipv4(ip.src_addr());
+    let destination = IpAddress::Ipv4(ip.dst_addr());
+    let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+    if !tcp.verify_checksum(&source, &destination) {
+        return None;
+    }
+    Some(TcpFrame {
+        source: IpEndpoint::new(source, tcp.src_port()),
+        destination: IpEndpoint::new(destination, tcp.dst_port()),
+        fin_end: tcp.fin().then(|| {
+            tcp.seq_number()
+                .0
+                .wrapping_add(tcp.payload().len() as i32)
+                .wrapping_add(1)
+        }),
+        ack: (tcp.ack() && !tcp.rst()).then(|| tcp.ack_number().0),
+    })
+}
 pub struct NetStack {
     id: u64,
     device: Tunnel,
@@ -88,6 +123,7 @@ pub struct NetStack {
     pub sockets: SocketSet<'static>,
     address: Option<Ipv4Addr>,
     pub close_failed: bool,
+    fins: HashMap<SocketHandle, (i32, bool)>,
 }
 
 impl NetStack {
@@ -99,6 +135,7 @@ impl NetStack {
             sockets: SocketSet::new(Vec::new()),
             address: None,
             close_failed: false,
+            fins: HashMap::new(),
         }
     }
 
@@ -131,6 +168,7 @@ impl NetStack {
                 let _ = socket.listen(endpoint);
             }
         }
+        self.fins.clear();
         self.iface = Some(iface);
         self.address = Some(address);
     }
@@ -138,6 +176,20 @@ impl NetStack {
     /// Queue a decrypted packet for smoltcp.
     pub fn deliver(&mut self, packet: &[u8]) {
         if self.device.rx.len() < QUEUE_LIMIT {
+            if let Some(frame) = tcp_frame(packet)
+                && let Some(ack) = frame.ack
+            {
+                for (handle, socket) in self.sockets.iter() {
+                    let smoltcp::socket::Socket::Tcp(socket) = socket;
+                    if socket.local_endpoint() == Some(frame.destination)
+                        && socket.remote_endpoint() == Some(frame.source)
+                        && let Some((expected, acknowledged)) = self.fins.get_mut(&handle)
+                        && *expected == ack
+                    {
+                        *acknowledged = true;
+                    }
+                }
+            }
             self.device.rx.push_back(packet.to_vec());
         }
     }
@@ -149,7 +201,22 @@ impl NetStack {
         } else {
             self.device.rx.clear();
         }
-        self.device.tx.drain(..).collect()
+        let packets: Vec<Vec<u8>> = self.device.tx.drain(..).collect();
+        for packet in &packets {
+            if let Some(frame) = tcp_frame(packet)
+                && let Some(end) = frame.fin_end
+            {
+                for (handle, socket) in self.sockets.iter() {
+                    let smoltcp::socket::Socket::Tcp(socket) = socket;
+                    if socket.local_endpoint() == Some(frame.source)
+                        && socket.remote_endpoint() == Some(frame.destination)
+                    {
+                        self.fins.entry(handle).or_insert((end, false));
+                    }
+                }
+            }
+        }
+        packets
     }
 
     /// Open a TCP connection. It completes asynchronously as packets flow.
@@ -194,6 +261,24 @@ impl NetStack {
         })
     }
 
+    pub fn close_outcome(&mut self, handle: TcpHandle) -> Option<bool> {
+        let acknowledged = self
+            .fins
+            .get(&handle.socket)
+            .is_some_and(|(_, acknowledged)| *acknowledged);
+        let Some(socket) = self.tcp(handle) else {
+            return Some(false);
+        };
+        match socket.state() {
+            tcp::State::Closed => Some(acknowledged && socket.send_queue() == 0),
+            tcp::State::FinWait2 | tcp::State::TimeWait
+                if acknowledged && socket.send_queue() == 0 =>
+            {
+                Some(true)
+            }
+            _ => None,
+        }
+    }
     pub fn drained(&self) -> bool {
         self.sockets.iter().all(|(_, socket)| {
             let smoltcp::socket::Socket::Tcp(socket) = socket;
@@ -239,6 +324,7 @@ impl NetStack {
         if handle.stack == self.id {
             self.sockets.get_mut::<tcp::Socket>(handle.socket).abort();
             self.sockets.remove(handle.socket);
+            self.fins.remove(&handle.socket);
         }
     }
 }
@@ -250,6 +336,48 @@ fn instant(now_ms: u64) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn drain_distinguishes_a_reset_from_acknowledged_final_data() {
+        for reset in [false, true] {
+            let mut local = NetStack::new(1);
+            let mut remote = NetStack::new(2);
+            local.set_address("100.64.0.1".parse().unwrap(), 0, 1);
+            remote.set_address("100.64.0.2".parse().unwrap(), 0, 2);
+            let accepted = remote.listen(2222).unwrap();
+            let client = local
+                .connect("100.64.0.2".parse().unwrap(), 2222, 49152)
+                .unwrap();
+            for now in 0..10 {
+                for bytes in local.poll(now) {
+                    remote.deliver(&bytes);
+                }
+                for bytes in remote.poll(now) {
+                    local.deliver(&bytes);
+                }
+            }
+            assert_eq!(local.tcp(client).unwrap().state(), tcp::State::Established);
+            local.tcp(client).unwrap().send_slice(b"final").unwrap();
+            local.tcp(client).unwrap().close();
+            let final_packets = local.poll(10);
+            assert!(!final_packets.is_empty());
+            if reset {
+                remote.tcp(accepted).unwrap().abort();
+            } else {
+                for bytes in final_packets {
+                    remote.deliver(&bytes);
+                }
+            }
+            for now in 11..100 {
+                for bytes in remote.poll(now) {
+                    local.deliver(&bytes);
+                }
+                for bytes in local.poll(now) {
+                    remote.deliver(&bytes);
+                }
+            }
+            assert_eq!(local.close_outcome(client), Some(!reset));
+        }
+    }
     #[test]
     fn wrapping_source_port_selection_preserves_active_four_tuples() {
         let mut net = NetStack::new(1);

@@ -149,22 +149,14 @@ async fn bridge(runtime: Shared, handle: TcpHandle, stream: DuplexStream) {
     let closed = copied
         && tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let done = runtime.borrow_mut().tcp(handle).is_none_or(|socket| {
-                    matches!(
-                        socket.state(),
-                        smoltcp::socket::tcp::State::Closed
-                            | smoltcp::socket::tcp::State::FinWait2
-                            | smoltcp::socket::tcp::State::TimeWait
-                    ) && socket.send_queue() == 0
-                });
-                if done {
-                    break;
+                if let Some(outcome) = runtime.borrow_mut().close_outcome(handle) {
+                    break outcome;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .is_ok();
+        .unwrap_or(false);
     let mut net = runtime.borrow_mut();
     net.close_failed |= !closed;
     net.remove(handle);

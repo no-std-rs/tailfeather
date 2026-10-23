@@ -49,7 +49,9 @@ TCP write shutdown preserves the response reader. Fully dropped streams release
 half-closed sockets after acknowledging queued data and FIN, with bounded close
 deadlines even when the peer stops responding. Call `Client::drain().await` after
 dropping application streams and before dropping the client to retain final writes.
-Drain returns an error if a close fails or its 15-second deadline expires.
+Drain rejects live listeners and returns an error if a close is reset, fails,
+or its 15-second deadline expires. FIN acknowledgement is tracked from the
+validated TCP flow rather than inferred from an empty send queue.
 Directional ACLs govern incoming connection attempts; TCP continuation packets
 still require cryptokey source validation and the TCP stack's sequence checks.
 
@@ -66,7 +68,9 @@ publishing reflexive candidates. `relay_only` omits these candidates. TCP races
 up to 16 distinct IPv4 DNS answers within a 15-second total connection deadline.
 Custom CA DER is validated before the runtime starts. DERP protocol handshakes
 have a 20-second deadline and disconnect commands cancel pending handshakes;
-valid large extension frames are drained without growing buffers.
+valid large extension frames are drained without growing buffers. Invalid or
+over-capacity netmaps stop the node, including during endpoint publication, so
+an older ACL cannot remain active after an unsupported policy update.
 
 The Headscale fixture runner also accepts `--direct --offline-direct`. After it
 prints `READY`, stop the fixture and create `continue` in its directory. It then

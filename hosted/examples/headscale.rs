@@ -33,6 +33,7 @@ fn main() {
         assert!(tailfeather_hosted::is_enrolled(&root.join("hosted-server"),"https://localhost:18443").unwrap());
         assert!(tailfeather_hosted::is_enrolled(&root.join("hosted-server"),"https://other.invalid").is_err());
         let mut listener=server.listen(2222).await.unwrap();
+        assert_eq!(server.drain().await.unwrap_err().kind(),std::io::ErrorKind::InvalidInput);
         let mut from=client.connect(server_ip,2222).await.unwrap();
         let mut to=tokio::time::timeout(Duration::from_secs(30),listener.accept()).await.unwrap().unwrap();
         use tokio::io::{AsyncReadExt,AsyncWriteExt};

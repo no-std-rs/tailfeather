@@ -186,7 +186,7 @@ impl Client {
             .map_err(|_| io::Error::other("node stopped"))??;
         Ok(Listener { receiver })
     }
-    /// After dropping streams, wait for their final bytes and FINs to be
+    /// After dropping listeners and streams, wait for final bytes and FINs to be
     /// acknowledged before dropping this client. Stop creating connections
     /// while draining. A failed close or a 15-second deadline returns an error.
     pub async fn drain(&self) -> io::Result<()> {

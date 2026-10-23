@@ -240,7 +240,7 @@ async fn control_loop(
         }
         let session = control_session(reactor, node, actions, authority, status, config);
         if let Err(stage) = session.await {
-            if stage == "registration rejected" {
+            if matches!(stage, "registration rejected" | "netmap rejected") {
                 return Err(stage);
             }
             tracing::debug!("POCKETBOOT TAILNET_CONTROL_RETRY stage={stage}");
@@ -432,6 +432,7 @@ async fn control_session(
         let event =
             match exec::select(maps.next(&mut http, &mut staging), reactor.sleep(90000)).await {
                 Either::First(Ok(event)) => event,
+                Either::First(Err(error)) => return Err(map_failure(error)),
                 _ => return Err("map timeout"),
             };
         if matches!(event, MapEvent::Applied) {
@@ -492,6 +493,7 @@ async fn control_session(
                 .await
                 {
                     Either::First(Ok(())) => {}
+                    Either::First(Err(error)) => return Err(map_failure(error)),
                     _ => return Err("endpoint update"),
                 }
                 published_home = Some(selected_home);
@@ -499,6 +501,14 @@ async fn control_session(
                 tracing::debug!("POCKETBOOT TAILNET_HOME_PUBLISHED region={selected_home}");
             }
         }
+    }
+}
+fn map_failure<E>(error: transport::Error<E>) -> Error {
+    match error {
+        transport::Error::Netmap(_)
+        | transport::Error::ResponseTooLong
+        | transport::Error::FrameTooLarge => "netmap rejected",
+        _ => "map transport",
     }
 }
 async fn refresh_home(
@@ -815,7 +825,8 @@ async fn packets(
             received=udp.recv_from(&mut datagram)=>{let (len,from)=received.map_err(|_|"UDP receive")?;if node.receive_stun(&datagram[..len],from){continue;}enqueue(actions,node.borrow_mut().handle_direct_from(&datagram[..len],from.into(),reactor.clock_millis(),&mut OsRng).ok().flatten());}
             command=commands.recv()=>match command {
                 Some(crate::Command::Drain { reply }) => {
-                    if drain.as_ref().is_some_and(|reply| !reply.is_closed()) { let _ = reply.send(Err(std::io::Error::other("TCP drain already pending"))); }
+                    if listeners.iter().any(|(_,_,incoming)|!incoming.is_closed()) { let _=reply.send(Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"drop listeners before draining"))); }
+                    else if drain.as_ref().is_some_and(|reply| !reply.is_closed()) { let _ = reply.send(Err(std::io::Error::other("TCP drain already pending"))); }
                     else { drain=Some(reply); }
                 }
                 Some(crate::Command::Connect {address,port,reply})=>{
@@ -1045,6 +1056,20 @@ mod tests {
                     assert_eq!(node.borrow().netmap().home_derp, expected);
                 }
             });
+    }
+    #[test]
+    fn over_capacity_acl_updates_are_terminal() {
+        let rules=(0..100).map(|port|format!(r#"{{"SrcIPs":["*"],"DstPorts":[{{"IP":"*","Ports":{{"First":{port},"Last":{port}}}}}]}}"#)).collect::<Vec<_>>().join(",");
+        let json = format!(r#"{{"PacketFilter":[{rules}]}}"#);
+        let mut map = tailfeather::netmap::Netmap::<PEERS>::new();
+        let mut parser = tailfeather::netmap::Parser::new();
+        parser.push(&mut map, json.as_bytes()).unwrap();
+        let error = parser.finish(&mut map).unwrap_err();
+        assert!(matches!(error, tailfeather::netmap::Error::Full(_)));
+        assert_eq!(
+            map_failure(transport::Error::<std::io::Error>::Netmap(error)),
+            "netmap rejected"
+        );
     }
     #[test]
     fn map_status_bursts_cannot_exhaust_the_action_queue() {
