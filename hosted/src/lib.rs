@@ -68,6 +68,7 @@ impl Client {
         }
         tailfeather::control::authority::Authority::parse(&config.control_url, false)
             .map_err(|_| io::Error::other("HTTPS control origin required"))?;
+        tls::roots(&config.control_ca_der)?;
         store::create_directory(&config.directory)?;
         let lock = std::fs::OpenOptions::new()
             .create(true)

@@ -8,7 +8,7 @@ fn config(root: &std::path::Path, name: &str, auth: String) -> Config {
         hostname: name.into(),
         auth_key: auth,
         control_ca_der: std::fs::read(root.join("ca.der")).unwrap(),
-        relay_only: true,
+        relay_only: !std::env::args().any(|arg| arg == "--direct"),
         ephemeral: std::env::args().any(|arg| arg == "--ephemeral"),
     }
 }
@@ -25,6 +25,11 @@ fn main() {
         let server_ip=tokio::time::timeout(Duration::from_secs(60),server.ready()).await.unwrap().unwrap();
         let client_ip=tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap();
         println!("PASS: real Headscale registration/map with private CA; server={server_ip}, client={client_ip}");
+        if std::env::args().any(|arg|arg=="--offline-direct") {
+            println!("READY: stop the fixture, then create continue in its directory");
+            use std::io::Write;std::io::stdout().flush().unwrap();
+            tokio::time::timeout(Duration::from_secs(60),async { while !root.join("continue").exists(){tokio::time::sleep(Duration::from_millis(20)).await;} }).await.unwrap();
+        }
         assert!(tailfeather_hosted::is_enrolled(&root.join("hosted-server"),"https://localhost:18443").unwrap());
         assert!(tailfeather_hosted::is_enrolled(&root.join("hosted-server"),"https://other.invalid").is_err());
         let mut listener=server.listen(2222).await.unwrap();
@@ -35,7 +40,8 @@ fn main() {
         let mut input=[0;5];tokio::time::timeout(Duration::from_secs(10),to.read_exact(&mut input)).await.unwrap().unwrap();assert_eq!(input,[0,1,2,255,10]);
         to.write_all(b"round-trip").await.unwrap();
         let mut echoed=[0;10];tokio::time::timeout(Duration::from_secs(10),from.read_exact(&mut echoed)).await.unwrap().unwrap();assert_eq!(&echoed,b"round-trip");
-        println!("PASS: userspace TCP binary round trip over real private-CA Headscale DERP");
+        let mode=if std::env::args().any(|arg|arg=="--direct") {"direct UDP"}else{"DERP"};
+        println!("PASS: userspace TCP binary round trip over real private-CA Headscale {mode}");
         let payload=vec![0x5a;1024*1024];let mut received=vec![0;payload.len()];
         let transferred=tokio::time::Instant::now();
         tokio::time::timeout(Duration::from_secs(10),async {
@@ -43,7 +49,10 @@ fn main() {
             sent.unwrap();read.unwrap();
         }).await.unwrap();
         assert_eq!(payload,received);
-        println!("PASS: 1 MiB DERP transfer in {:?}",transferred.elapsed());
+        println!("PASS: 1 MiB {mode} transfer in {:?}",transferred.elapsed());
+        if std::env::args().any(|arg|arg=="--offline-direct") {
+            println!("PASS: direct TCP works with control and DERP offline");return;
+        }
         drop(from);drop(to);drop(listener);drop(client);drop(server);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let client=Client::start(config(&root,"hosted-client",String::new())).unwrap();

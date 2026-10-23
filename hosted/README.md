@@ -19,8 +19,11 @@ let node = Client::start(Config {
     relay_only: false,
     ephemeral: true,
 })?;
-let address = node.ready().await?;
-let stream = node.connect(address, 2222).await?;
+let own_address = node.ready().await?;
+// Obtain the target's current address from your application's approved device
+// directory (for example the rzero backend), rather than using own_address.
+let peer_address = "100.64.0.2".parse().unwrap();
+let stream = node.connect(peer_address, 2222).await?;
 # Ok(()) }
 ```
 
@@ -46,3 +49,16 @@ TLS, real DERP TCP exchange and reconnects against a local Headscale fixture at
 `https://localhost:18443`. It takes a directory containing `ca.der` and a private
 `keys.json` array of two fixture-only preauth keys; `--ephemeral` exercises
 ephemeral registration on both ends. It never accepts keys as command arguments.
+
+Direct mode advertises the bound UDP port on the control connection's local
+interface and validates STUN replies received on that same data socket before
+publishing reflexive candidates. `relay_only` omits these candidates. TCP races
+up to 16 distinct IPv4 DNS answers within a 15-second total connection deadline.
+Custom CA DER is validated before the runtime starts. DERP protocol handshakes
+have a 20-second deadline and disconnect commands cancel pending handshakes;
+valid large extension frames are drained without growing buffers.
+
+The Headscale fixture runner also accepts `--direct --offline-direct`. After it
+prints `READY`, stop the fixture and create `continue` in its directory. It then
+establishes a new TCP connection and transfers 1 MiB using direct UDP while both
+control and DERP are offline, skipping the reconnect tests that need the server.

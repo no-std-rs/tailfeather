@@ -19,6 +19,7 @@ pub struct Slot {
     queue: RefCell<Deque<DerpCommand, 16>>,
     stop: Cell<bool>,
     ready: tokio::sync::Notify,
+    stopped: tokio::sync::Notify,
 }
 impl Slot {
     pub fn new() -> Self {
@@ -27,6 +28,7 @@ impl Slot {
             queue: RefCell::new(Deque::new()),
             stop: Cell::new(false),
             ready: tokio::sync::Notify::new(),
+            stopped: tokio::sync::Notify::new(),
         }
     }
 }
@@ -56,6 +58,7 @@ pub fn dispatch(
         slot.region.set(Some(region));
         if matches!(command, DerpCommand::Disconnect { .. }) {
             slot.stop.set(true);
+            slot.stopped.notify_waiters();
         } else if let Err(command) = slot.queue.borrow_mut().push_back(command) {
             return Some(command);
         }
@@ -85,10 +88,19 @@ pub async fn worker(
             continue;
         };
         slot.stop.set(false);
-        if connection(reactor, node, actions, slot, region, &endpoint, ca)
-            .await
-            .is_err()
-        {
+        let stopped = async {
+            loop {
+                if slot.stop.get() {
+                    break;
+                }
+                slot.stopped.notified().await;
+            }
+        };
+        let result = tokio::select! {
+            result=connection(reactor,node,actions,slot,region,&endpoint,ca)=>result,
+            _=stopped=>Ok(()),
+        };
+        if result.is_err() {
             tracing::debug!("POCKETBOOT TAILNET_RELAY_RETRY region={region}");
         }
         slot.queue.borrow_mut().clear();
@@ -111,20 +123,44 @@ pub async fn worker(
 struct Frames {
     bytes: [u8; FRAME],
     filled: usize,
+    discard: usize,
 }
 impl Frames {
     fn new() -> Self {
         Self {
             bytes: [0; FRAME],
             filled: 0,
+            discard: 0,
         }
     }
     async fn read<S: Read>(&mut self, stream: &mut S) -> Result<Frame, Error> {
         loop {
+            if self.discard > 0 {
+                if self.filled > 0 {
+                    let take = self.discard.min(self.filled);
+                    self.bytes.copy_within(take..self.filled, 0);
+                    self.filled -= take;
+                    self.discard -= take;
+                } else {
+                    let limit = self.discard.min(FRAME);
+                    let n = stream
+                        .read(&mut self.bytes[..limit])
+                        .await
+                        .map_err(|_| "relay drain")?;
+                    if n == 0 {
+                        return Err("relay EOF");
+                    }
+                    self.discard -= n;
+                }
+                continue;
+            }
             if self.filled >= frame::HEADER_LEN {
                 let frame = Frame::parse(&self.bytes[..self.filled]).map_err(|_| "relay frame")?;
                 if frame.length > FRAME - frame::HEADER_LEN {
-                    return Err("relay frame bound");
+                    self.bytes.copy_within(frame::HEADER_LEN..self.filled, 0);
+                    self.filled -= frame::HEADER_LEN;
+                    self.discard = frame.length;
+                    continue;
                 }
                 if self.filled >= frame::HEADER_LEN + frame.length {
                     return Ok(frame);
@@ -158,18 +194,9 @@ async fn connection(
     endpoint: &Endpoint,
     ca: &[u8],
 ) -> Result<(), Error> {
-    let ip = crate::node::resolve_v4(&endpoint.host)
+    let socket = TcpStream::connect_host(reactor, &endpoint.host, endpoint.port)
         .await
-        .ok_or("relay DNS")?;
-    let socket = match exec::select(
-        TcpStream::connect(reactor, ip, endpoint.port),
-        reactor.sleep(15000),
-    )
-    .await
-    {
-        Either::First(Ok(s)) => s,
-        _ => return Err("relay TCP"),
-    };
+        .map_err(|_| "relay TCP")?;
     let mut read = [0; tailfeather::control::tls::TLS_READ_BUFFER];
     let mut write = [0; tailfeather::control::tls::TLS_WRITE_BUFFER];
     let name = endpoint
@@ -188,58 +215,64 @@ async fn connection(
         _ => return Err("relay TLS"),
     };
     let mut output = [0u8; FRAME];
-    let req = tailfeather::derp::client::write_upgrade_request(&endpoint.host, &mut output)
-        .map_err(|_| "relay upgrade")?;
-    stream
-        .write_all(req)
-        .await
-        .map_err(|_| "relay upgrade write")?;
-    stream.flush().await.map_err(|_| "relay flush")?;
-    let mut header = [0u8; 2048];
-    let mut filled = 0;
-    loop {
-        if filled == header.len() {
-            return Err("relay upgrade size");
-        }
-        let n = stream
-            .read(&mut header[filled..filled + 1])
-            .await
-            .map_err(|_| "relay upgrade read")?;
-        if n == 0 {
-            return Err("relay upgrade EOF");
-        }
-        filled += n;
-        if header[..filled].ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
-    tailfeather::derp::client::parse_upgrade(&header[..filled])
-        .map_err(|_| "relay upgrade response")?;
     let mut frames = Frames::new();
-    let frame = frames.read(&mut stream).await?;
-    let server =
-        Client::read_server_key(frame, frames.payload(frame)).map_err(|_| "relay server key")?;
-    frames.consume(frame);
-    let key = node.borrow().identity().node.clone();
-    let len = Client::write_client_info(&key, &key.public(), &server, &mut OsRng, &mut output)
-        .map_err(|_| "relay client info")?;
-    stream
-        .write_all(&output[..len])
-        .await
-        .map_err(|_| "relay auth write")?;
-    stream.flush().await.map_err(|_| "relay auth flush")?;
-    let frame = frames.read(&mut stream).await?;
-    let client = Client::read_server_info(&key, &server, frame, frames.payload(frame), &mut output)
-        .map_err(|_| "relay authentication")?;
-    frames.consume(frame);
-    let preferred = node.borrow().netmap().home_derp == region;
-    let len =
-        Client::write_note_preferred(preferred, &mut output).map_err(|_| "relay preferred")?;
-    stream
-        .write_all(&output[..len])
-        .await
-        .map_err(|_| "relay write")?;
-    stream.flush().await.map_err(|_| "relay flush")?;
+    let client = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let req = tailfeather::derp::client::write_upgrade_request(&endpoint.host, &mut output)
+            .map_err(|_| "relay upgrade")?;
+        stream
+            .write_all(req)
+            .await
+            .map_err(|_| "relay upgrade write")?;
+        stream.flush().await.map_err(|_| "relay flush")?;
+        let mut header = [0u8; 2048];
+        let mut filled = 0;
+        loop {
+            if filled == header.len() {
+                return Err("relay upgrade size");
+            }
+            let n = stream
+                .read(&mut header[filled..filled + 1])
+                .await
+                .map_err(|_| "relay upgrade read")?;
+            if n == 0 {
+                return Err("relay upgrade EOF");
+            }
+            filled += n;
+            if header[..filled].ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        tailfeather::derp::client::parse_upgrade(&header[..filled])
+            .map_err(|_| "relay upgrade response")?;
+        let frame = frames.read(&mut stream).await?;
+        let server = Client::read_server_key(frame, frames.payload(frame))
+            .map_err(|_| "relay server key")?;
+        frames.consume(frame);
+        let key = node.borrow().identity().node.clone();
+        let len = Client::write_client_info(&key, &key.public(), &server, &mut OsRng, &mut output)
+            .map_err(|_| "relay client info")?;
+        stream
+            .write_all(&output[..len])
+            .await
+            .map_err(|_| "relay auth write")?;
+        stream.flush().await.map_err(|_| "relay auth flush")?;
+        let frame = frames.read(&mut stream).await?;
+        let client =
+            Client::read_server_info(&key, &server, frame, frames.payload(frame), &mut output)
+                .map_err(|_| "relay authentication")?;
+        frames.consume(frame);
+        let preferred = node.borrow().netmap().home_derp == region;
+        let len =
+            Client::write_note_preferred(preferred, &mut output).map_err(|_| "relay preferred")?;
+        stream
+            .write_all(&output[..len])
+            .await
+            .map_err(|_| "relay write")?;
+        stream.flush().await.map_err(|_| "relay flush")?;
+        Ok::<_, Error>(client)
+    })
+    .await
+    .map_err(|_| "relay protocol handshake deadline")??;
     enqueue(
         actions,
         node.borrow_mut()
@@ -316,5 +349,55 @@ async fn connection(
             }
             frames.consume(frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Input(tokio::io::DuplexStream);
+    impl embedded_io_async::ErrorType for Input {
+        type Error = std::io::Error;
+    }
+    impl Read for Input {
+        async fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            tokio::io::AsyncReadExt::read(&mut self.0, out).await
+        }
+    }
+    #[test]
+    fn oversized_frames_are_drained_across_cancelled_reads() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tokio::io::AsyncWriteExt;
+                let (input, mut output) = tokio::io::duplex(131072);
+                let mut input = Input(input);
+                let mut header = [0; 5];
+                header[0] = 0x14;
+                header[1..].copy_from_slice(&65536u32.to_be_bytes());
+                output.write_all(&header).await.unwrap();
+                output.write_all(&[1; 16]).await.unwrap();
+                let mut frames = Frames::new();
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(5),
+                        frames.read(&mut input)
+                    )
+                    .await
+                    .is_err()
+                );
+                output.write_all(&vec![1; 65536 - 16]).await.unwrap();
+                let mut ping = [0; 13];
+                let n = frame::write(FrameType::Ping, b"12345678", &mut ping).unwrap();
+                output.write_all(&ping[..n]).await.unwrap();
+                let parsed = frames.read(&mut input).await.unwrap();
+                assert_eq!(parsed.kind, FrameType::Ping);
+                assert_eq!(frames.payload(parsed), b"12345678");
+                frames.consume(parsed);
+                drop(output);
+                assert!(frames.read(&mut input).await.is_err());
+            });
     }
 }

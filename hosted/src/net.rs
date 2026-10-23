@@ -5,9 +5,59 @@ use std::{
 };
 pub struct TcpStream(pub tokio::net::TcpStream);
 impl TcpStream {
-    pub async fn connect(_: &Reactor, ip: Ipv4Addr, port: u16) -> io::Result<Self> {
-        tokio::net::TcpStream::connect((ip, port)).await.map(Self)
+    pub async fn connect_host(_: &Reactor, host: &str, port: u16) -> io::Result<Self> {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let addresses = resolve_v4(host).await?;
+            connect_addresses(
+                addresses
+                    .into_iter()
+                    .map(|ip| SocketAddrV4::new(ip, port))
+                    .collect(),
+            )
+            .await
+            .map(Self)
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connection deadline"))?
     }
+}
+pub async fn resolve_v4(host: &str) -> io::Result<Vec<Ipv4Addr>> {
+    let resolved = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::lookup_host((host, 0)),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS deadline"))??;
+    let mut addresses = Vec::new();
+    for address in resolved {
+        if let std::net::IpAddr::V4(ip) = address.ip()
+            && !addresses.contains(&ip)
+        {
+            addresses.push(ip);
+            if addresses.len() == 16 {
+                break;
+            }
+        }
+    }
+    if addresses.is_empty() {
+        return Err(io::Error::other("no IPv4 addresses"));
+    }
+    Ok(addresses)
+}
+async fn connect_addresses(addresses: Vec<SocketAddrV4>) -> io::Result<tokio::net::TcpStream> {
+    let mut attempts = tokio::task::JoinSet::new();
+    for (index, address) in addresses.into_iter().enumerate() {
+        attempts.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(index as u64 * 250)).await;
+            tokio::net::TcpStream::connect(address).await
+        });
+    }
+    while let Some(result) = attempts.join_next().await {
+        if let Ok(Ok(stream)) = result {
+            return Ok(stream);
+        }
+    }
+    Err(io::Error::other("all resolved addresses failed"))
 }
 impl embedded_io_async::ErrorType for TcpStream {
     type Error = io::Error;
@@ -27,6 +77,12 @@ impl embedded_io_async::Write for TcpStream {
 }
 pub struct UdpSocket(tokio::net::UdpSocket);
 impl UdpSocket {
+    pub fn local_addr(&self) -> io::Result<SocketAddrV4> {
+        match self.0.local_addr()? {
+            std::net::SocketAddr::V4(v) => Ok(v),
+            _ => Err(io::Error::other("IPv6 unsupported")),
+        }
+    }
     pub async fn bind(_: &Reactor, ip: Ipv4Addr, port: u16) -> io::Result<Self> {
         tokio::net::UdpSocket::bind((ip, port)).await.map(Self)
     }
@@ -39,5 +95,38 @@ impl UdpSocket {
             std::net::SocketAddr::V4(v) => Ok((len, v)),
             _ => Err(io::Error::other("IPv6 unsupported")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn connection_uses_a_healthy_alternate_address() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .unwrap();
+                let good = match listener.local_addr().unwrap() {
+                    std::net::SocketAddr::V4(v) => v,
+                    _ => unreachable!(),
+                };
+                let bad = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), good.port());
+                let connected = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    connect_addresses(vec![bad, good]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    connected.peer_addr().unwrap(),
+                    std::net::SocketAddr::V4(good)
+                );
+            });
     }
 }

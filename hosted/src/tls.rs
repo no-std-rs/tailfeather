@@ -6,6 +6,16 @@ use tokio_rustls::{
         pki_types::{CertificateDer, ServerName},
     },
 };
+pub fn roots(ca: &[u8]) -> io::Result<rustls::RootCertStore> {
+    let mut roots =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if !ca.is_empty() {
+        roots
+            .add(CertificateDer::from(ca.to_vec()))
+            .map_err(|_| io::Error::other("invalid control CA"))?;
+    }
+    Ok(roots)
+}
 pub struct Stream(tokio_rustls::client::TlsStream<tokio::net::TcpStream>);
 pub async fn connect(
     socket: crate::net::TcpStream,
@@ -14,13 +24,7 @@ pub async fn connect(
     _: &mut [u8],
     _: &mut [u8],
 ) -> io::Result<Stream> {
-    let mut roots =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if !ca.is_empty() {
-        roots
-            .add(CertificateDer::from(ca.to_vec()))
-            .map_err(|_| io::Error::other("invalid control CA"))?;
-    }
+    let roots = roots(ca)?;
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -49,5 +53,24 @@ impl embedded_io_async::Write for Stream {
     }
     async fn flush(&mut self) -> io::Result<()> {
         tokio::io::AsyncWriteExt::flush(&mut self.0).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn malformed_custom_ca_fails_before_a_node_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let result = crate::Client::start(crate::Config {
+            directory: root.path().join("unused"),
+            control_url: "https://control.invalid".into(),
+            hostname: "fixture".into(),
+            auth_key: "fixture-only".into(),
+            control_ca_der: vec![1, 2, 3],
+            relay_only: false,
+            ephemeral: true,
+        });
+        assert!(matches!(result,Err(error) if error.to_string()=="invalid control CA"));
+        assert!(!root.path().join("unused").exists());
     }
 }

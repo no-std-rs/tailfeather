@@ -18,7 +18,52 @@ const HOST_OS: &str = if cfg!(target_os = "macos") {
 } else {
     std::env::consts::OS
 };
-pub type Shared = RefCell<Node<PEERS>>;
+pub struct Shared {
+    node: RefCell<Node<PEERS>>,
+    udp: UdpSocket,
+    probe: RefCell<Option<Probe>>,
+    endpoints: RefCell<Vec<std::string::String>>,
+    direct: bool,
+}
+struct Probe {
+    transaction: [u8; 12],
+    server: core::net::SocketAddrV4,
+    reply: tokio::sync::oneshot::Sender<core::net::SocketAddrV4>,
+}
+impl Shared {
+    pub fn borrow(&self) -> std::cell::Ref<'_, Node<PEERS>> {
+        self.node.borrow()
+    }
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, Node<PEERS>> {
+        self.node.borrow_mut()
+    }
+    fn candidate(&self, address: core::net::SocketAddrV4) {
+        if !self.direct || address.ip().is_unspecified() || address.ip().is_multicast() {
+            return;
+        }
+        let text = address.to_string();
+        let mut endpoints = self.endpoints.borrow_mut();
+        if endpoints.len() < 8 && !endpoints.contains(&text) {
+            endpoints.push(text);
+        }
+    }
+    fn receive_stun(&self, bytes: &[u8], from: core::net::SocketAddrV4) -> bool {
+        let mapped = self.probe.borrow().as_ref().and_then(|p| {
+            (p.server == from)
+                .then(|| tailfeather::stun::response(bytes, p.transaction).ok())
+                .flatten()
+        });
+        if let Some((ip, port)) = mapped {
+            if let Some(probe) = self.probe.borrow_mut().take() {
+                let _ = probe
+                    .reply
+                    .send(core::net::SocketAddrV4::new(ip.into(), port));
+            }
+            return true;
+        }
+        false
+    }
+}
 #[derive(Default)]
 pub struct Actions {
     queue: RefCell<VecDeque<NodeAction>>,
@@ -90,15 +135,21 @@ pub async fn run(
     node.set_control_endpoint(
         tailfeather::Endpoint::new(authority.host(), authority.port()).map_err(node_error)?,
     );
-    let node = RefCell::new(node);
-    let actions = Actions::default();
     let udp = UdpSocket::bind(&reactor, core::net::Ipv4Addr::UNSPECIFIED, 0)
         .await
         .map_err(|_| "UDP bind")?;
+    let node = Shared {
+        node: RefCell::new(node),
+        udp,
+        probe: RefCell::new(None),
+        endpoints: RefCell::new(Vec::new()),
+        direct: !config.relay_only,
+    };
+    let actions = Actions::default();
     let slots = [crate::relay::Slot::new(), crate::relay::Slot::new()];
     tokio::select! {
         result=control_loop(&reactor, &node, &actions, &store, &authority, &status, &config)=>result,
-        result=packets(&reactor, &node, &actions, &udp, &slots, &mut commands, &status)=>result,
+        result=packets(&reactor, &node, &actions, &node.udp, &slots, &mut commands, &status)=>result,
         result=crate::relay::worker(&reactor, &node, &actions, &slots[0], &config.control_ca_der)=>result,
         result=crate::relay::worker(&reactor, &node, &actions, &slots[1], &config.control_ca_der)=>result,
     }
@@ -164,11 +215,9 @@ async fn control_loop(
     }
 }
 async fn tcp(reactor: &Reactor, host: &str, port: u16) -> Result<TcpStream, Error> {
-    let ip = resolve_v4(host).await.ok_or("DNS")?;
-    match exec::select(TcpStream::connect(reactor, ip, port), reactor.sleep(15000)).await {
-        Either::First(Ok(s)) => Ok(s),
-        _ => Err("TCP connect"),
-    }
+    TcpStream::connect_host(reactor, host, port)
+        .await
+        .map_err(|_| "TCP connect")
 }
 async fn control_session(
     reactor: &Reactor,
@@ -188,6 +237,11 @@ async fn control_session(
     write!(host, "{}:{}", authority.host(), authority.port()).map_err(|_| "host")?;
     let key = {
         let socket = tcp(reactor, authority.host(), authority.port()).await?;
+        if let Ok(std::net::SocketAddr::V4(local)) = socket.0.local_addr()
+            && let Ok(bound) = node.udp.local_addr()
+        {
+            node.candidate(core::net::SocketAddrV4::new(*local.ip(), bound.port()));
+        }
         let tls = crate::tls::connect(socket, authority.host(), ca, &mut read, &mut write);
         let mut stream = match exec::select(tls, reactor.sleep(20000)).await {
             Either::First(Ok(s)) => s,
@@ -298,6 +352,8 @@ async fn control_session(
     if node.borrow().requires_persistence() {
         return Ok(());
     }
+    let endpoints = node.endpoints.borrow().clone();
+    let endpoint_refs: Vec<_> = endpoints.iter().map(|s| s.as_str()).collect();
     let request = MapRequest {
         version: tailfeather::control::CAPABILITY_VERSION,
         node_key: &public,
@@ -311,7 +367,7 @@ async fn control_session(
         stream: true,
         omit_peers: false,
         read_only: false,
-        endpoints: &[],
+        endpoints: &endpoint_refs,
     };
     let request = request.write(&mut body).map_err(|_| "map size")?;
     let mut maps = MapStream::<PEERS>::start(&mut http, &host, request)
@@ -349,6 +405,8 @@ async fn control_session(
             }
             publish(node, status)?;
             if selected_home != 0 && published_home != selected_home {
+                let endpoints = node.endpoints.borrow().clone();
+                let endpoint_refs: Vec<_> = endpoints.iter().map(|s| s.as_str()).collect();
                 let request = MapRequest {
                     version: tailfeather::control::CAPABILITY_VERSION,
                     node_key: &public,
@@ -363,7 +421,7 @@ async fn control_session(
                     stream: false,
                     omit_peers: true,
                     read_only: false,
-                    endpoints: &[],
+                    endpoints: &endpoint_refs,
                 };
                 let request = request.write(&mut body).map_err(|_| "endpoint size")?;
                 if !maps.has_pending_update() {
@@ -393,54 +451,53 @@ async fn control_session(
 async fn select_home(reactor: &Reactor, node: &Shared) -> u16 {
     let snapshot = node.borrow().netmap().clone();
     let mut best = tailfeather::stun::Selection::new(&snapshot);
-    let socket = match UdpSocket::bind(reactor, core::net::Ipv4Addr::UNSPECIFIED, 0).await {
-        Ok(s) => s,
-        Err(_) => return best.home(),
-    };
-    let deadline = reactor.clock_millis() + 12000;
-    let mut response = [0u8; 512];
-    for region in snapshot.derp.iter().filter(|r| r.can_be_home()) {
-        if reactor.clock_millis() >= deadline {
-            break;
-        }
+    if !node.direct {
+        return best.home();
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+    for region in snapshot.derp.iter() {
         let Some(relay) = region.nodes.iter().find(|n| n.stun_port != 0) else {
             continue;
         };
-        let remaining =
-            std::time::Duration::from_millis(deadline.saturating_sub(reactor.clock_millis()));
-        let ip = match tokio::time::timeout(remaining, resolve_v4(&relay.host_name)).await {
-            Ok(Some(ip)) => ip,
-            Ok(None) => continue,
-            Err(_) => break,
-        };
-        let to = core::net::SocketAddrV4::new(ip, relay.stun_port);
-        let mut transaction = [0; 12];
-        getrandom::fill(&mut transaction).map_err(|_| "random").ok();
-        let start = reactor.clock_millis();
-        if socket
-            .send_to(&tailfeather::stun::request(transaction), &to)
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        if let Either::First(Ok((len, from))) = exec::select(
-            socket.recv_from(&mut response),
-            reactor.sleep(200.min(deadline.saturating_sub(reactor.clock_millis()))),
-        )
-        .await
-            && from == to
-            && let Ok((ip, port)) = tailfeather::stun::response(&response[..len], transaction)
-        {
-            best.record(
-                region,
-                reactor.clock_millis() - start,
-                core::net::SocketAddrV4::new(ip.into(), port),
-            );
+        let addresses =
+            match tokio::time::timeout_at(deadline, crate::net::resolve_v4(&relay.host_name)).await
+            {
+                Ok(Ok(addresses)) => addresses,
+                Ok(Err(_)) => continue,
+                Err(_) => break,
+            };
+        for ip in addresses {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let server = core::net::SocketAddrV4::new(ip, relay.stun_port);
+            let mut transaction = [0; 12];
+            getrandom::fill(&mut transaction).expect("OS random");
+            let (reply, received) = tokio::sync::oneshot::channel();
+            *node.probe.borrow_mut() = Some(Probe {
+                transaction,
+                server,
+                reply,
+            });
+            let started = reactor.clock_millis();
+            let probe = async {
+                node.udp
+                    .send_to(&tailfeather::stun::request(transaction), &server)
+                    .await
+                    .ok()?;
+                received.await.ok()
+            };
+            let limit =
+                deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(200));
+            if let Ok(Some(mapped)) = tokio::time::timeout_at(limit, probe).await {
+                node.candidate(mapped);
+                best.record(region, reactor.clock_millis() - started, mapped);
+            }
+            node.probe.borrow_mut().take();
         }
     }
-    // This probe uses a separate UDP socket only for relay latency selection;
-    // its reflexive endpoint must never be published for the data-plane socket.
+    // These reflexive candidates belong to the actual data socket and can be
+    // published alongside its local interface address.
     best.home()
 }
 fn publish(node: &Shared, status: &tokio::sync::watch::Sender<crate::Status>) -> Result<(), Error> {
@@ -611,7 +668,7 @@ async fn packets(
         );
         tokio::select! {
             _=actions.ready.notified()=>{},
-            received=udp.recv_from(&mut datagram)=>{let (len,from)=received.map_err(|_|"UDP receive")?;enqueue(actions,node.borrow_mut().handle_direct_from(&datagram[..len],from.into(),reactor.clock_millis(),&mut OsRng).ok().flatten());}
+            received=udp.recv_from(&mut datagram)=>{let (len,from)=received.map_err(|_|"UDP receive")?;if node.receive_stun(&datagram[..len],from){continue;}enqueue(actions,node.borrow_mut().handle_direct_from(&datagram[..len],from.into(),reactor.clock_millis(),&mut OsRng).ok().flatten());}
             command=commands.recv()=>match command {
                 Some(crate::Command::Connect {address,port,reply})=>{
                     if let Some(own)=status.borrow().address {net.borrow_mut().set_address(own,reactor.clock_millis(),seed);}
@@ -632,22 +689,6 @@ async fn packets(
             _=interval.tick()=>{}
         }
     }
-}
-
-pub async fn resolve_v4(host: &str) -> Option<std::net::Ipv4Addr> {
-    let addresses = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::net::lookup_host((host, 0)),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    addresses
-        .filter_map(|a| match a.ip() {
-            std::net::IpAddr::V4(v) => Some(v),
-            _ => None,
-        })
-        .next()
 }
 
 #[cfg(test)]
