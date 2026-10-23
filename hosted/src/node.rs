@@ -413,7 +413,9 @@ async fn control_session(
     .map_err(|_| "map start deadline")?
     .map_err(|_| "map start")?;
     let mut staging = tailfeather::netmap::Netmap::new();
-    let mut published_home = 0;
+    // A reconnect may inherit a coordinator-side preference from the previous
+    // stream. Unknown is distinct from explicitly advertising no home.
+    let mut published_home = None;
     let mut selected_home = 0;
     loop {
         if !maps.has_pending_update() {
@@ -436,7 +438,7 @@ async fn control_session(
             );
             refresh_home(reactor, node, &mut selected_home).await?;
             publish(node, status)?;
-            if published_home != selected_home {
+            if published_home != Some(selected_home) {
                 let endpoints = node.endpoints.borrow().clone();
                 let endpoint_refs: Vec<_> = endpoints.iter().map(|s| s.as_str()).collect();
                 let request = MapRequest {
@@ -475,7 +477,7 @@ async fn control_session(
                     Either::First(Ok(())) => {}
                     _ => return Err("endpoint update"),
                 }
-                published_home = selected_home;
+                published_home = Some(selected_home);
                 tracing::debug!("POCKETBOOT TAILNET_HOME_PUBLISHED region={selected_home}");
             }
         }
