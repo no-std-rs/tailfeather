@@ -17,6 +17,9 @@ impl FileStore {
     pub fn new(path: &Path) -> Self {
         Self(path.join("tailfeather.state"))
     }
+    pub fn timestamp(path: &Path) -> Self {
+        Self(path.join("tai64n.floor"))
+    }
     pub fn load(&self, out: &mut [u8]) -> io::Result<Option<usize>> {
         match fs::read(&self.0) {
             Ok(bytes) => {

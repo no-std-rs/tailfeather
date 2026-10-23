@@ -35,6 +35,9 @@ all client clones and streams have been dropped. Persistent consumers can set
 `ephemeral: false` and reuse their private directory without a new auth key.
 State is bound to the HTTPS control origin, replaced atomically, and protected by
 an exclusive directory lock. Corrupt or mismatched state fails closed.
+WireGuard timestamp ranges are reserved ahead in a private atomic sidecar, so
+reusing an identity after a clock rollback cannot repeat earlier initiations.
+The reservation avoids writing on every packet-driver iteration.
 
 `listen(port)` accepts tunnel-only streams after control ACL and cryptographic
 source checks. The runtime bounds TCP sockets to 16, listeners to 4, pending

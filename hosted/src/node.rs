@@ -20,6 +20,7 @@ const HOST_OS: &str = if cfg!(target_os = "macos") {
 };
 pub struct Shared {
     node: RefCell<Node<PEERS>>,
+    timestamp: RefCell<crate::time::Timestamp>,
     udp: UdpSocket,
     probe: RefCell<Option<Probe>>,
     endpoints: RefCell<Vec<std::string::String>>,
@@ -171,6 +172,7 @@ pub async fn run(
         .map_err(|_| "UDP bind")?;
     let node = Shared {
         node: RefCell::new(node),
+        timestamp: RefCell::new(crate::time::Timestamp::new(&config.directory)?),
         udp,
         probe: RefCell::new(None),
         endpoints: RefCell::new(Vec::new()),
@@ -618,7 +620,6 @@ async fn packets(
     let mut datagram = [0; 2048];
     let net = std::rc::Rc::new(RefCell::new(crate::netstack::NetStack::new(1)));
     let mut local_port = 49152u16;
-    let mut timestamp = crate::time::Timestamp::default();
     let mut outgoing = VecDeque::new();
     let mut punches: Vec<(tailfeather::keys::NodePublic, u64, u8)> = Vec::new();
     let mut candidate_generation = node.candidate_generation.get();
@@ -789,7 +790,7 @@ async fn packets(
         enqueue(
             actions,
             node.borrow_mut()
-                .poll_tunnel(now, &timestamp.next(), &mut OsRng)
+                .poll_tunnel(now, &node.timestamp.borrow_mut().next()?, &mut OsRng)
                 .ok()
                 .flatten(),
         );
@@ -833,6 +834,7 @@ mod tests {
         node.persistence_result(state.generation(), true).unwrap();
         Shared {
             node: RefCell::new(node),
+            timestamp: RefCell::new(crate::time::Timestamp::default()),
             udp: UdpSocket::bind(&Reactor::new(), std::net::Ipv4Addr::LOCALHOST, 0)
                 .await
                 .unwrap(),
