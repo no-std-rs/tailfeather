@@ -44,7 +44,13 @@ source checks. The runtime bounds TCP sockets to 16, listeners to 4, pending
 commands to 16 and packet queues to 128. TCP buffers are 64 KiB per direction.
 Dropping the last client shuts down the node. Dropping a listener stops new
 acceptance. This adapter exposes IPv4 TCP, not system-wide networking or UDP
-application sockets. Peer capacity follows the core's 32-peer limit.
+application sockets. Hosted peer capacity is 128; the core's embedded default remains 32. Hosted
+clients enable the `hosted-policy` feature: each of the 32 ACL rules can retain
+256 source and 256 destination networks, so provider-expanded device tags do
+not overflow the firmware's eight-address budget. Oversized policies still
+fail closed; no ACL entries are truncated. Embedded builds retain their small
+defaults. The hosted worker reserves a 64 MiB stack for the larger bounded map
+and its async staging frames (virtual address space, committed as used).
 TCP write shutdown preserves the response reader. Fully dropped streams release
 half-closed sockets after acknowledging queued data and FIN, with bounded close
 deadlines even when the peer stops responding. Call `Client::drain().await` after

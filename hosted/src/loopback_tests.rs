@@ -242,6 +242,9 @@ impl Side {
 
 #[test]
 fn tcp_crosses_relay_only_wireguard_from_a_cold_start() {
+    crate::on_worker_stack(tcp_crosses_relay_only_wireguard_from_a_cold_start_on_worker);
+}
+fn tcp_crosses_relay_only_wireguard_from_a_cold_start_on_worker() {
     let mut rng = Counter(42);
     let mut browser = Side::new(1, &mut rng);
     let mut server = Side::new(2, &mut rng);

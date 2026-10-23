@@ -12,7 +12,7 @@ use tailfeather::control::{
     transport::{self, MapEvent, MapStream},
 };
 use tailfeather::{ControlCommand, ControlEvent, Node, NodeAction, PersistState};
-pub const PEERS: usize = 32;
+pub const PEERS: usize = 128;
 const HOST_OS: &str = if cfg!(target_os = "macos") {
     "darwin"
 } else {
@@ -505,9 +505,11 @@ async fn control_session(
 }
 fn map_failure<E>(error: transport::Error<E>) -> Error {
     match error {
-        transport::Error::Netmap(_)
-        | transport::Error::ResponseTooLong
-        | transport::Error::FrameTooLarge => "netmap rejected",
+        transport::Error::Netmap(error) => {
+            eprintln!("Network map rejected: {error}");
+            "netmap rejected"
+        }
+        transport::Error::ResponseTooLong | transport::Error::FrameTooLarge => "netmap rejected",
         _ => "map transport",
     }
 }
@@ -874,6 +876,9 @@ mod tests {
     }
     #[test]
     fn a_queued_disconnect_prevents_any_relay_connection_attempt() {
+        crate::on_worker_stack(a_queued_disconnect_prevents_any_relay_connection_attempt_on_worker);
+    }
+    fn a_queued_disconnect_prevents_any_relay_connection_attempt_on_worker() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let server=std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).unwrap();server.set_nonblocking(true).unwrap();
             let node=fixture().await;let actions=Actions::default();let slots=[crate::relay::Slot::new(),crate::relay::Slot::new()];
@@ -887,6 +892,9 @@ mod tests {
     }
     #[test]
     fn stun_discovery_tries_a_backup_node_using_the_data_socket() {
+        crate::on_worker_stack(stun_discovery_tries_a_backup_node_using_the_data_socket_on_worker);
+    }
+    fn stun_discovery_tries_a_backup_node_using_the_data_socket_on_worker() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -975,6 +983,11 @@ mod tests {
     }
     #[test]
     fn discovery_replaces_old_candidates_even_after_filling_capacity() {
+        crate::on_worker_stack(
+            discovery_replaces_old_candidates_even_after_filling_capacity_on_worker,
+        );
+    }
+    fn discovery_replaces_old_candidates_even_after_filling_capacity_on_worker() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -994,6 +1007,9 @@ mod tests {
     }
     #[test]
     fn a_disconnect_bypasses_a_saturated_relay_send() {
+        crate::on_worker_stack(a_disconnect_bypasses_a_saturated_relay_send_on_worker);
+    }
+    fn a_disconnect_bypasses_a_saturated_relay_send_on_worker() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let server=std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).unwrap();server.set_nonblocking(true).unwrap();
             let node=fixture().await;let actions=Actions::default();let slots=[crate::relay::Slot::new(),crate::relay::Slot::new()];
@@ -1014,6 +1030,11 @@ mod tests {
     }
     #[test]
     fn streaming_maps_replace_a_removed_or_ineligible_home_region() {
+        crate::on_worker_stack(
+            streaming_maps_replace_a_removed_or_ineligible_home_region_on_worker,
+        );
+    }
+    fn streaming_maps_replace_a_removed_or_ineligible_home_region_on_worker() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1058,7 +1079,32 @@ mod tests {
             });
     }
     #[test]
+    fn expanded_fleet_acl_is_complete_and_still_bounded() {
+        std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+            for count in [40, 256, 257] {
+                let sources = (1..=count).map(|n| format!("\"100.64.{}.{}/32\"", n / 256, n % 256)).collect::<Vec<_>>().join(",");
+                let destinations = (1..=count).map(|n| format!(r#"{{"IP":"100.65.{}.{}/32","Ports":{{"First":2222,"Last":2222}}}}"#, n / 256, n % 256)).collect::<Vec<_>>().join(",");
+                let json = format!(r#"{{"PacketFilter":[{{"SrcIPs":[{sources}],"DstPorts":[{destinations}],"IPProto":[6]}}]}}"#);
+                let mut map = tailfeather::netmap::Netmap::<PEERS>::new();
+                let mut parser = tailfeather::netmap::Parser::new();
+                parser.push(&mut map, json.as_bytes()).unwrap();
+                let result = parser.finish(&mut map);
+                if count > 256 {
+                    assert!(matches!(result, Err(tailfeather::netmap::Error::Full(_))));
+                } else {
+                    result.unwrap();
+                    assert!(map.packet_filter.allows([100,64,(count / 256) as u8,(count % 256) as u8].into(), [100,65,(count / 256) as u8,(count % 256) as u8].into(), 6, 2222));
+                    assert!(!map.packet_filter.allows([100,64,2,200].into(), [100,65,0,1].into(), 6, 2222));
+                    assert!(!map.packet_filter.allows([100,64,0,1].into(), [100,65,0,1].into(), 6, 22));
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+    #[test]
     fn over_capacity_acl_updates_are_terminal() {
+        crate::on_worker_stack(over_capacity_acl_updates_are_terminal_on_worker);
+    }
+    fn over_capacity_acl_updates_are_terminal_on_worker() {
         let rules=(0..100).map(|port|format!(r#"{{"SrcIPs":["*"],"DstPorts":[{{"IP":"*","Ports":{{"First":{port},"Last":{port}}}}}]}}"#)).collect::<Vec<_>>().join(",");
         let json = format!(r#"{{"PacketFilter":[{rules}]}}"#);
         let mut map = tailfeather::netmap::Netmap::<PEERS>::new();
@@ -1073,6 +1119,9 @@ mod tests {
     }
     #[test]
     fn map_status_bursts_cannot_exhaust_the_action_queue() {
+        crate::on_worker_stack(map_status_bursts_cannot_exhaust_the_action_queue_on_worker);
+    }
+    fn map_status_bursts_cannot_exhaust_the_action_queue_on_worker() {
         let actions = Actions::default();
         for _ in 0..100 {
             enqueue(
@@ -1087,6 +1136,9 @@ mod tests {
     }
     #[test]
     fn saturated_packet_queue_keeps_stateful_relay_commands() {
+        crate::on_worker_stack(saturated_packet_queue_keeps_stateful_relay_commands_on_worker);
+    }
+    fn saturated_packet_queue_keeps_stateful_relay_commands_on_worker() {
         let actions = Actions::default();
         let key = tailfeather::keys::Identity::generate(&mut OsRng)
             .node
