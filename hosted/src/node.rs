@@ -434,14 +434,7 @@ async fn control_session(
                     })
                     .map_err(node_error)?,
             );
-            if selected_home == 0 {
-                selected_home = select_home(reactor, node).await;
-            }
-            if selected_home != 0 {
-                node.borrow_mut()
-                    .prefer_derp(selected_home)
-                    .map_err(node_error)?;
-            }
+            refresh_home(reactor, node, &mut selected_home, &mut published_home).await?;
             publish(node, status)?;
             if selected_home != 0 && published_home != selected_home {
                 let endpoints = node.endpoints.borrow().clone();
@@ -486,6 +479,33 @@ async fn control_session(
             }
         }
     }
+}
+async fn refresh_home(
+    reactor: &Reactor,
+    node: &Shared,
+    selected: &mut u16,
+    published: &mut u16,
+) -> Result<(), Error> {
+    if *selected != 0
+        && node
+            .borrow()
+            .netmap()
+            .derp
+            .region(*selected)
+            .is_none_or(|region| !region.can_be_home())
+    {
+        *selected = 0;
+        *published = 0;
+    }
+    if *selected == 0 {
+        *selected = select_home(reactor, node).await;
+    }
+    if *selected != 0 {
+        node.borrow_mut()
+            .prefer_derp(*selected)
+            .map_err(node_error)?;
+    }
+    Ok(())
 }
 async fn select_home(reactor: &Reactor, node: &Shared) -> u16 {
     let snapshot = node.borrow().netmap().clone();
@@ -915,6 +935,52 @@ mod tests {
             assert!(tokio::time::timeout(std::time::Duration::from_millis(50),actors).await.is_err());
             assert!(matches!(server.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
         });
+    }
+    #[test]
+    fn streaming_maps_replace_a_removed_or_ineligible_home_region() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tailfeather::netmap::{DerpNode, DerpRegion, Netmap};
+                let mut node = fixture().await;
+                node.direct = false;
+                let reactor = Reactor::new();
+                let mut selected = 7;
+                let mut published = 7;
+                for (id, excluded, expected) in [(8, false, 8), (8, true, 0), (7, false, 7)] {
+                    let mut nodes = heapless::Vec::new();
+                    nodes
+                        .push(DerpNode {
+                            host_name: heapless::String::try_from("127.0.0.1").unwrap(),
+                            cert_name: None,
+                            port: 443,
+                            stun_port: 0,
+                        })
+                        .unwrap();
+                    let mut map = Netmap::new();
+                    map.derp
+                        .insert(DerpRegion {
+                            id,
+                            no_measure_no_home: excluded,
+                            code: heapless::String::try_from("fixture").unwrap(),
+                            nodes,
+                        })
+                        .unwrap();
+                    node.borrow_mut()
+                        .handle_control_event(ControlEvent::MapFinished {
+                            lease: &mut map,
+                            result: Ok(()),
+                        })
+                        .unwrap();
+                    refresh_home(&reactor, &node, &mut selected, &mut published)
+                        .await
+                        .unwrap();
+                    assert_eq!(selected, expected);
+                    assert_eq!(published, 0);
+                }
+            });
     }
     #[test]
     fn saturated_packet_queue_keeps_stateful_relay_commands() {
