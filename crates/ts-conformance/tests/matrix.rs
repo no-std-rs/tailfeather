@@ -34,9 +34,20 @@ fn env() -> Env {
     Env::offline(&repo_root())
 }
 
+fn report() -> Report {
+    // The workspace all-features build also selects hosted-policy. The matrix
+    // constructs full nodes, so use the hosted runtime's worker stack budget.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| Report::run(&env()))
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
 #[test]
 fn no_known_incompatibilities() {
-    let report = Report::run(&env());
+    let report = report();
     let failures: Vec<String> = report
         .failures()
         .map(|o| match &o.status {
@@ -245,7 +256,7 @@ fn hosted_tls_captures_validate_and_fit_the_embedded_bounds() {
 fn print_the_matrix() {
     // Not an assertion — this is how the report reaches anyone running the
     // suite with --nocapture.
-    let report = Report::run(&env());
+    let report = report();
     println!("{report}");
 }
 

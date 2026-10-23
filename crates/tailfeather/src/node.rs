@@ -1877,6 +1877,18 @@ impl<S> DerpSession<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn on_node_test_stack(test: fn()) {
+        #[cfg(feature = "hosted-policy")]
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+        #[cfg(not(feature = "hosted-policy"))]
+        test();
+    }
     struct Counter(u8);
     impl crate::keys::Rng for Counter {
         fn fill_bytes(&mut self, out: &mut [u8]) {
@@ -1953,6 +1965,12 @@ mod tests {
 
     #[test]
     fn persisted_identity_is_bound_to_the_control_authority() {
+        // This fixture keeps multiple complete nodes while testing restores.
+        // Match the hosted worker's stack when its larger policy is selected.
+        on_node_test_stack(persisted_identity_authority_roundtrip);
+    }
+
+    fn persisted_identity_authority_roundtrip() {
         let authority = [7; 16];
         let mut node = Node::<1>::factory_reset_for_authority(
             Identity::generate(&mut Counter(1)),
@@ -1969,6 +1987,10 @@ mod tests {
 
     #[test]
     fn version_one_state_preserves_identity_and_migrates_for_the_current_authority() {
+        on_node_test_stack(version_one_state_roundtrip);
+    }
+
+    fn version_one_state_roundtrip() {
         let identity = Identity::generate(&mut Counter(20));
         let expected = identity.node.public();
         let mut legacy = [0; PersistState::LEGACY_BLOB_LEN];
@@ -1997,6 +2019,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "hosted-policy"))]
     fn default_node_fits_device_budget() {
         assert!(
             core::mem::size_of::<Node<32>>() <= 64 * 1024,
@@ -2006,6 +2029,24 @@ mod tests {
         assert!(
             core::mem::size_of::<Netmap<32>>() <= 32 * 1024,
             "Netmap<32> is {} bytes",
+            core::mem::size_of::<Netmap<32>>()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "hosted-policy")]
+    fn hosted_policy_node_fits_host_budget() {
+        // Hosted clients deliberately retain larger ACL address lists. Their
+        // layout has a separate bound; the device contract above still covers
+        // every build without hosted-policy, including other optional features.
+        assert!(
+            core::mem::size_of::<Node<32>>() <= 256 * 1024,
+            "Node<32> with hosted policy is {} bytes",
+            core::mem::size_of::<Node<32>>()
+        );
+        assert!(
+            core::mem::size_of::<Netmap<32>>() <= 192 * 1024,
+            "Netmap<32> with hosted policy is {} bytes",
             core::mem::size_of::<Netmap<32>>()
         );
     }
