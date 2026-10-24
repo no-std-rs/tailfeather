@@ -35,8 +35,10 @@ The stable root targets are `//:format`, `//:clippy`, `//:docs`,
 
 ## Privileged lab
 
-`bazel test //:privileged_lab` is routed only to the `linux-amd64-kvm`
-BuildBuddy pool. It is uncached and has no local fallback. The test boots one
+`bazel test --config=local //:privileged_lab` runs in the dedicated GitHub-hosted
+Ubuntu 24.04 workflow. It is uncached and cannot use remote executors. Ordinary
+builds and offline conformance use BuildBuddy-managed RBE; custom runners are
+reserved for private repositories. The test boots one
 disposable 4-vCPU/2-GiB smolVM guest from checksum-pinned smolVM 1.7.4 and
 Alpine 3.21.7 inputs, installs an offline checksum-pinned APK overlay, starts
 Headscale 0.29.3 and Tailscale 1.94.2 with a real TUN device, enforces the full

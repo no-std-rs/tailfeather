@@ -1,5 +1,6 @@
 actions:
   - name: "Bazel / RBE"
+    self_hosted: false
     container_image: "ubuntu-24.04"
     allow_concurrent_runs_on_branches: []
     triggers:
@@ -14,6 +15,7 @@ actions:
       - run: "bazel build //harness:harness //firmware:ci_image --config=optimized"
 
   - name: "Offline conformance / RBE"
+    self_hosted: false
     container_image: "ubuntu-24.04"
     allow_concurrent_runs_on_branches: []
     triggers:
@@ -23,14 +25,3 @@ actions:
         branches: ["*"] # Include stacked PRs whose base is another feature branch.
     steps:
       - run: "bazel test //:offline_conformance --config=optimized --test_output=all"
-
-  - name: "Privileged lab / RBE"
-    container_image: "ubuntu-24.04"
-    allow_concurrent_runs_on_branches: []
-    triggers:
-      push:
-        branches: ["main"]
-      pull_request:
-        branches: ["*"] # Include stacked PRs whose base is another feature branch.
-    steps:
-      - run: "bazel test //:privileged_lab --config=optimized --test_output=all"
