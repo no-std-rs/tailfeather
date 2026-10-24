@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.1.0...tailfeather-v0.2.0) (2026-10-24)
+
+
+### Features
+
+* add a compact Tailscale SSH console ([#7](https://github.com/no-std-rs/tailfeather/issues/7)) ([3e02732](https://github.com/no-std-rs/tailfeather/commit/3e02732bf63263f8dda96d843904fcbac6fc0526))
+
+### Bug Fixes
+
+* **disco:** preserve healthy direct paths on candidate updates ([#18](https://github.com/no-std-rs/tailfeather/issues/18)) ([5778937](https://github.com/no-std-rs/tailfeather/commit/5778937199a2969ad695ffdda4a343245dd2cfb5))
+* accept hosted DERP coordinates and verify Tailscale SSH ([#9](https://github.com/no-std-rs/tailfeather/issues/9)) ([f34118d](https://github.com/no-std-rs/tailfeather/commit/f34118d67d40050851258d5a3484dcfc6e8fc034))
+* validate SSH handshakes and dual-stack authorization ([#8](https://github.com/no-std-rs/tailfeather/issues/8)) ([a285dbe](https://github.com/no-std-rs/tailfeather/commit/a285dbe7b37d6df87513838e7f84247e7668f93f))
+
 ## [0.1.0](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.0.1...tailfeather-v0.1.0) (2026-10-18)
 
 
