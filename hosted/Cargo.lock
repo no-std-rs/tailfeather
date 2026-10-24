@@ -991,6 +991,7 @@ dependencies = [
  "embedded-io-async",
  "getrandom 0.3.4",
  "heapless",
+ "rustix",
  "serde_json",
  "smoltcp",
  "tailfeather",

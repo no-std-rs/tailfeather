@@ -95,8 +95,13 @@ impl Client {
             .read(true)
             .write(true)
             .open(config.directory.join("lock"))?;
+        #[cfg(not(target_os = "android"))]
         lock.try_lock()
             .map_err(|_| io::Error::other("network identity already in use"))?;
+        #[cfg(target_os = "android")]
+        {
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        }
         let (commands, receiver) = mpsc::channel(16);
         let (status_tx, status) = watch::channel(Status::default());
         let (shutdown, stopped) = oneshot::channel();
