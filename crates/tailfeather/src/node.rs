@@ -1043,6 +1043,7 @@ impl<const PEERS: usize> Node<PEERS> {
         );
         let probe_direct = handshake
             && direct_paths
+            && !path.direct_healthy
             && path.direct.is_some()
             && (path.direct_probe_pending || path.home_derp == 0);
         if probe_direct {
@@ -1255,7 +1256,7 @@ impl<const PEERS: usize> Node<PEERS> {
             }
         }
         let Some(index) = self.paths.iter().position(|path| {
-            !path.direct_healthy
+            (!path.direct_healthy || path.direct_probe_pending)
                 && !path.advertised.is_empty()
                 && path.disco.is_some()
                 && usize::from(path.disco_attempts) < path.advertised.len().saturating_mul(3)
@@ -1567,14 +1568,13 @@ impl<const PEERS: usize> Node<PEERS> {
                     // Candidate advertisements are not evidence that the
                     // authenticated direct path stopped working. Keep that
                     // path (including a NAT-translated source absent from the
-                    // advertisement) until actual reachability fails. Retain
-                    // the new candidates for the next discovery round.
+                    // advertisement) while probing the new candidates.
                     if !self.paths[index].direct_healthy {
                         self.paths[index].direct = Some(SocketAddr::V4(endpoint));
-                        self.paths[index].direct_probe_pending = true;
-                        self.paths[index].disco_tx = None;
-                        self.paths[index].disco_attempts = 0;
                     }
+                    self.paths[index].direct_probe_pending = true;
+                    self.paths[index].disco_tx = None;
+                    self.paths[index].disco_attempts = 0;
                 }
                 Ok(None)
             }
@@ -2477,9 +2477,21 @@ mod tests {
         assert_eq!(node.paths[0].advertised.as_slice(), &[advertised]);
         assert_eq!(node.paths[0].direct, Some(source));
         assert!(node.paths[0].direct_healthy);
-        assert!(node.poll_disco(20, &mut Counter(60)).unwrap().is_none());
+        let id = node.tunnel.peer_by_public_key(peer_key.as_bytes()).unwrap();
+        // A rekey handshake stays on the working path and must not cancel
+        // the independently requested candidate probe.
+        assert!(
+            matches!(node.route_packet(id, &[tunnel::messages::TYPE_INITIATION]).unwrap(),
+            NodeAction::DirectTransmit { endpoint, .. } if endpoint == source)
+        );
+        assert!(matches!(node.poll_disco(20, &mut Counter(60)).unwrap(),
+            Some(NodeAction::DirectTransmit { endpoint, .. }) if endpoint == SocketAddr::V4(advertised)));
+        assert!(
+            matches!(node.route_packet(id, &[tunnel::messages::TYPE_DATA]).unwrap(),
+            NodeAction::DirectTransmit { endpoint, .. } if endpoint == source)
+        );
         node.mark_direct_unhealthy(&peer_key).unwrap();
-        assert!(matches!(node.poll_disco(21, &mut Counter(70)).unwrap(),
+        assert!(matches!(node.poll_disco(1021, &mut Counter(70)).unwrap(),
             Some(NodeAction::DirectTransmit { endpoint, .. }) if endpoint == SocketAddr::V4(advertised)));
     }
 
