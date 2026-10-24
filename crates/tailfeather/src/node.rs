@@ -618,6 +618,10 @@ impl<const PEERS: usize> Node<PEERS> {
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
+    /// The normalized control authority this identity is bound to.
+    pub fn authority_hash(&self) -> [u8; 16] {
+        self.authority_hash
+    }
     pub fn netmap(&self) -> &Netmap<PEERS> {
         &self.netmap
     }

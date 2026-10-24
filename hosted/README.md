@@ -106,7 +106,16 @@ the last received frame, including when outbound notifications continue.
 
 `python3 hosted/tools/test-headscale.py` runs both production-path scenarios
 against a digest-pinned disposable Headscale container with a generated CA.
-It needs Docker (or `CONTAINER_ENGINE=podman`), OpenSSL and free loopback ports
-18443/13478. Linux CI runs it after the native tests; fixture keys never leave
+It needs Docker (or `CONTAINER_ENGINE=podman`) and OpenSSL; the runner selects
+free loopback ports automatically. Linux CI runs it after the native tests; fixture keys never leave
 its private temporary directory. This includes the 1 MiB transfer regression
 and immediate no-key reconnect without a restart sleep.
+
+
+The userspace TCP stack, routing/source checks, bounded action mailbox, clocks,
+outer sockets, TLS and file storage are shared with `tailfeather-reactor`.
+That companion crate also exposes an allocation-free Embassy runtime with
+caller-owned arenas and the same control/DERP/WireGuard/TCP behavior. Native
+hosted applications enable its CPU-dispatched fused AEAD provider. See
+[`tailfeather-reactor`](../crates/tailfeather-reactor/README.md) for the feature
+matrix, CPU capability diagnostics, and local packet-engine benchmarks.

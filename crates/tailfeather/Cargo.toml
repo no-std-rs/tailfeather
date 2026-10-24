@@ -18,6 +18,7 @@ default = ["fast-curve25519"]
 # Preserve the existing node's speed/flash tradeoff; small console consumers
 # can disable defaults to omit Curve25519's precomputed basepoint tables.
 fast-curve25519 = ["x25519-dalek/precomputed-tables"]
+accelerated-crypto = ["wirefeather/accelerated-crypto"]
 # Retain a bounded display name for each peer (MagicDNS short name, falling
 # back to Hostinfo.Hostname) and for this node. Off by default so the
 # firmware's static RAM budget is unchanged; only the browser client enables it.

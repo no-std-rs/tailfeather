@@ -1,10 +1,10 @@
 name: Hosted runtime
 on:
   pull_request:
-    paths: ['hosted/**', 'crates/tailfeather/**', 'crates/wirefeather/**', '.github/workflows/hosted.yml']
+    paths: ['hosted/**', 'crates/tailfeather-reactor/**', 'crates/tailfeather/**', 'crates/wirefeather/**', '.github/workflows/hosted.yml']
   push:
     branches: [main]
-    paths: ['hosted/**', 'crates/tailfeather/**', 'crates/wirefeather/**', '.github/workflows/hosted.yml']
+    paths: ['hosted/**', 'crates/tailfeather-reactor/**', 'crates/tailfeather/**', 'crates/wirefeather/**', '.github/workflows/hosted.yml']
 permissions:
   contents: read
 jobs:
@@ -20,10 +20,44 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo fmt --manifest-path hosted/Cargo.toml --check
+      - run: cargo fmt --manifest-path crates/tailfeather-reactor/Cargo.toml --check
       - run: cargo test --manifest-path hosted/Cargo.toml --locked
+      - run: cargo test --manifest-path crates/tailfeather-reactor/Cargo.toml --locked --features std,embassy,accelerated-crypto
       - run: cargo clippy --manifest-path hosted/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo clippy --manifest-path crates/tailfeather-reactor/Cargo.toml --locked --all-targets --features std,embassy,accelerated-crypto -- -D warnings
       - if: runner.os == 'Linux'
         run: cargo test --locked -p tailfeather control::register
       - if: runner.os == 'Linux'
+        run: cargo test --locked -p wirefeather --features accelerated-crypto
+      - if: runner.os == 'Linux'
+        name: Complete runtime benchmark smoke with owned buffers
+        run: cargo bench --locked --manifest-path crates/tailfeather-reactor/Cargo.toml --features std,embassy,accelerated-crypto --bench throughput -- --mesh --buffers owned --bytes 1048576
+      - if: runner.os == 'Linux'
         name: Real Headscale direct and DERP networking
         run: python3 hosted/tools/test-headscale.py
+      - if: runner.os == 'Linux'
+        name: Shared runtime with caller-owned buffers
+        env:
+          TAILFEATHER_FIXTURE_RUNTIME: reactor-fixed
+        run: python3 hosted/tools/test-headscale.py
+      - if: runner.os == 'Linux'
+        name: Shared runtime with owned buffers and accelerated crypto
+        env:
+          TAILFEATHER_FIXTURE_RUNTIME: reactor-owned
+        run: python3 hosted/tools/test-headscale.py
+  embassy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: riscv32imac-unknown-none-elf
+      - run: cargo test --manifest-path crates/tailfeather-reactor/Cargo.toml --locked --no-default-features --features embassy
+      - name: Complete allocation-free runtime benchmark smoke
+        run: cargo bench --locked --manifest-path crates/tailfeather-reactor/Cargo.toml --no-default-features --features embassy --bench throughput -- --mesh --buffers fixed --bytes 1048576
+      - run: cargo check --manifest-path crates/tailfeather-reactor/Cargo.toml --locked --no-default-features --target riscv32imac-unknown-none-elf
+      - run: cargo clippy --manifest-path crates/tailfeather-reactor/Cargo.toml --locked --no-default-features --features embassy,accelerated-crypto --target riscv32imac-unknown-none-elf -- -D warnings
+      - run: cargo fmt --manifest-path crates/tailfeather-reactor/probe/Cargo.toml --check
+      - name: Full Embassy executor task without a global allocator
+        run: cargo build --manifest-path crates/tailfeather-reactor/probe/Cargo.toml --locked --features accelerated-crypto --target riscv32imac-unknown-none-elf

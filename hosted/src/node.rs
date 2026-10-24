@@ -76,22 +76,18 @@ impl Shared {
 }
 #[derive(Default)]
 pub struct Actions {
-    queue: RefCell<VecDeque<NodeAction>>,
+    queue: RefCell<tailfeather_reactor::queue::Actions<32>>,
     overflow: Cell<bool>,
     pub ready: tokio::sync::Notify,
     space: tokio::sync::Notify,
 }
 impl Actions {
-    fn borrow_mut(&self) -> std::cell::RefMut<'_, VecDeque<NodeAction>> {
+    fn borrow_mut(&self) -> std::cell::RefMut<'_, tailfeather_reactor::queue::Actions<32>> {
         self.queue.borrow_mut()
     }
     fn pop(&self) -> Option<NodeAction> {
         let mut queue = self.queue.borrow_mut();
-        let action = if let Some(index) = queue.iter().position(|action| !droppable(action)) {
-            queue.remove(index)
-        } else {
-            queue.pop_front()
-        };
+        let action = queue.pop();
         if queue.len() < 16 {
             self.space.notify_waiters();
         }
@@ -107,14 +103,6 @@ impl Actions {
         }
     }
 }
-fn droppable(action: &NodeAction) -> bool {
-    matches!(
-        action,
-        NodeAction::DirectTransmit { .. }
-            | NodeAction::DeliveredIpv4 { .. }
-            | NodeAction::Derp(tailfeather::DerpCommand::Send { .. })
-    )
-}
 pub type Error = &'static str;
 fn node_error(_: tailfeather::NodeError) -> Error {
     "node state"
@@ -123,23 +111,13 @@ pub fn enqueue(actions: &Actions, action: Option<NodeAction>) {
     let Some(action) = action.filter(|a| !matches!(a, NodeAction::StatusChanged(_))) else {
         return;
     };
-    let mut queue = actions.borrow_mut();
-    if queue.len() == 32 {
-        if droppable(&action) {
-            return;
-        }
-        if let Some(index) = queue.iter().position(droppable) {
-            queue.remove(index);
-        } else {
-            // Stateful commands cannot be lost while leaving a live node that
-            // believes they ran. Surface capacity exhaustion to its caller.
-            actions.overflow.set(true);
-            return;
-        }
+    if actions.borrow_mut().push(action).is_err() {
+        actions.overflow.set(true);
+        return;
     }
-    queue.push_back(action);
     actions.ready.notify_one();
 }
+
 pub async fn run(
     config: crate::Config,
     mut commands: tokio::sync::mpsc::Receiver<crate::Command>,
@@ -631,6 +609,7 @@ async fn packets(
 ) -> Result<(), Error> {
     let mut datagram = [0; 2048];
     let net = std::rc::Rc::new(RefCell::new(crate::netstack::NetStack::new(1)));
+    let tcp_wake = std::rc::Rc::new(tokio::sync::Notify::new());
     let mut local_port = 49152u16;
     let mut outgoing = VecDeque::new();
     let mut drain: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>> = None;
@@ -643,7 +622,6 @@ async fn packets(
     let mut random = [0; 8];
     getrandom::fill(&mut random).map_err(|_| "random")?;
     let seed = u64::from_ne_bytes(random);
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
     let trace = std::env::var_os("TAILFEATHER_NET_TRACE").is_some();
     let mut trace_at = 0;
     loop {
@@ -671,8 +649,8 @@ async fn packets(
                     let bytes = packet.as_slice();
                     let allowed = {
                         let n = node.borrow();
-                        (n.netmap().packet_filter.allows_ipv4(bytes)
-                            || crate::logic::tcp_continuation(bytes))
+                        (crate::logic::tcp_continuation(bytes)
+                            || n.netmap().packet_filter.allows_ipv4(bytes))
                             && n.netmap().addresses.iter().any(|a| match a.address {
                                 IpAddr::V4(own) => crate::logic::inbound_allowed(
                                     bytes,
@@ -695,7 +673,7 @@ async fn packets(
                         actions,
                         reactor.clock_millis(),
                     ) {
-                        actions.borrow_mut().push_back(NodeAction::Derp(command));
+                        let _ = actions.borrow_mut().push(NodeAction::Derp(command));
                         continue;
                     }
                 }
@@ -715,7 +693,12 @@ async fn packets(
             for accepted in ready {
                 let net = net.clone();
                 let incoming = incoming.clone();
-                tokio::task::spawn_local(crate::bridge::accepted(net, accepted, incoming));
+                tokio::task::spawn_local(crate::bridge::accepted(
+                    net,
+                    accepted,
+                    tcp_wake.clone(),
+                    incoming,
+                ));
             }
         }
         let now = reactor.clock_millis();
@@ -724,7 +707,11 @@ async fn packets(
             trace_at = now + 2000;
         }
         if outgoing.is_empty() {
-            outgoing.extend(net.borrow_mut().poll(now));
+            let mut net = net.borrow_mut();
+            net.poll_stack(now);
+            while let Some(packet) = net.take_transmit() {
+                outgoing.push_back(packet);
+            }
         }
         // Keep generated TCP packets until the bounded actor queues have room;
         // large windows must not turn into systematic local packet loss.
@@ -788,13 +775,16 @@ async fn packets(
             node.borrow_mut().poll_disco(now, &mut OsRng).ok().flatten(),
         );
         enqueue(actions, node.borrow_mut().poll_derp().ok().flatten());
-        enqueue(
-            actions,
-            node.borrow_mut()
-                .poll_tunnel(now, &node.timestamp.borrow_mut().next()?, &mut OsRng)
-                .ok()
-                .flatten(),
-        );
+        let timestamp = node.timestamp.borrow().candidate()?;
+        let handshake = node
+            .borrow_mut()
+            .poll_tunnel(now, &timestamp, &mut OsRng)
+            .ok()
+            .flatten();
+        if handshake.is_some() {
+            node.timestamp.borrow_mut().commit(timestamp)?;
+        }
+        enqueue(actions, handshake);
         enqueue(
             actions,
             node.borrow_mut().poll_tunnel_timers(now).ok().flatten(),
@@ -810,8 +800,19 @@ async fn packets(
                 Ok(())
             });
         }
+        let tcp_deadline = if outgoing.is_empty() {
+            net.borrow_mut().deadline(now)
+        } else {
+            None
+        };
+        let idle = tcp_deadline
+            .map_or(250, |deadline| {
+                deadline.saturating_sub(reactor.clock_millis())
+            })
+            .clamp(1, 250);
         tokio::select! {
             _=actions.ready.notified()=>{},
+            _=tcp_wake.notified()=>{},
             received=udp.recv_from(&mut datagram)=>{let (len,from)=received.map_err(|_|"UDP receive")?;if node.receive_stun(&datagram[..len],from){continue;}enqueue(actions,node.borrow_mut().handle_direct_from(&datagram[..len],from.into(),reactor.clock_millis(),&mut OsRng).ok().flatten());}
             command=commands.recv()=>match command {
                 Some(crate::Command::Drain { reply }) => {
@@ -824,7 +825,7 @@ async fn packets(
                     let result=net.borrow_mut().connect(address,port,local_port);
                     local_port=if local_port==65535 {49152} else {local_port+1};
                     match result {
-                        Ok(handle)=>{let net=net.clone();tokio::task::spawn_local(async move {crate::bridge::connect(net,handle,reply).await;});}
+                        Ok(handle)=>{let net=net.clone();let wake=tcp_wake.clone();tokio::task::spawn_local(async move {crate::bridge::connect(net,handle,wake,reply).await;});}
                         Err(error)=>{let _=reply.send(Err(std::io::Error::other(error)));}
                     }
                 }
@@ -835,7 +836,7 @@ async fn packets(
                 }
                 None=>return Ok(()),
             },
-            _=interval.tick()=>{}
+            _=reactor.sleep(idle)=>{}
         }
     }
 }
@@ -1149,7 +1150,7 @@ mod tests {
         );
         assert_eq!(actions.borrow_mut().len(), 32);
         assert!(matches!(
-            actions.borrow_mut().back(),
+            actions.pop(),
             Some(NodeAction::Derp(tailfeather::DerpCommand::Connect {
                 region: 7,
                 ..

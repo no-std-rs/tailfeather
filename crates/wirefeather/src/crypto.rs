@@ -9,13 +9,49 @@
 use blake2::Blake2s256;
 use blake2::Blake2sMac;
 use blake2::digest::consts::U16;
-use blake2::digest::{Digest, KeyInit, Mac};
-use chacha20poly1305::aead::AeadInPlace;
-use chacha20poly1305::{ChaCha20Poly1305, Key as AeadKey, Tag};
+use blake2::digest::{Digest, Mac};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 use crate::Error;
+
+#[cfg(all(
+    feature = "accelerated-crypto",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    any(target_family = "unix", target_family = "windows")
+))]
+mod native;
+#[cfg(any(
+    test,
+    not(all(
+        feature = "accelerated-crypto",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(target_family = "unix", target_family = "windows")
+    ))
+))]
+mod portable;
+#[cfg(all(
+    feature = "accelerated-crypto",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    any(target_family = "unix", target_family = "windows")
+))]
+use native as aead_backend;
+#[cfg(not(all(
+    feature = "accelerated-crypto",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    any(target_family = "unix", target_family = "windows")
+)))]
+use portable as aead_backend;
+
+/// The configured AEAD provider. Providers dispatch supported SIMD at runtime.
+pub fn aead_backend() -> &'static str {
+    aead_backend::NAME
+}
 
 /// A 32-byte symmetric key, chaining key, or hash value.
 pub type Key = [u8; 32];
@@ -126,14 +162,11 @@ pub type Nonce = [u8; NONCE_LEN];
 /// happened to be baked in here — a mistake that produces a valid-looking
 /// ciphertext the peer silently rejects.
 pub fn aead_seal_nonce(key: &Key, nonce: &Nonce, aad: &[u8], buffer: &mut [u8]) -> [u8; TAG_LEN] {
-    let cipher = ChaCha20Poly1305::new(AeadKey::from_slice(key));
-    let tag = cipher
-        .encrypt_in_place_detached(nonce.into(), aad, buffer)
-        .expect("in-place detached sealing cannot fail for an in-range buffer");
-    tag.into()
+    aead_backend::seal(key, nonce, aad, buffer)
 }
 
 /// Open `buffer` in place under an explicit nonce, verifying `tag`.
+/// Authentication failure clears the buffer on every backend.
 pub fn aead_open_nonce(
     key: &Key,
     nonce: &Nonce,
@@ -144,10 +177,11 @@ pub fn aead_open_nonce(
     if tag.len() != TAG_LEN {
         return Err(Error::Malformed);
     }
-    let cipher = ChaCha20Poly1305::new(AeadKey::from_slice(key));
-    cipher
-        .decrypt_in_place_detached(nonce.into(), aad, buffer, Tag::from_slice(tag))
-        .map_err(|_| Error::Decryption)
+    let result = aead_backend::open(key, nonce, aad, buffer, tag);
+    if result.is_err() {
+        buffer.zeroize();
+    }
+    result
 }
 
 /// WireGuard's AEAD nonce: 4 zero bytes followed by a 64-bit little-endian
@@ -205,10 +239,13 @@ mod tests {
         let key = [0x5a; KEY_LEN];
         let mut buffer = *b"sixteen bytes...";
         let tag = aead_seal_nonce(&key, &big_endian, &[], &mut buffer);
+        let ciphertext = buffer;
         assert_eq!(
             aead_open_nonce(&key, &little_endian, &[], &mut buffer, &tag),
             Err(Error::Decryption)
         );
+        assert!(buffer.iter().all(|byte| *byte == 0));
+        buffer = ciphertext;
         assert_eq!(
             aead_open_nonce(&key, &big_endian, &[], &mut buffer, &tag),
             Ok(())

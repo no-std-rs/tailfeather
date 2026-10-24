@@ -261,20 +261,7 @@ pub fn is_enrolled(directory: &std::path::Path, control_url: &str) -> io::Result
     }
     Ok(state.enrolled())
 }
-struct OsRng;
-macro_rules! rng {
-    ($trait:path) => {
-        impl $trait for OsRng {
-            fn fill_bytes(&mut self, out: &mut [u8]) {
-                getrandom::fill(out).expect("operating system randomness unavailable");
-            }
-        }
-    };
-}
-rng!(tailfeather::keys::Rng);
-rng!(tailfeather::tunnel::Rng);
-rng!(tailfeather::disco::packet::Rng);
-rng!(tailfeather::derp::client::Rng);
+use tailfeather_reactor::native::OsRng;
 
 // Netmaps and their staging copies remain fixed-size, including in debug builds.
 const WORKER_STACK: usize = 64 * 1024 * 1024;

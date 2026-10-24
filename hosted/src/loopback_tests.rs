@@ -7,7 +7,6 @@
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 
-use smoltcp::socket::tcp;
 use tailfeather::keys::{Identity, NodePublic, Rng};
 use tailfeather::netmap::{Cidr, Cidr4, DerpNode, DerpRegion, Netmap, Peer};
 use tailfeather::{ControlEvent, DerpCommand, DerpEvent, Node, NodeAction};
@@ -257,12 +256,7 @@ fn tcp_crosses_relay_only_wireguard_from_a_cold_start_on_worker() {
     browser.apply(client_map, 0, 11);
     server.apply(server_map, 0, 12);
 
-    let mut listener = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; 4096]),
-        tcp::SocketBuffer::new(vec![0; 4096]),
-    );
-    listener.listen(22).unwrap();
-    let listener = server.net.sockets.add(listener);
+    let listener = server.net.listen(22).unwrap();
     let client = browser
         .net
         .connect(Ipv4Addr::new(100, 64, 0, 2), 22, 50_000)
@@ -297,7 +291,7 @@ fn tcp_crosses_relay_only_wireguard_from_a_cold_start_on_worker() {
             }
         }
         {
-            let socket = server.net.sockets.get_mut::<tcp::Socket>(listener);
+            let socket = server.net.tcp(listener).unwrap();
             if !echoed && socket.can_recv() {
                 let mut buffer = [0u8; 16];
                 let len = socket.recv_slice(&mut buffer).unwrap();

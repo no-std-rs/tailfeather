@@ -22,6 +22,14 @@ mod x509;
 
 use rsa::HashAlgorithm;
 pub use rsa::RsaWorkspace;
+
+/// Validate an application's private CA before starting network activity.
+pub fn validate_trust_anchor(der: &[u8]) -> Result<(), embedded_tls::TlsError> {
+    if der.len() > MAX_CERTIFICATE_SIZE {
+        return Err(embedded_tls::TlsError::InsufficientSpace);
+    }
+    x509::validate_trust_anchor(der)
+}
 use x509::LeafPublicKey;
 
 use super::authority::HOST_CAPACITY;
@@ -393,5 +401,19 @@ mod tests {
                 .set_hostname_verification(&(hostname + "a"))
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod root_validation_tests {
+    use super::*;
+
+    #[test]
+    fn trust_anchors_are_checked_before_starting_platform_io() {
+        assert!(validate_trust_anchor(ISRG_ROOT_X2_DER).is_ok());
+        assert!(validate_trust_anchor(ISRG_ROOT_YR_DER).is_ok());
+        assert!(validate_trust_anchor(&[]).is_err());
+        assert!(validate_trust_anchor(&[0x30, 0, 0, 0]).is_err());
+        assert!(validate_trust_anchor(&[0; MAX_CERTIFICATE_SIZE + 1]).is_err());
     }
 }

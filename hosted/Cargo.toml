@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+tailfeather-reactor = { path = "../crates/tailfeather-reactor", features = ["std", "accelerated-crypto"] }
 tailfeather = { path = "../crates/tailfeather", features = ["peer-names", "hosted-policy"] }
 wirefeather = { path = "../crates/wirefeather" }
 critical-section = { version = "1.2", features = ["std"] }

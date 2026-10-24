@@ -1393,6 +1393,7 @@ dependencies = [
  "heapless",
  "hex",
  "hmac",
+ "ring",
  "subtle",
  "x25519-dalek",
  "zeroize",

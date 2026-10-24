@@ -6,6 +6,7 @@ const BRIDGE_BUFFER: usize = 16384;
 pub async fn connect(
     net: Shared,
     handle: TcpHandle,
+    wake: Rc<tokio::sync::Notify>,
     reply: tokio::sync::oneshot::Sender<io::Result<DuplexStream>>,
 ) {
     let established = tokio::time::timeout(std::time::Duration::from_secs(90), async {
@@ -34,11 +35,12 @@ pub async fn connect(
         net.borrow_mut().remove(handle);
         return;
     }
-    bridge(net, handle, stream).await;
+    bridge(net, handle, stream, wake).await;
 }
 pub async fn accepted(
     net: Shared,
     handle: TcpHandle,
+    wake: Rc<tokio::sync::Notify>,
     incoming: tokio::sync::mpsc::Sender<DuplexStream>,
 ) {
     let (client, stream) = tokio::io::duplex(65536);
@@ -46,13 +48,19 @@ pub async fn accepted(
         net.borrow_mut().remove(handle);
         return;
     }
-    bridge(net, handle, stream).await;
+    bridge(net, handle, stream, wake).await;
 }
-async fn bridge(runtime: Shared, handle: TcpHandle, stream: DuplexStream) {
+async fn bridge(
+    runtime: Shared,
+    handle: TcpHandle,
+    stream: DuplexStream,
+    wake: Rc<tokio::sync::Notify>,
+) {
     let (mut from_ssh, mut to_ssh) = tokio::io::split(stream);
     let abandoned = tokio::sync::Notify::new();
     let outbound = {
         let runtime = runtime.clone();
+        let wake = wake.clone();
         async move {
             let mut buffer = vec![0u8; BRIDGE_BUFFER];
             loop {
@@ -82,19 +90,24 @@ async fn bridge(runtime: Shared, handle: TcpHandle, stream: DuplexStream) {
                     .await;
 
                     match sent {
-                        Some(sent) => offset += sent,
+                        Some(sent) => {
+                            offset += sent;
+                            wake.notify_one();
+                        }
                         None => return,
                     }
                 }
             }
             if let Some(socket) = runtime.borrow_mut().tcp(handle) {
                 socket.close();
+                wake.notify_one();
             }
         }
     };
     let inbound = {
         let runtime = runtime.clone();
         let abandoned = &abandoned;
+        let wake = wake.clone();
         async move {
             let mut buffer = vec![0u8; BRIDGE_BUFFER];
             let mut probe = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -123,7 +136,10 @@ async fn bridge(runtime: Shared, handle: TcpHandle, stream: DuplexStream) {
                         continue;
                     }
                 };
-                // Reading frees receive window; let the driver advertise it.
+                // Reading frees the receive window; advertise it immediately.
+                if received > 0 {
+                    wake.notify_one();
+                }
 
                 if received == 0 {
                     break;
@@ -160,6 +176,7 @@ async fn bridge(runtime: Shared, handle: TcpHandle, stream: DuplexStream) {
     let mut net = runtime.borrow_mut();
     net.close_failed |= !closed;
     net.remove(handle);
+    wake.notify_one();
 }
 
 #[cfg(test)]
@@ -195,7 +212,12 @@ mod tests {
                 );
                 let local = Rc::new(RefCell::new(local));
                 let (mut client, stream) = tokio::io::duplex(1024);
-                let task = tokio::task::spawn_local(bridge(local.clone(), handle, stream));
+                let task = tokio::task::spawn_local(bridge(
+                    local.clone(),
+                    handle,
+                    stream,
+                    Rc::new(tokio::sync::Notify::new()),
+                ));
                 let local_driver = local.clone();
                 let driver = tokio::task::spawn_local(async move {
                     let mut now = 10;
@@ -226,7 +248,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(local.borrow().sockets.iter().count(), 0);
+                assert_eq!(local.borrow().socket_count(), 0);
                 driver.abort();
             }));
     }
