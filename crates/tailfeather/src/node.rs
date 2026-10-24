@@ -480,9 +480,11 @@ pub enum DerpEvent<'a> {
 #[derive(Clone)]
 struct PeerPath {
     key: NodePublic,
-    /// Endpoint last advertised by the control plane. This is tracked
-    /// separately from `direct`, which may have been learned from authenticated
-    /// traffic after NAT translation.
+    /// Endpoints last advertised by the control plane. Discovery candidates
+    /// must not make an unchanged control delta look like an endpoint change.
+    control_endpoints: Vec<SocketAddrV4, { crate::netmap::MAX_ENDPOINTS }>,
+    /// Current probe candidates, from control or authenticated CallMeMaybe.
+    /// `direct` may instead be a NAT-translated source learned from traffic.
     advertised: Vec<SocketAddrV4, { crate::netmap::MAX_ENDPOINTS }>,
     direct: Option<SocketAddr>,
     direct_healthy: bool,
@@ -969,11 +971,12 @@ impl<const PEERS: usize> Node<PEERS> {
                 // Preserve an authenticated, possibly NAT-translated source only
                 // while the control plane continues to advertise the same path.
                 // A changed or removed endpoint invalidates the old health bit.
-                if previous.advertised == path.advertised {
+                if previous.control_endpoints == path.control_endpoints {
                     path.direct = previous.direct;
                     path.direct_healthy = previous.direct_healthy;
                     path.direct_probe_pending = previous.direct_probe_pending;
                     if previous.disco == path.disco {
+                        path.advertised = previous.advertised.clone();
                         path.disco_tx = previous.disco_tx;
                         path.disco_deadline_ms = previous.disco_deadline_ms;
                         path.disco_attempts = previous.disco_attempts;
@@ -1012,6 +1015,7 @@ impl<const PEERS: usize> Node<PEERS> {
         let direct = advertised.first().copied().map(SocketAddr::V4);
         PeerPath {
             key: peer.node_key,
+            control_endpoints: advertised.clone(),
             advertised,
             direct,
             direct_healthy: false,
@@ -2484,6 +2488,18 @@ mod tests {
         assert_eq!(node.paths[0].advertised.as_slice(), &[advertised]);
         assert_eq!(node.paths[0].direct, Some(source));
         assert!(node.paths[0].direct_healthy);
+        // An unrelated control delta still contains the original control
+        // endpoints, not the candidates just received through discovery.
+        node.seed_staging(&mut lease);
+        lease.peers.get_mut(7).unwrap().home_derp = 10;
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        assert_eq!(node.paths[0].direct, Some(source));
+        assert!(node.paths[0].direct_healthy);
+        assert_eq!(node.paths[0].advertised.as_slice(), &[advertised]);
         let id = node.tunnel.peer_by_public_key(peer_key.as_bytes()).unwrap();
         // A rekey handshake stays on the working path and must not cancel
         // the independently requested candidate probe.
@@ -2499,6 +2515,12 @@ mod tests {
         assert!(matches!(node.poll_disco(21, &mut Counter(60)).unwrap(),
             Some(NodeAction::DirectTransmit { endpoint, .. }) if endpoint == SocketAddr::V4(advertised)));
         let tx_id = node.paths[0].disco_tx.unwrap();
+        node.seed_staging(&mut lease);
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
         node.observe_direct(id, source).unwrap();
         node.handle_direct_from(&ping_datagram[..ping_len], source, 22, &mut Counter(65))
             .unwrap();
@@ -2533,6 +2555,14 @@ mod tests {
         assert!(node.paths[0].direct_healthy);
         assert!(!node.paths[0].direct_probe_pending);
         assert_eq!(node.paths[0].disco_tx, None);
+        node.seed_staging(&mut lease);
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        assert_eq!(node.paths[0].direct, Some(SocketAddr::V4(advertised)));
+        assert!(node.paths[0].direct_healthy);
         node.mark_direct_unhealthy(&peer_key).unwrap();
         assert!(matches!(node.poll_disco(1023, &mut Counter(100)).unwrap(),
             Some(NodeAction::DirectTransmit { endpoint, .. }) if endpoint == SocketAddr::V4(advertised)));
