@@ -637,14 +637,15 @@ async fn packets(
     let mut punches: Vec<(tailfeather::keys::NodePublic, u64, u8)> = Vec::new();
     let mut candidate_generation = node.candidate_generation.get();
     let mut listeners: Vec<(
-        u16,
-        crate::netstack::TcpHandle,
+        crate::netstack::TcpListener,
         tokio::sync::mpsc::Sender<tokio::io::DuplexStream>,
     )> = Vec::new();
     let mut random = [0; 8];
     getrandom::fill(&mut random).map_err(|_| "random")?;
     let seed = u64::from_ne_bytes(random);
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+    let trace = std::env::var_os("TAILFEATHER_NET_TRACE").is_some();
+    let mut trace_at = 0;
     loop {
         if actions.overflow.get() {
             return Err("node action capacity exceeded");
@@ -701,40 +702,27 @@ async fn packets(
                 _ => {}
             }
         }
-        listeners.retain(|(_, handle, incoming)| {
+        listeners.retain_mut(|(listener, incoming)| {
             if incoming.is_closed() {
-                net.borrow_mut().remove(*handle);
+                net.borrow_mut().remove_listener(listener);
                 false
             } else {
                 true
             }
         });
-        for (port, handle, incoming) in &mut listeners {
-            if net
-                .borrow_mut()
-                .tcp(*handle)
-                .is_some_and(|s| s.state() == smoltcp::socket::tcp::State::Established)
-            {
-                let accepted = *handle;
-                let replacement = net.borrow_mut().listen(*port);
-                match replacement {
-                    Ok(next) => {
-                        *handle = next;
-                        let net = net.clone();
-                        let incoming = incoming.clone();
-                        tokio::task::spawn_local(crate::bridge::accepted(net, accepted, incoming));
-                    }
-                    Err(_) => {
-                        net.borrow_mut().remove(accepted);
-                        *handle = net
-                            .borrow_mut()
-                            .listen(*port)
-                            .map_err(|_| "listener capacity")?;
-                    }
-                }
+        for (listener, incoming) in &mut listeners {
+            let ready = net.borrow_mut().accept_ready(listener);
+            for accepted in ready {
+                let net = net.clone();
+                let incoming = incoming.clone();
+                tokio::task::spawn_local(crate::bridge::accepted(net, accepted, incoming));
             }
         }
         let now = reactor.clock_millis();
+        if trace && now >= trace_at {
+            net.borrow().trace();
+            trace_at = now + 2000;
+        }
         if outgoing.is_empty() {
             outgoing.extend(net.borrow_mut().poll(now));
         }
@@ -827,7 +815,7 @@ async fn packets(
             received=udp.recv_from(&mut datagram)=>{let (len,from)=received.map_err(|_|"UDP receive")?;if node.receive_stun(&datagram[..len],from){continue;}enqueue(actions,node.borrow_mut().handle_direct_from(&datagram[..len],from.into(),reactor.clock_millis(),&mut OsRng).ok().flatten());}
             command=commands.recv()=>match command {
                 Some(crate::Command::Drain { reply }) => {
-                    if listeners.iter().any(|(_,_,incoming)|!incoming.is_closed()) { let _=reply.send(Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"drop listeners before draining"))); }
+                    if listeners.iter().any(|(_,incoming)|!incoming.is_closed()) { let _=reply.send(Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"drop listeners before draining"))); }
                     else if drain.as_ref().is_some_and(|reply| !reply.is_closed()) { let _ = reply.send(Err(std::io::Error::other("TCP drain already pending"))); }
                     else { drain=Some(reply); }
                 }
@@ -842,8 +830,8 @@ async fn packets(
                 }
                 Some(crate::Command::Listen{port,incoming,reply})=>{
                     if let Some(own)=status.borrow().address {net.borrow_mut().set_address(own,reactor.clock_millis(),seed);}
-                    if listeners.len()>=4||listeners.iter().any(|(p,_,_)|*p==port){let _=reply.send(Err(std::io::Error::other("listener unavailable")));}
-                    else {let result=net.borrow_mut().listen(port);match result {Ok(handle)=>{listeners.push((port,handle,incoming));let _=reply.send(Ok(()));},Err(error)=>{let _=reply.send(Err(std::io::Error::other(error)));}}}
+                    if listeners.len()>=4||listeners.iter().any(|(listener,_)|listener.port==port){let _=reply.send(Err(std::io::Error::other("listener unavailable")));}
+                    else {let result=net.borrow_mut().listen_backlog(port);match result {Ok(listener)=>{listeners.push((listener,incoming));let _=reply.send(Ok(()));},Err(error)=>{let _=reply.send(Err(std::io::Error::other(error)));}}}
                 }
                 None=>return Ok(()),
             },
