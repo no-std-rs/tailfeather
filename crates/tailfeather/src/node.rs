@@ -1564,11 +1564,17 @@ impl<const PEERS: usize> Node<PEERS> {
                 }
                 if let Some(endpoint) = endpoints.first().copied() {
                     self.paths[index].advertised = endpoints;
-                    self.paths[index].direct = Some(SocketAddr::V4(endpoint));
-                    self.paths[index].direct_healthy = false;
-                    self.paths[index].direct_probe_pending = true;
-                    self.paths[index].disco_tx = None;
-                    self.paths[index].disco_attempts = 0;
+                    // Candidate advertisements are not evidence that the
+                    // authenticated direct path stopped working. Keep that
+                    // path (including a NAT-translated source absent from the
+                    // advertisement) until actual reachability fails. Retain
+                    // the new candidates for the next discovery round.
+                    if !self.paths[index].direct_healthy {
+                        self.paths[index].direct = Some(SocketAddr::V4(endpoint));
+                        self.paths[index].direct_probe_pending = true;
+                        self.paths[index].disco_tx = None;
+                        self.paths[index].disco_attempts = 0;
+                    }
                 }
                 Ok(None)
             }
@@ -2403,6 +2409,78 @@ mod tests {
             Some(NodeAction::DirectTransmit { endpoint: got, .. })
                 if got == SocketAddr::V4(endpoint)
         ));
+    }
+
+    #[test]
+    fn call_me_maybe_preserves_an_authenticated_working_direct_path() {
+        let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+        persisted(&mut node);
+        let peer_key = NodePrivate::from_bytes([77; 32]).public();
+        let peer_disco = DiscoPrivate::from_bytes([88; 32]);
+        let mut lease = Netmap::<2>::new();
+        let mut peer = Peer::new(7, peer_key);
+        peer.disco_key = Some(peer_disco.public());
+        peer.home_derp = 9;
+        peer.endpoints
+            .push("192.0.2.10:41641".parse().unwrap())
+            .unwrap();
+        lease.peers.upsert(peer).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        let source: SocketAddr = "198.51.100.10:50123".parse().unwrap();
+        let mut plaintext = [0; crate::disco::MAX_PACKET];
+        let mut datagram = [0; crate::disco::MAX_PACKET];
+        let ping = crate::disco::Message::Ping(crate::disco::Ping {
+            tx_id: [3; 12],
+            node_key: Some(peer_key),
+        });
+        let len = ping.encode(&mut plaintext).unwrap();
+        let len = crate::disco::seal(
+            &peer_disco,
+            &peer_disco.public(),
+            &node.identity.disco.public(),
+            &plaintext[..len],
+            &mut Counter(20),
+            &mut datagram,
+        )
+        .unwrap();
+        node.handle_direct_from(&datagram[..len], source, 10, &mut Counter(30))
+            .unwrap();
+        assert!(node.paths[0].direct_healthy);
+        let advertised: SocketAddrV4 = "203.0.113.20:41641".parse().unwrap();
+        let mut endpoints = heapless::Vec::new();
+        endpoints.push(SocketAddr::V4(advertised)).unwrap();
+        let message = crate::disco::Message::CallMeMaybe(crate::disco::CallMeMaybe { endpoints });
+        let len = message.encode(&mut plaintext).unwrap();
+        let len = crate::disco::seal(
+            &peer_disco,
+            &peer_disco.public(),
+            &node.identity.disco.public(),
+            &plaintext[..len],
+            &mut Counter(40),
+            &mut datagram,
+        )
+        .unwrap();
+        node.handle_derp_event(
+            DerpEvent::Packet {
+                region: 9,
+                peer: peer_key,
+                payload: &datagram[..len],
+            },
+            20,
+            &mut Counter(50),
+        )
+        .unwrap();
+        assert_eq!(node.paths[0].advertised.as_slice(), &[advertised]);
+        assert_eq!(node.paths[0].direct, Some(source));
+        assert!(node.paths[0].direct_healthy);
+        assert!(node.poll_disco(20, &mut Counter(60)).unwrap().is_none());
+        node.mark_direct_unhealthy(&peer_key).unwrap();
+        assert!(matches!(node.poll_disco(21, &mut Counter(70)).unwrap(),
+            Some(NodeAction::DirectTransmit { endpoint, .. }) if endpoint == SocketAddr::V4(advertised)));
     }
 
     #[test]
