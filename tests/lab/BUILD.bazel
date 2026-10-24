@@ -105,19 +105,11 @@ sh_test(
         "@tailscale_1_94_2_linux_amd64//:tailscaled",
         "//tests/vectors:versions.json",
     ],
-    exec_properties = {
-        "test.Arch": "amd64",
-        "test.OSFamily": "Linux",
-        "test.Pool": "linux-amd64-kvm",
-        "test.container-image": "",
-        "test.use-self-hosted-executors": "true",
-        "test.workload-isolation-type": "none",
-    },
     size = "enormous",
     tags = [
         "exclusive-if-local",
         "no-cache",
-        "no-local",
+        "no-remote",
     ],
     # Inner budgets: conformance 360s, WireGuard 120s, no-std 180s,
     # SSH scenarios 980s, plus setup. The VM caps the total at 1800s.

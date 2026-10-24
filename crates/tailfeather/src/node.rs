@@ -480,9 +480,11 @@ pub enum DerpEvent<'a> {
 #[derive(Clone)]
 struct PeerPath {
     key: NodePublic,
-    /// Endpoint last advertised by the control plane. This is tracked
-    /// separately from `direct`, which may have been learned from authenticated
-    /// traffic after NAT translation.
+    /// Endpoints last advertised by the control plane. Discovery candidates
+    /// must not make an unchanged control delta look like an endpoint change.
+    control_endpoints: Vec<SocketAddrV4, { crate::netmap::MAX_ENDPOINTS }>,
+    /// Current probe candidates, from control or authenticated CallMeMaybe.
+    /// `direct` may instead be a NAT-translated source learned from traffic.
     advertised: Vec<SocketAddrV4, { crate::netmap::MAX_ENDPOINTS }>,
     direct: Option<SocketAddr>,
     direct_healthy: bool,
@@ -970,11 +972,12 @@ impl<const PEERS: usize> Node<PEERS> {
                 // Preserve an authenticated, possibly NAT-translated source only
                 // while the control plane continues to advertise the same path.
                 // A changed or removed endpoint invalidates the old health bit.
-                if previous.advertised == path.advertised {
+                if previous.control_endpoints == path.control_endpoints {
                     path.direct = previous.direct;
                     path.direct_healthy = previous.direct_healthy;
                     path.direct_probe_pending = previous.direct_probe_pending;
                     if previous.disco == path.disco {
+                        path.advertised = previous.advertised.clone();
                         path.disco_tx = previous.disco_tx;
                         path.disco_deadline_ms = previous.disco_deadline_ms;
                         path.disco_attempts = previous.disco_attempts;
@@ -1013,6 +1016,7 @@ impl<const PEERS: usize> Node<PEERS> {
         let direct = advertised.first().copied().map(SocketAddr::V4);
         PeerPath {
             key: peer.node_key,
+            control_endpoints: advertised.clone(),
             advertised,
             direct,
             direct_healthy: false,
@@ -1044,6 +1048,7 @@ impl<const PEERS: usize> Node<PEERS> {
         );
         let probe_direct = handshake
             && direct_paths
+            && !path.direct_healthy
             && path.direct.is_some()
             && (path.direct_probe_pending || path.home_derp == 0);
         if probe_direct {
@@ -1117,12 +1122,25 @@ impl<const PEERS: usize> Node<PEERS> {
             .iter_mut()
             .find(|path| path.key == key)
             .ok_or(NodeError::InvalidState)?;
+        Self::learn_direct_path(path, source, false);
+        Ok(())
+    }
+
+    fn learn_direct_path(path: &mut PeerPath, source: SocketAddr, probe_completed: bool) {
+        // Traffic on the existing working path does not answer a probe of
+        // refreshed candidates. Keep that round, including its transaction,
+        // until a matching pong or a newly observed path completes it.
+        let preserve_probe = path.direct_healthy
+            && path.direct == Some(source)
+            && path.direct_probe_pending
+            && !probe_completed;
         path.direct = Some(source);
         path.direct_healthy = true;
-        path.direct_probe_pending = false;
-        path.disco_tx = None;
-        path.disco_attempts = 0;
-        Ok(())
+        if !preserve_probe {
+            path.direct_probe_pending = false;
+            path.disco_tx = None;
+            path.disco_attempts = 0;
+        }
     }
 
     fn observe_relay(&mut self, peer: NodePublic, region: u16) -> Result<(), NodeError> {
@@ -1256,7 +1274,7 @@ impl<const PEERS: usize> Node<PEERS> {
             }
         }
         let Some(index) = self.paths.iter().position(|path| {
-            !path.direct_healthy
+            (!path.direct_healthy || path.direct_probe_pending)
                 && !path.advertised.is_empty()
                 && path.disco.is_some()
                 && usize::from(path.disco_attempts) < path.advertised.len().saturating_mul(3)
@@ -1565,8 +1583,13 @@ impl<const PEERS: usize> Node<PEERS> {
                 }
                 if let Some(endpoint) = endpoints.first().copied() {
                     self.paths[index].advertised = endpoints;
-                    self.paths[index].direct = Some(SocketAddr::V4(endpoint));
-                    self.paths[index].direct_healthy = false;
+                    // Candidate advertisements are not evidence that the
+                    // authenticated direct path stopped working. Keep that
+                    // path (including a NAT-translated source absent from the
+                    // advertisement) while probing the new candidates.
+                    if !self.paths[index].direct_healthy {
+                        self.paths[index].direct = Some(SocketAddr::V4(endpoint));
+                    }
                     self.paths[index].direct_probe_pending = true;
                     self.paths[index].disco_tx = None;
                     self.paths[index].disco_attempts = 0;
@@ -1703,14 +1726,14 @@ impl<const PEERS: usize> Node<PEERS> {
                         path.disco == Some(claimed) && path.disco_tx == Some(pong.tx_id)
                     })
                     .ok_or(NodeError::InvalidState)?;
-                self.learn_disco_path(index, source);
+                Self::learn_direct_path(&mut self.paths[index], source, true);
                 Ok(None)
             }
             crate::disco::Message::Ping(ping) => {
                 let index = self
                     .disco_path_index(claimed, ping.node_key)
                     .ok_or(NodeError::InvalidState)?;
-                self.learn_disco_path(index, source);
+                Self::learn_direct_path(&mut self.paths[index], source, false);
                 let peer = self.paths[index].key;
                 let pong = crate::disco::Message::Pong(crate::disco::Pong {
                     tx_id: ping.tx_id,
@@ -1756,14 +1779,6 @@ impl<const PEERS: usize> Node<PEERS> {
             .map(|(index, _)| index);
         let index = matches.next()?;
         matches.next().is_none().then_some(index)
-    }
-
-    fn learn_disco_path(&mut self, index: usize, source: SocketAddr) {
-        self.paths[index].direct = Some(source);
-        self.paths[index].direct_healthy = true;
-        self.paths[index].direct_probe_pending = false;
-        self.paths[index].disco_tx = None;
-        self.paths[index].disco_attempts = 0;
     }
 
     /// Encrypt an inner IPv4 packet for a configured peer.
@@ -2445,6 +2460,154 @@ mod tests {
             Some(NodeAction::DirectTransmit { endpoint: got, .. })
                 if got == SocketAddr::V4(endpoint)
         ));
+    }
+
+    #[test]
+    fn call_me_maybe_preserves_an_authenticated_working_direct_path() {
+        let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+        persisted(&mut node);
+        let peer_key = NodePrivate::from_bytes([77; 32]).public();
+        let peer_disco = DiscoPrivate::from_bytes([88; 32]);
+        let mut lease = Netmap::<2>::new();
+        let mut peer = Peer::new(7, peer_key);
+        peer.disco_key = Some(peer_disco.public());
+        peer.home_derp = 9;
+        peer.endpoints
+            .push("192.0.2.10:41641".parse().unwrap())
+            .unwrap();
+        lease.peers.upsert(peer).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        let source: SocketAddr = "198.51.100.10:50123".parse().unwrap();
+        let mut plaintext = [0; crate::disco::MAX_PACKET];
+        let mut datagram = [0; crate::disco::MAX_PACKET];
+        let ping = crate::disco::Message::Ping(crate::disco::Ping {
+            tx_id: [3; 12],
+            node_key: Some(peer_key),
+        });
+        let len = ping.encode(&mut plaintext).unwrap();
+        let len = crate::disco::seal(
+            &peer_disco,
+            &peer_disco.public(),
+            &node.identity.disco.public(),
+            &plaintext[..len],
+            &mut Counter(20),
+            &mut datagram,
+        )
+        .unwrap();
+        let ping_datagram = datagram;
+        let ping_len = len;
+        node.handle_direct_from(&datagram[..len], source, 10, &mut Counter(30))
+            .unwrap();
+        assert!(node.paths[0].direct_healthy);
+        let advertised: SocketAddrV4 = "203.0.113.20:41641".parse().unwrap();
+        let mut endpoints = heapless::Vec::new();
+        endpoints.push(SocketAddr::V4(advertised)).unwrap();
+        let message = crate::disco::Message::CallMeMaybe(crate::disco::CallMeMaybe { endpoints });
+        let len = message.encode(&mut plaintext).unwrap();
+        let len = crate::disco::seal(
+            &peer_disco,
+            &peer_disco.public(),
+            &node.identity.disco.public(),
+            &plaintext[..len],
+            &mut Counter(40),
+            &mut datagram,
+        )
+        .unwrap();
+        node.handle_derp_event(
+            DerpEvent::Packet {
+                region: 9,
+                peer: peer_key,
+                payload: &datagram[..len],
+            },
+            20,
+            &mut Counter(50),
+        )
+        .unwrap();
+        assert_eq!(node.paths[0].advertised.as_slice(), &[advertised]);
+        assert_eq!(node.paths[0].direct, Some(source));
+        assert!(node.paths[0].direct_healthy);
+        // An unrelated control delta still contains the original control
+        // endpoints, not the candidates just received through discovery.
+        node.seed_staging(&mut lease);
+        lease.peers.get_mut(7).unwrap().home_derp = 10;
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        assert_eq!(node.paths[0].direct, Some(source));
+        assert!(node.paths[0].direct_healthy);
+        assert_eq!(node.paths[0].advertised.as_slice(), &[advertised]);
+        let id = node.tunnel.peer_by_public_key(peer_key.as_bytes()).unwrap();
+        // A rekey handshake stays on the working path and must not cancel
+        // the independently requested candidate probe.
+        assert!(
+            matches!(node.route_packet(id, &[tunnel::messages::TYPE_INITIATION]).unwrap(),
+            NodeAction::DirectTransmit { endpoint, .. } if endpoint == source)
+        );
+        // Both authenticated WireGuard traffic and disco pings from the
+        // current endpoint must leave refreshed-candidate discovery intact.
+        node.observe_direct(id, source).unwrap();
+        node.handle_direct_from(&ping_datagram[..ping_len], source, 21, &mut Counter(55))
+            .unwrap();
+        assert!(matches!(node.poll_disco(21, &mut Counter(60)).unwrap(),
+            Some(NodeAction::DirectTransmit { endpoint, .. }) if endpoint == SocketAddr::V4(advertised)));
+        let tx_id = node.paths[0].disco_tx.unwrap();
+        node.seed_staging(&mut lease);
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        node.observe_direct(id, source).unwrap();
+        node.handle_direct_from(&ping_datagram[..ping_len], source, 22, &mut Counter(65))
+            .unwrap();
+        assert_eq!(node.paths[0].disco_tx, Some(tx_id));
+        assert_eq!(node.paths[0].disco_attempts, 1);
+        assert!(
+            matches!(node.route_packet(id, &[tunnel::messages::TYPE_DATA]).unwrap(),
+            NodeAction::DirectTransmit { endpoint, .. } if endpoint == source)
+        );
+        let pong = crate::disco::Message::Pong(crate::disco::Pong {
+            tx_id: node.paths[0].disco_tx.unwrap(),
+            src: SocketAddr::V4(advertised),
+        });
+        let len = pong.encode(&mut plaintext).unwrap();
+        let len = crate::disco::seal(
+            &peer_disco,
+            &peer_disco.public(),
+            &node.identity.disco.public(),
+            &plaintext[..len],
+            &mut Counter(80),
+            &mut datagram,
+        )
+        .unwrap();
+        node.handle_direct_from(
+            &datagram[..len],
+            SocketAddr::V4(advertised),
+            1022,
+            &mut Counter(90),
+        )
+        .unwrap();
+        assert_eq!(node.paths[0].direct, Some(SocketAddr::V4(advertised)));
+        assert!(node.paths[0].direct_healthy);
+        assert!(!node.paths[0].direct_probe_pending);
+        assert_eq!(node.paths[0].disco_tx, None);
+        node.seed_staging(&mut lease);
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        assert_eq!(node.paths[0].direct, Some(SocketAddr::V4(advertised)));
+        assert!(node.paths[0].direct_healthy);
+        node.mark_direct_unhealthy(&peer_key).unwrap();
+        assert!(matches!(node.poll_disco(1023, &mut Counter(100)).unwrap(),
+            Some(NodeAction::DirectTransmit { endpoint, .. }) if endpoint == SocketAddr::V4(advertised)));
     }
 
     #[test]
