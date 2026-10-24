@@ -20,6 +20,12 @@ pub const MTU: usize = 1280;
 /// retransmits what is dropped; nothing grows without bound.
 const QUEUE_LIMIT: usize = 128;
 const SOCKET_BUFFER: usize = 64 * 1024;
+const LISTEN_BACKLOG: usize = 4;
+
+pub struct TcpListener {
+    pub port: u16,
+    pending: Vec<TcpHandle>,
+}
 /// Any address works: with `Medium::Ip` smoltcp only needs *a* route for
 /// destinations outside its own /32.
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 100);
@@ -127,6 +133,21 @@ pub struct NetStack {
 }
 
 impl NetStack {
+    pub fn trace(&self) {
+        for (_, socket) in self.sockets.iter() {
+            let smoltcp::socket::Socket::Tcp(socket) = socket;
+            if socket.state() != tcp::State::Listen {
+                eprintln!(
+                    "tailnet TCP {:?} -> {:?}: {:?} send={} recv={}",
+                    socket.local_endpoint(),
+                    socket.remote_endpoint(),
+                    socket.state(),
+                    socket.send_queue(),
+                    socket.recv_queue()
+                );
+            }
+        }
+    }
     pub fn new(id: u64) -> Self {
         Self {
             id,
@@ -315,6 +336,49 @@ impl NetStack {
             socket: self.sockets.add(socket),
         })
     }
+    /// smoltcp consumes a listening socket as soon as a SYN arrives. Reserve
+    /// several sockets before polling packets, otherwise simultaneous SYNs
+    /// receive RST while the only listener completes its first handshake.
+    pub fn listen_backlog(&mut self, port: u16) -> Result<TcpListener, String> {
+        let first = self.listen(port)?;
+        let mut listener = TcpListener {
+            port,
+            pending: vec![first],
+        };
+        self.refill_listener(&mut listener);
+        Ok(listener)
+    }
+    fn refill_listener(&mut self, listener: &mut TcpListener) {
+        while listener.pending.len() < LISTEN_BACKLOG {
+            match self.listen(listener.port) {
+                Ok(handle) => listener.pending.push(handle),
+                Err(_) => break, // Existing connections retain their slots.
+            }
+        }
+    }
+    pub fn accept_ready(&mut self, listener: &mut TcpListener) -> Vec<TcpHandle> {
+        let mut ready = Vec::new();
+        listener.pending.retain(
+            |handle| match self.tcp(*handle).map(|socket| socket.state()) {
+                Some(tcp::State::Established | tcp::State::CloseWait) => {
+                    ready.push(*handle);
+                    false
+                }
+                Some(tcp::State::Listen | tcp::State::SynReceived) => true,
+                _ => {
+                    self.remove(*handle);
+                    false
+                }
+            },
+        );
+        self.refill_listener(listener);
+        ready
+    }
+    pub fn remove_listener(&mut self, listener: &mut TcpListener) {
+        for handle in listener.pending.drain(..) {
+            self.remove(handle);
+        }
+    }
     pub fn tcp(&mut self, handle: TcpHandle) -> Option<&mut tcp::Socket<'static>> {
         (handle.stack == self.id).then(|| self.sockets.get_mut::<tcp::Socket>(handle.socket))
     }
@@ -408,5 +472,41 @@ mod tests {
         assert_eq!(net.tcp(listener).unwrap().state(), tcp::State::Listen);
         assert_eq!(net.tcp(listener).unwrap().listen_endpoint().port, 2222);
         assert_eq!(net.tcp(outgoing).unwrap().state(), tcp::State::Closed);
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+    #[test]
+    fn simultaneous_syns_survive_before_the_runtime_can_accept() {
+        let mut server = NetStack::new(1);
+        let mut client = NetStack::new(2);
+        server.set_address("100.64.0.1".parse().unwrap(), 0, 1);
+        client.set_address("100.64.0.2".parse().unwrap(), 0, 2);
+        let mut listener = server.listen_backlog(2222).unwrap();
+        let connections = (0..4)
+            .map(|n| {
+                client
+                    .connect("100.64.0.1".parse().unwrap(), 2222, 49152 + n)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        // Deliver all SYNs in one packet batch before the accept task runs.
+        for now in 0..30 {
+            for packet in client.poll(now) {
+                server.deliver(&packet);
+            }
+            for packet in server.poll(now) {
+                client.deliver(&packet);
+            }
+        }
+        assert!(
+            connections
+                .iter()
+                .all(|h| client.tcp(*h).unwrap().state() == tcp::State::Established)
+        );
+        assert_eq!(server.accept_ready(&mut listener).len(), 4);
+        assert_eq!(listener.pending.len(), LISTEN_BACKLOG);
     }
 }
