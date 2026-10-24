@@ -1117,12 +1117,25 @@ impl<const PEERS: usize> Node<PEERS> {
             .iter_mut()
             .find(|path| path.key == key)
             .ok_or(NodeError::InvalidState)?;
+        Self::learn_direct_path(path, source, false);
+        Ok(())
+    }
+
+    fn learn_direct_path(path: &mut PeerPath, source: SocketAddr, probe_completed: bool) {
+        // Traffic on the existing working path does not answer a probe of
+        // refreshed candidates. Keep that round, including its transaction,
+        // until a matching pong or a newly observed path completes it.
+        let preserve_probe = path.direct_healthy
+            && path.direct == Some(source)
+            && path.direct_probe_pending
+            && !probe_completed;
         path.direct = Some(source);
         path.direct_healthy = true;
-        path.direct_probe_pending = false;
-        path.disco_tx = None;
-        path.disco_attempts = 0;
-        Ok(())
+        if !preserve_probe {
+            path.direct_probe_pending = false;
+            path.disco_tx = None;
+            path.disco_attempts = 0;
+        }
     }
 
     fn observe_relay(&mut self, peer: NodePublic, region: u16) -> Result<(), NodeError> {
@@ -1708,14 +1721,14 @@ impl<const PEERS: usize> Node<PEERS> {
                         path.disco == Some(claimed) && path.disco_tx == Some(pong.tx_id)
                     })
                     .ok_or(NodeError::InvalidState)?;
-                self.learn_disco_path(index, source);
+                Self::learn_direct_path(&mut self.paths[index], source, true);
                 Ok(None)
             }
             crate::disco::Message::Ping(ping) => {
                 let index = self
                     .disco_path_index(claimed, ping.node_key)
                     .ok_or(NodeError::InvalidState)?;
-                self.learn_disco_path(index, source);
+                Self::learn_direct_path(&mut self.paths[index], source, false);
                 let peer = self.paths[index].key;
                 let pong = crate::disco::Message::Pong(crate::disco::Pong {
                     tx_id: ping.tx_id,
@@ -1761,14 +1774,6 @@ impl<const PEERS: usize> Node<PEERS> {
             .map(|(index, _)| index);
         let index = matches.next()?;
         matches.next().is_none().then_some(index)
-    }
-
-    fn learn_disco_path(&mut self, index: usize, source: SocketAddr) {
-        self.paths[index].direct = Some(source);
-        self.paths[index].direct_healthy = true;
-        self.paths[index].direct_probe_pending = false;
-        self.paths[index].disco_tx = None;
-        self.paths[index].disco_attempts = 0;
     }
 
     /// Encrypt an inner IPv4 packet for a configured peer.
@@ -2447,6 +2452,8 @@ mod tests {
             &mut datagram,
         )
         .unwrap();
+        let ping_datagram = datagram;
+        let ping_len = len;
         node.handle_direct_from(&datagram[..len], source, 10, &mut Counter(30))
             .unwrap();
         assert!(node.paths[0].direct_healthy);
@@ -2484,14 +2491,50 @@ mod tests {
             matches!(node.route_packet(id, &[tunnel::messages::TYPE_INITIATION]).unwrap(),
             NodeAction::DirectTransmit { endpoint, .. } if endpoint == source)
         );
-        assert!(matches!(node.poll_disco(20, &mut Counter(60)).unwrap(),
+        // Both authenticated WireGuard traffic and disco pings from the
+        // current endpoint must leave refreshed-candidate discovery intact.
+        node.observe_direct(id, source).unwrap();
+        node.handle_direct_from(&ping_datagram[..ping_len], source, 21, &mut Counter(55))
+            .unwrap();
+        assert!(matches!(node.poll_disco(21, &mut Counter(60)).unwrap(),
             Some(NodeAction::DirectTransmit { endpoint, .. }) if endpoint == SocketAddr::V4(advertised)));
+        let tx_id = node.paths[0].disco_tx.unwrap();
+        node.observe_direct(id, source).unwrap();
+        node.handle_direct_from(&ping_datagram[..ping_len], source, 22, &mut Counter(65))
+            .unwrap();
+        assert_eq!(node.paths[0].disco_tx, Some(tx_id));
+        assert_eq!(node.paths[0].disco_attempts, 1);
         assert!(
             matches!(node.route_packet(id, &[tunnel::messages::TYPE_DATA]).unwrap(),
             NodeAction::DirectTransmit { endpoint, .. } if endpoint == source)
         );
+        let pong = crate::disco::Message::Pong(crate::disco::Pong {
+            tx_id: node.paths[0].disco_tx.unwrap(),
+            src: SocketAddr::V4(advertised),
+        });
+        let len = pong.encode(&mut plaintext).unwrap();
+        let len = crate::disco::seal(
+            &peer_disco,
+            &peer_disco.public(),
+            &node.identity.disco.public(),
+            &plaintext[..len],
+            &mut Counter(80),
+            &mut datagram,
+        )
+        .unwrap();
+        node.handle_direct_from(
+            &datagram[..len],
+            SocketAddr::V4(advertised),
+            1022,
+            &mut Counter(90),
+        )
+        .unwrap();
+        assert_eq!(node.paths[0].direct, Some(SocketAddr::V4(advertised)));
+        assert!(node.paths[0].direct_healthy);
+        assert!(!node.paths[0].direct_probe_pending);
+        assert_eq!(node.paths[0].disco_tx, None);
         node.mark_direct_unhealthy(&peer_key).unwrap();
-        assert!(matches!(node.poll_disco(1021, &mut Counter(70)).unwrap(),
+        assert!(matches!(node.poll_disco(1023, &mut Counter(100)).unwrap(),
             Some(NodeAction::DirectTransmit { endpoint, .. }) if endpoint == SocketAddr::V4(advertised)));
     }
 
