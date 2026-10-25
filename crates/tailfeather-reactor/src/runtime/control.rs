@@ -310,7 +310,7 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
                     _ => None,
                 })
                 .ok_or("assigned IPv4")?;
-            runtime.status.sender().send(Status {
+            runtime.publish_status(Status {
                 address: Some(address),
                 error: None,
             });

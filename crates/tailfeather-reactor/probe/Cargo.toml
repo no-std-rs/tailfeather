@@ -18,7 +18,7 @@ tailfeather-reactor = { path = "..", default-features = false, features = ["emba
 tailfeather = { path = "../../tailfeather", default-features = false }
 embassy-executor = { version = "0.10", features = ["platform-riscv32", "executor-thread"] }
 embassy-net = { version = "0.9.1", default-features = false, features = ["medium-ip", "dns", "tcp", "udp", "proto-ipv4"] }
-embedded-tls = { version = "0.19", default-features = false }
+embedded-tls = { git = "https://github.com/pawelchcki/embedded-tls", rev = "48fef49e6e7cbdaa44e9003a45078656f8955d3d", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 static_cell = "2"
 

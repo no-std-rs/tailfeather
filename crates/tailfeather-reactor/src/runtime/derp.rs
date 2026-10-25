@@ -321,71 +321,56 @@ async fn connection<P: Network, S: State, const PEERS: usize, const A: usize>(
             .flatten(),
     );
     activity.set(reactor.clock_millis());
-    let transfer = async {
-        let mut alternate = false;
-        loop {
-            if slot.stop.get() {
-                return Ok(());
+    let (mut reader, mut writer) = stream.split();
+    let receive = |frame: Frame, payload: &[u8]| -> Result<bool, Error> {
+        match frame.kind {
+            FrameType::RecvPacket => {
+                let (peer, payload) =
+                    Client::read_packet(frame, payload).map_err(|_| "relay packet")?;
+                runtime.enqueue(
+                    runtime
+                        .node
+                        .borrow_mut()
+                        .handle_derp_event(
+                            DerpEvent::Packet {
+                                region,
+                                peer,
+                                payload,
+                            },
+                            reactor.clock_millis(),
+                            &mut runtime.network.rng(),
+                        )
+                        .ok()
+                        .flatten(),
+                );
             }
-            for _ in 0..A {
-                let command = slot.queue.borrow_mut().pop_front();
-                let Some(DerpCommand::Send { peer, packet, .. }) = command else {
-                    break;
-                };
-                let len = client
-                    .send_packet(&peer, packet.as_slice(), &mut output)
-                    .map_err(|_| "relay packet size")?;
-                send(&mut stream, reactor, &output[..len]).await?;
-            }
-            runtime.ready.signal(());
-            let read = async {
-                runtime.wait_for_space().await;
-                frames.read(&mut stream, reactor).await
-            };
-            if let Either::First(frame) =
-                crate::exec::select_fair(alternate, read, slot.ready.wait()).await
-            {
-                let frame = frame?;
-                match frame.kind {
-                    FrameType::RecvPacket => {
-                        let (peer, payload) = Client::read_packet(frame, frames.payload(frame))
-                            .map_err(|_| "relay packet")?;
-                        runtime.enqueue(
-                            runtime
-                                .node
-                                .borrow_mut()
-                                .handle_derp_event(
-                                    DerpEvent::Packet {
-                                        region,
-                                        peer,
-                                        payload,
-                                    },
-                                    reactor.clock_millis(),
-                                    &mut runtime.network.rng(),
-                                )
-                                .ok()
-                                .flatten(),
-                        );
-                    }
-                    FrameType::Ping => {
-                        let len = Client::write_pong(frame, frames.payload(frame), &mut output)
-                            .map_err(|_| "relay ping")?;
-                        send(&mut stream, reactor, &output[..len]).await?;
-                    }
-                    FrameType::PeerGone => {
-                        if let Ok(peer) = Client::read_peer_gone(frame, frames.payload(frame)) {
-                            runtime.node.borrow_mut().forget_relay(&peer, region);
-                        }
-                    }
-                    FrameType::Restarting => return Ok(()),
-                    _ => {}
+            FrameType::PeerGone => {
+                if let Ok(peer) = Client::read_peer_gone(frame, payload) {
+                    runtime.node.borrow_mut().forget_relay(&peer, region);
                 }
-                frames.consume(frame);
             }
-            alternate = !alternate;
-            crate::exec::yield_now().await;
+            FrameType::Restarting => return Ok(false),
+            _ => {}
         }
+        Ok(true)
     };
+    let encode = |command: DerpCommand, output: &mut [u8]| -> Result<usize, Error> {
+        let DerpCommand::Send { peer, packet, .. } = command else {
+            return Err("relay command state");
+        };
+        client
+            .send_packet(&peer, packet.as_slice(), output)
+            .map_err(|_| "relay packet size")
+    };
+    let transfer = transfer(
+        reactor,
+        slot,
+        (&mut frames, &mut reader, &mut writer),
+        || runtime.wait_for_space(),
+        || runtime.ready.signal(()),
+        encode,
+        receive,
+    );
     let liveness = async {
         loop {
             let deadline = activity.get().saturating_add(90_000);
@@ -398,5 +383,235 @@ async fn connection<P: Network, S: State, const PEERS: usize, const A: usize>(
     match select(transfer, liveness).await {
         Either::First(result) => result,
         Either::Second(()) => Err("relay receive liveness deadline"),
+    }
+}
+
+// Read and write futures persist until the entire connection is discarded.
+// Outbound work never cancels a partially consumed TLS record header/body.
+async fn transfer<
+    R: Read,
+    W: Write,
+    C: Clock,
+    const A: usize,
+    F: core::future::Future<Output = ()>,
+>(
+    reactor: &Reactor<C>,
+    slot: &Slot<A>,
+    io: (&mut Frames<'_>, &mut R, &mut W),
+    mut wait_space: impl FnMut() -> F,
+    mut notify_space: impl FnMut(),
+    mut encode: impl FnMut(DerpCommand, &mut [u8]) -> Result<usize, Error>,
+    mut receive: impl FnMut(Frame, &[u8]) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    let (frames, reader, writer) = io;
+    const PONG: usize = frame::HEADER_LEN + frame::PING_LEN;
+    let pongs = RefCell::new(Deque::<[u8; PONG], 8>::new());
+    let pong_space = Signal::<NoopRawMutex, ()>::new();
+    let input = async {
+        loop {
+            wait_space().await;
+            let frame = frames.read(reader, reactor).await?;
+            if frame.kind == FrameType::Ping {
+                let mut pong = [0; PONG];
+                let len = Client::write_pong(frame, frames.payload(frame), &mut pong)
+                    .map_err(|_| "relay ping")?;
+                if len != PONG {
+                    return Err("relay pong size");
+                }
+                while pongs.borrow().is_full() {
+                    pong_space.wait().await;
+                }
+                pongs
+                    .borrow_mut()
+                    .push_back(pong)
+                    .map_err(|_| "relay pong capacity")?;
+                slot.ready.signal(());
+            } else if !receive(frame, frames.payload(frame))? {
+                return Ok(());
+            }
+            frames.consume(frame);
+        }
+    };
+    let output = async {
+        let mut bytes = [0; FRAME];
+        loop {
+            let pong = pongs.borrow_mut().pop_front();
+            if let Some(pong) = pong {
+                pong_space.signal(());
+                send(writer, reactor, &pong).await?;
+                continue;
+            }
+            let next = slot.queue.borrow_mut().pop_front();
+            if let Some(command) = next {
+                notify_space();
+                let len = encode(command, &mut bytes)?;
+                send(writer, reactor, &bytes[..len]).await?;
+                continue;
+            }
+            slot.ready.wait().await;
+        }
+    };
+    match select(input, output).await {
+        Either::First(result) | Either::Second(result) => result,
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+    use crate::exec::TokioClock;
+    use embedded_io_async::{ErrorKind, ErrorType};
+    struct PendingRead<'a> {
+        cancelled: &'a Cell<usize>,
+        complete: bool,
+    }
+    impl Drop for PendingRead<'_> {
+        fn drop(&mut self) {
+            if !self.complete {
+                self.cancelled.set(self.cancelled.get() + 1);
+            }
+        }
+    }
+    struct Input<'a> {
+        bytes: &'a [u8],
+        delay: bool,
+        cancelled: &'a Cell<usize>,
+    }
+    impl ErrorType for Input<'_> {
+        type Error = ErrorKind;
+    }
+    impl Read for Input<'_> {
+        async fn read(&mut self, output: &mut [u8]) -> Result<usize, ErrorKind> {
+            let mut pending = PendingRead {
+                cancelled: self.cancelled,
+                complete: false,
+            };
+            if self.delay {
+                tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+            }
+            let len = output.len().min(self.bytes.len()).min(2);
+            output[..len].copy_from_slice(&self.bytes[..len]);
+            self.bytes = &self.bytes[len..];
+            pending.complete = true;
+            Ok(len)
+        }
+    }
+    struct Output<'a>(&'a RefCell<std::vec::Vec<u8>>);
+    impl ErrorType for Output<'_> {
+        type Error = ErrorKind;
+    }
+    impl Write for Output<'_> {
+        async fn write(&mut self, input: &[u8]) -> Result<usize, ErrorKind> {
+            tokio::task::yield_now().await;
+            let len = input.len().min(3);
+            self.0.borrow_mut().extend_from_slice(&input[..len]);
+            Ok(len)
+        }
+        async fn flush(&mut self) -> Result<(), ErrorKind> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn relay_writes_keep_partial_record_reads_alive() {
+        let reactor = Reactor::with_clock(TokioClock::default());
+        let slot = Slot::<8>::new();
+        let activity = Cell::new(0);
+        let cancelled = Cell::new(0);
+        let mut frames = Frames::new(&activity);
+        let mut bytes = [0; 64];
+        let nonce = b"12345678";
+        let first = frame::write(FrameType::Ping, nonce, &mut bytes).unwrap();
+        let end = frame::write(FrameType::Restarting, &[], &mut bytes[first..]).unwrap();
+        let mut input = Input {
+            bytes: &bytes[..first + end],
+            delay: true,
+            cancelled: &cancelled,
+        };
+        let written = RefCell::new(std::vec::Vec::new());
+        let mut output = Output(&written);
+        let encode = |command: DerpCommand, output: &mut [u8]| {
+            let DerpCommand::Send { packet, .. } = command else {
+                return Err("test command");
+            };
+            frame::write(FrameType::SendPacket, packet.as_slice(), output).map_err(|_| "test frame")
+        };
+        let receive = |frame: Frame, _: &[u8]| Ok(frame.kind != FrameType::Restarting);
+        let producer = async {
+            for byte in 0..3 {
+                reactor.sleep(1).await;
+                slot.queue
+                    .borrow_mut()
+                    .push_back(DerpCommand::Send {
+                        region: 7,
+                        peer: tailfeather::keys::NodePublic::from_bytes([7; 32]),
+                        packet: tailfeather::SecretBuffer::try_from_slice(&[byte, 0, 255]).unwrap(),
+                    })
+                    .unwrap();
+                slot.ready.signal(());
+            }
+        };
+        let io = transfer(
+            &reactor,
+            &slot,
+            (&mut frames, &mut input, &mut output),
+            || core::future::ready(()),
+            || {},
+            encode,
+            receive,
+        );
+        tokio::time::timeout(core::time::Duration::from_secs(2), async {
+            let (result, ()) = tokio::join!(io, producer);
+            result.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cancelled.get(),
+            0,
+            "queue wake discarded a partially consumed TLS read"
+        );
+        let written = written.borrow();
+        let mut offset = 0;
+        for byte in 0..3 {
+            let header = Frame::parse(&written[offset..]).unwrap();
+            assert_eq!(header.kind, FrameType::SendPacket);
+            assert_eq!(
+                &written[offset + frame::HEADER_LEN..offset + frame::HEADER_LEN + header.length],
+                &[byte, 0, 255]
+            );
+            offset += frame::HEADER_LEN + header.length;
+        }
+        assert_eq!(
+            Frame::parse(&written[offset..]).unwrap().kind,
+            FrameType::Pong
+        );
+        assert_eq!(&written[offset + frame::HEADER_LEN..], nonce);
+    }
+    #[tokio::test]
+    async fn oversized_extensions_preserve_following_frame_and_liveness() {
+        let reactor = Reactor::with_clock(TokioClock::default());
+        let cancelled = Cell::new(0);
+        for size in [FRAME + 1, frame::MAX_WIRE_FRAME] {
+            let mut bytes = std::vec![0x7e;frame::HEADER_LEN+size+32];
+            bytes[0] = FrameType::Other(0xfe).to_byte();
+            bytes[1..5].copy_from_slice(&(size as u32).to_be_bytes());
+            let end = frame::HEADER_LEN + size;
+            let nonce = [0, 255, 2, 0, 4, 5, 6, 7];
+            let len = frame::write(FrameType::Ping, &nonce, &mut bytes[end..]).unwrap();
+            bytes.truncate(end + len);
+            let activity = Cell::new(u64::MAX);
+            let mut frames = Frames::new(&activity);
+            let mut input = Input {
+                bytes: &bytes,
+                delay: false,
+                cancelled: &cancelled,
+            };
+            let frame = frames.read(&mut input, &reactor).await.unwrap();
+            assert_eq!(frame.kind, FrameType::Ping);
+            assert_eq!(frames.payload(frame), nonce);
+            assert_ne!(activity.get(), u64::MAX);
+            frames.consume(frame);
+            assert_eq!(frames.read(&mut input, &reactor).await, Err("relay EOF"));
+        }
     }
 }

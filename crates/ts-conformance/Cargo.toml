@@ -25,7 +25,7 @@ wirefeather = { path = "../wirefeather", version = "0.0.1" }
 
 [dev-dependencies]
 base64                 = "0.22"
-embedded-tls           = { version = "0.19", default-features = false }
+embedded-tls           = { git = "https://github.com/pawelchcki/embedded-tls", rev = "48fef49e6e7cbdaa44e9003a45078656f8955d3d", default-features = false }
 # Pinned exactly. `fixed_ephemeral_key_for_testing_only` is public in the source
 # but absent from the rendered docs, so it carries no semver promise; byte
 # equality against snow is only meaningful if the version cannot move under us.

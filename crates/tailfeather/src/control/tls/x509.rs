@@ -175,6 +175,16 @@ pub(super) fn verify_chain_with_workspace<Clock: TlsClock>(
     private_root: Option<&[u8]>,
     workspace: &mut rsa::RsaWorkspace,
 ) -> Result<LeafPublicKey, TlsError> {
+    let anchors = [Some(ISRG_ROOT_X2_DER), Some(ISRG_ROOT_YR_DER), private_root];
+    verify_chain_with_roots::<Clock>(cert, hostname, anchors.into_iter().flatten(), workspace)
+}
+
+pub(super) fn verify_chain_with_roots<'a, Clock: TlsClock>(
+    cert: CertificateRef<'_>,
+    hostname: &str,
+    anchors: impl IntoIterator<Item = &'a [u8]>,
+    workspace: &mut rsa::RsaWorkspace,
+) -> Result<LeafPublicKey, TlsError> {
     if cert.entries.is_empty() || cert.entries.len() > MAX_CHAIN_CERTIFICATES {
         return Err(TlsError::InvalidCertificate);
     }
@@ -197,9 +207,8 @@ pub(super) fn verify_chain_with_workspace<Clock: TlsClock>(
     }
     validate_leaf(&leaf, hostname)?;
 
-    let anchors = [Some(ISRG_ROOT_X2_DER), Some(ISRG_ROOT_YR_DER), private_root];
     let mut trusted = false;
-    'anchors: for anchor in anchors.into_iter().flatten() {
+    'anchors: for anchor in anchors {
         let Ok(anchor) = parse_certificate(anchor) else {
             continue;
         };
@@ -1626,14 +1635,18 @@ fn hostname_matches_san(hostname: &str, input: &[u8]) -> bool {
     let Ok(sequence) = single_tlv(input, 0x30) else {
         return false;
     };
-    let ipv4 = core::net::Ipv4Addr::from_str(hostname).ok();
+    let ip = core::net::IpAddr::from_str(hostname).ok();
     let mut offset = 0;
     while offset < sequence.value.len() {
         let Ok(name) = next_tlv(sequence.value, &mut offset) else {
             return false;
         };
-        if let Some(address) = ipv4 {
-            if name.tag == 0x87 && name.value == address.octets() {
+        if let Some(address) = ip {
+            let matches = match address {
+                core::net::IpAddr::V4(address) => name.value == address.octets(),
+                core::net::IpAddr::V6(address) => name.value == address.octets(),
+            };
+            if name.tag == 0x87 && matches {
                 return true;
             }
         } else if name.tag == 0x82 && dns_name_matches(name.value, hostname.as_bytes()) {
@@ -1683,6 +1696,21 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use embedded_tls::{CertificateVerifyRef, SignatureScheme, TlsVerifier as _};
+
+    #[test]
+    fn ip_certificate_identities_match_their_complete_address_family() {
+        let ipv6 = [
+            0x30, 0x12, 0x87, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        let ipv4 = [0x30, 0x06, 0x87, 0x04, 127, 0, 0, 1];
+        assert!(hostname_matches_san("::1", &ipv6));
+        assert!(hostname_matches_san("0:0:0:0:0:0:0:1", &ipv6));
+        assert!(!hostname_matches_san("::2", &ipv6));
+        assert!(!hostname_matches_san("127.0.0.1", &ipv6));
+        assert!(hostname_matches_san("127.0.0.1", &ipv4));
+        assert!(!hostname_matches_san("::ffff:127.0.0.1", &ipv4));
+        assert!(!hostname_matches_san("localhost", &ipv6));
+    }
 
     struct CaptureClock;
     impl TlsClock for CaptureClock {
@@ -1767,6 +1795,70 @@ mod tests {
                 &mut workspace,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_anchors_do_not_fall_back_to_public_roots() {
+        use super::super::TrustVerifier;
+        let certificates = rsa_chain();
+        let transcript = sha2::Sha256::new();
+        let mut workspace = rsa::RsaWorkspace::new();
+        // The default constructor intentionally keeps both public anchors.
+        let mut default =
+            TrustVerifier::<CaptureClock>::new(Some(ISRG_ROOT_X2_DER), &mut workspace);
+        default
+            .set_hostname_verification("controlplane.tailscale.com")
+            .unwrap();
+        assert!(
+            default
+                .verify_certificate(&transcript, chain(&certificates))
+                .is_ok()
+        );
+        for roots in [
+            &[][..],
+            &[ISRG_ROOT_X2_DER][..],
+            &[b"invalid".as_slice()][..],
+        ] {
+            let mut verifier = TrustVerifier::<CaptureClock>::with_roots(roots, &mut workspace);
+            verifier
+                .set_hostname_verification("controlplane.tailscale.com")
+                .unwrap();
+            assert!(
+                verifier
+                    .verify_certificate(&transcript, chain(&certificates))
+                    .is_err()
+            );
+        }
+        for roots in [
+            &[ISRG_ROOT_YR_DER][..],
+            &[ISRG_ROOT_X2_DER, ISRG_ROOT_YR_DER][..],
+        ] {
+            let mut verifier = TrustVerifier::<CaptureClock>::with_roots(roots, &mut workspace);
+            verifier
+                .set_hostname_verification("controlplane.tailscale.com")
+                .unwrap();
+            assert!(
+                verifier
+                    .verify_certificate(&transcript, chain(&certificates))
+                    .is_ok()
+            );
+            verifier.set_hostname_verification("wrong.example").unwrap();
+            assert!(
+                verifier
+                    .verify_certificate(&transcript, chain(&certificates))
+                    .is_err()
+            );
+        }
+        let roots = &[ISRG_ROOT_YR_DER];
+        let mut verifier = TrustVerifier::<AfterClock>::with_roots(roots, &mut workspace);
+        verifier
+            .set_hostname_verification("controlplane.tailscale.com")
+            .unwrap();
+        assert!(
+            verifier
+                .verify_certificate(&transcript, chain(&certificates))
+                .is_err()
         );
     }
 
