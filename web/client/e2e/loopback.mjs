@@ -23,6 +23,8 @@ export async function loopbackTest(context, { nativeExtension = false } = {}) {
   const original = `http://127.0.0.1:${port}/auth?state=fixture-state`;
   const callback = `http://127.0.0.1:${port}/`;
   let finished = false;
+  let duplexReceived;
+  const duplexBody = new Promise((resolve) => { duplexReceived = resolve; });
   const provider = createServer((request, response) => {
     const url = new URL(request.url, "http://provider.test");
     if (url.pathname === "/favicon.ico") { response.writeHead(204).end(); return; }
@@ -44,6 +46,13 @@ export async function loopbackTest(context, { nativeExtension = false } = {}) {
       request.pipe(response);
       return;
     }
+    if (url.pathname === "/duplex") {
+      response.writeHead(200, { "Content-Type": "application/octet-stream" });
+      response.flushHeaders();
+      request.once("data", () => duplexReceived(true));
+      request.on("end", () => response.end());
+      return;
+    }
     if (url.pathname === "/auth") {
       assert.equal(url.searchParams.get("state"), "fixture-state");
       response.writeHead(302, { Location: `http://127.0.0.1:${providerPort}/authorize?redirect_uri=${encodeURIComponent(callback)}&state=fixture-state` }).end();
@@ -57,7 +66,20 @@ export async function loopbackTest(context, { nativeExtension = false } = {}) {
   const backingPort = await listen(remote);
   const { server, url } = await serve();
   const forwards = [];
-  const ssh = await startLocalSsh(server, { forwardTarget: { port, backingPort }, onForward: (info) => forwards.push(info) });
+  let delayNext = false;
+  let delayedInfo;
+  let lateClosed;
+  const lateClose = new Promise((resolve) => { lateClosed = resolve; });
+  const ssh = await startLocalSsh(server, {
+    forwardTarget: { port, backingPort }, onForward: (info) => forwards.push(info),
+    forwardDelay: (info) => {
+      if (!delayNext) return 0;
+      delayNext = false;
+      delayedInfo = info;
+      return 16_000;
+    },
+    onForwardClose: (info) => { if (info === delayedInfo) lateClosed(true); },
+  });
   const hosts = new Map();
   let page;
   try {
@@ -130,12 +152,51 @@ export async function loopbackTest(context, { nativeExtension = false } = {}) {
     await popup.click("button");
     await popup.waitForURL(`${callback}?code=fixture-code&state=fixture-state`);
     check(await popup.textContent("body") === "Authorization complete" && finished, "OAuth callback did not reach original remote listener");
+    // A slow browser reader must not stop request bytes traveling in the
+    // opposite direction. Emulate native TCP backpressure deterministically.
+    await page.evaluate(async ({ port }) => {
+      let seen;
+      const reading = new Promise((resolve) => { seen = resolve; });
+      const blocked = new Promise((resolve) => { window.__releaseDuplex = resolve; });
+      window.__duplexPipe = await window.tailfeather.session.open_forward("127.0.0.1", port,
+        () => { seen(); return blocked; }, () => {});
+      await window.__duplexPipe.send(new TextEncoder().encode(
+        "POST /duplex HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n"));
+      await reading;
+      window.__duplexSend = window.__duplexPipe.send(new Uint8Array([1])).then(() => true, () => false);
+    }, { port });
+    let timer;
+    let independent;
+    try {
+      independent = await Promise.race([
+        duplexBody,
+        new Promise((resolve) => { timer = setTimeout(() => resolve(false), 2000); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      await page.evaluate(() => window.__releaseDuplex());
+      await page.evaluate(async () => { await window.__duplexSend; window.__duplexPipe.close(); });
+    }
+    check(independent, "a backpressured browser reader blocked SSH request writes");
     check(await popup.evaluate(async () => {
       const body = Uint8Array.from({ length: 256 * 1024 }, (_unused, index) => index % 251);
       const response = await fetch("/roundtrip", { method: "POST", body });
       const returned = new Uint8Array(await response.arrayBuffer());
       return returned.length === body.length && returned.every((value, index) => value === body[index]);
     }), "forwarded binary request/response lost bytes across frame boundaries");
+    // A server may confirm an open only after the client deadline. The late
+    // channel must be closed rather than leaked inside the live SSH session.
+    delayNext = true;
+    check(await page.evaluate(async (port) => {
+      try { await window.tailfeather.session.open_forward("127.0.0.1", port, () => {}, () => {}); return false; }
+      catch { return true; }
+    }, port), "delayed channel open did not time out");
+    let lateTimer;
+    try {
+      check(await Promise.race([lateClose, new Promise((resolve) => {
+        lateTimer = setTimeout(() => resolve(false), 4000);
+      })]), "SSH channel confirmed after timeout was left open");
+    } finally { clearTimeout(lateTimer); }
     check(forwards.length >= 1 && forwards.every((info) => info.destIP === "127.0.0.1" && info.destPort === port), "forwarding changed the remote destination");
     const secretState = await page.evaluate(() => ({ stored: JSON.stringify({ ...localStorage }), logs: window.tailfeather.logs.join("\n") }));
     check(!/fixture-state|fixture-code/.test(secretState.stored + secretState.logs), "OAuth values escaped into logs/storage");

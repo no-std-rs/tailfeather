@@ -76,6 +76,39 @@ test("localhost reserves both loopback families and explicit IPv6 stays loopback
   } finally { host.close(); }
 });
 
+test("partial localhost bind failure releases its IPv4 listener and listener budget is reusable", async () => {
+  const blocker = createServer();
+  blocker.listen({ port: 0, host: "::1", ipv6Only: true });
+  await once(blocker, "listening");
+  const port = blocker.address().port;
+  const replies = [];
+  const host = new LoopbackHost((reply) => replies.push(reply));
+  try {
+    await host.receive({ type: "listen", id: "partial", request: "1", host: "localhost", port });
+    assert.equal(replies.at(-1).ok, false);
+    assert.equal(host.listeners.size, 0);
+    const reused = createServer();
+    reused.listen(port, "127.0.0.1");
+    await once(reused, "listening");
+    await new Promise((resolve) => reused.close(resolve));
+    for (let index = 0; index < 8; index++) {
+      await host.receive({ type: "listen", id: `listener-${index}`, request: "2", host: "127.0.0.1", port: await freePort() });
+      assert.equal(replies.at(-1).ok, true);
+    }
+    const ninth = { type: "listen", id: "ninth", request: "3", host: "127.0.0.1", port: await freePort() };
+    await host.receive(ninth);
+    assert.equal(replies.at(-1).ok, false);
+    assert.equal(host.listeners.size, 8);
+    host.stop("listener-0");
+    await host.receive(ninth);
+    assert.equal(replies.at(-1).ok, true);
+    assert.equal(host.listeners.size, 8);
+  } finally {
+    host.close();
+    await new Promise((resolve) => blocker.close(resolve));
+  }
+});
+
 class Page {
   location = { origin: "https://no-std-rs.github.io" };
   listeners = new Set();
@@ -86,6 +119,56 @@ class Page {
     for (const fn of this.listeners) fn({ source: this, origin: this.location.origin, data: message, ...override });
   }
 }
+
+test("disconnect rejects pending hello/listen/write requests and stale sessions cannot answer a successor", async () => {
+  for (const phase of ["hello", "listen", "write"]) {
+    const page = new Page();
+    const controller = new LoopbackForwarding(() => ({}), { window: page });
+    page.outbound = (message) => {
+      if (phase !== "hello" && message.type === "hello") queueMicrotask(() => page.emit({
+        source: "tailfeather-loopback-extension", session: controller.session, type: "hello",
+      }));
+    };
+    const pending = phase === "write" ? controller.request({ type: "write", socket: "1", data: "" })
+      : controller.listen("http://127.0.0.1:53682/auth");
+    const rejected = assert.rejects(pending, /disconnected/);
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.dispose();
+    await rejected;
+    assert.equal(controller.pending.size, 0);
+    assert.equal(controller.listeners.size, 0);
+    assert.equal(page.listeners.size, 0);
+    const next = new LoopbackForwarding(() => ({}), { window: page });
+    try {
+      const current = next.request({ type: "write", socket: "1", data: "" });
+      page.emit({ source: "tailfeather-loopback-extension", session: controller.session, type: "reply", request: "1", ok: true });
+      assert.equal(next.pending.size, 1);
+      page.emit({ source: "tailfeather-loopback-extension", session: next.session, type: "reply", request: "1", ok: true });
+      await current;
+      assert.equal(next.pending.size, 0);
+    } finally { next.dispose(); }
+  }
+});
+
+test("failure accepting a native connection closes its already opened SSH pipe", async () => {
+  const page = new Page();
+  let closed = 0;
+  const ssh = { async open_forward() { return { close() { closed++; } }; } };
+  const controller = new LoopbackForwarding(() => ssh, { window: page });
+  page.outbound = (message) => {
+    if (message.type === "hello") queueMicrotask(() => page.emit({
+      source: "tailfeather-loopback-extension", session: controller.session, type: "hello",
+    }));
+  };
+  controller.request = async ({ type }) => { if (type === "accept") throw Error("native accept timed out"); };
+  try {
+    await controller.listen("http://127.0.0.1:53682/auth");
+    const entry = [...controller.listeners.values()][0];
+    await controller.receive({ type: "connection", id: entry.id, socket: "1" });
+    assert.equal(controller.pipes.size, 0);
+    assert.equal(closed, 1);
+  } finally { controller.dispose(); }
+});
 
 test("page controller isolates sessions, backpressures bytes, and drops native/SSH resources", async () => {
   const page = new Page();

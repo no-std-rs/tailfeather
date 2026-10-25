@@ -120,6 +120,7 @@ export class LoopbackForwarding {
         record.pipe = pipe;
         await this.request({ type: "accept", socket });
       } catch {
+        record.pipe?.close();
         this.pipes.delete(socket);
         this.onError("SSH forwarding was refused or disconnected. Check the server's forwarding policy.");
         if (!this.disposed) this.post({ type: "close", socket });

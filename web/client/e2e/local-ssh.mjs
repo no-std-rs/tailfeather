@@ -52,7 +52,9 @@ function shell(stream) {
   });
 }
 
-export async function startLocalSsh(httpServer, { forwardTarget = null, onForward = () => {} } = {}) {
+export async function startLocalSsh(httpServer, {
+  forwardTarget = null, onForward = () => {}, forwardDelay = () => 0, onForwardClose = () => {},
+} = {}) {
   const hostKey = utils.generateKeyPairSync("ed25519");
   const ssh = new Server(
     { hostKeys: [hostKey.private], banner: "e2e-sshd banner: authorized testing only\nApprove: https://login.tailscale.com/a/banner-example\n" },
@@ -71,14 +73,19 @@ export async function startLocalSsh(httpServer, { forwardTarget = null, onForwar
         client.on("tcpip", (accept, reject, info) => {
           if (!forwardTarget || info.destPort !== forwardTarget.port || !["localhost", "127.0.0.1", "::1"].includes(info.destIP)) return reject();
           onForward(info);
+          const delay = forwardDelay(info);
           // Emulate the remote namespace on a separate local backing port.
           const upstream = connect(forwardTarget.backingPort, "127.0.0.1");
           upstream.on("error", () => { try { reject(); } catch {} });
           upstream.on("connect", () => {
-            const stream = accept();
-            upstream.pipe(stream).pipe(upstream);
-            stream.on("error", () => upstream.destroy());
-            stream.on("close", () => upstream.destroy());
+            const open = () => {
+              const stream = accept();
+              upstream.pipe(stream).pipe(upstream);
+              stream.on("error", () => upstream.destroy());
+              stream.on("close", () => { upstream.destroy(); onForwardClose(info); });
+            };
+            if (delay) setTimeout(open, delay);
+            else open();
           });
         });
         client.on("session", (accept) => {

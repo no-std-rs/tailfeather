@@ -125,46 +125,84 @@ pub(crate) async fn run<H: russh::client::Handler>(
         registration,
     } = request;
     let _notify = NotifyClosed(closed);
-    let operation = async {
-        let channel = match crate::js::timeout(
-            15_000,
-            session.channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0),
-        )
-        .await
-        {
-            Ok(Ok(channel)) => channel,
-            _ => {
-                let _ = ready.send(Err("SSH forwarding refused or timed out".into()));
-                return;
+    let opening = session
+        .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0)
+        .fuse();
+    let cancelled = Abortable::new(futures::future::pending::<()>(), registration).fuse();
+    futures::pin_mut!(opening, cancelled);
+    let opened = {
+        let deadline = crate::js::sleep(15_000).fuse();
+        futures::pin_mut!(deadline);
+        futures::select! {
+            result = opening => Some(result),
+            _ = deadline => None,
+            _ = cancelled => None,
+        }
+    };
+    let channel = match opened {
+        Some(Ok(channel)) => channel,
+        Some(Err(_)) => {
+            let _ = ready.send(Err("SSH forwarding refused".into()));
+            return;
+        }
+        None => {
+            let _ = ready.send(Err("SSH forwarding cancelled or timed out".into()));
+            // russh keeps an open request after its waiter is dropped. Drain a
+            // late confirmation and close its channel, retaining this task in
+            // the session's bounded set until then (or session disconnect).
+            if let Ok(channel) = opening.await {
+                drop(channel.into_stream());
             }
-        };
+            return;
+        }
+    };
+    let operation = async {
         let _ = ready.send(Ok(()));
         let (mut reader, mut writer) = tokio::io::split(channel.into_stream());
-        let mut buffer = [0u8; 32768];
-        loop {
-            futures::select! {
-                data = reader.read(&mut buffer).fuse() => match data {
+        // Each direction must progress while the other waits on SSH window
+        // capacity or the native TCP consumer; otherwise uploads and early
+        // responses can deadlock each other under backpressure.
+        let inbound = async {
+            let mut buffer = [0u8; 32768];
+            loop {
+                let len = match reader.read(&mut buffer).await {
                     Ok(0) | Err(_) => break,
-                    Ok(len) => {
-                        let array = js_sys::Uint8Array::from(&buffer[..len]);
-                        let Ok(result) = write.call1(&JsValue::NULL, &array) else { break };
-                        if wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&result)).await.is_err() {
-                            break;
-                        }
-                    }
-                },
-                command = input.next().fuse() => match command {
-                    Some(Command::Data(data, ready)) => {
+                    Ok(len) => len,
+                };
+                let array = js_sys::Uint8Array::from(&buffer[..len]);
+                let Ok(result) = write.call1(&JsValue::NULL, &array) else {
+                    break;
+                };
+                if wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&result))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        };
+        let outbound = async {
+            while let Some(command) = input.next().await {
+                match command {
+                    Command::Data(data, ready) => {
                         let result = writer.write_all(&data).await.map_err(|_| ());
                         let failed = result.is_err();
                         let _ = ready.send(result);
-                        if failed { break; }
+                        if failed {
+                            break;
+                        }
                     }
-                    Some(Command::Eof) => { if writer.shutdown().await.is_err() { break; } }
-                    None => break,
+                    Command::Eof => {
+                        if writer.shutdown().await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
-        }
+        };
+        futures::pin_mut!(inbound, outbound);
+        futures::select! { _ = inbound.fuse() => {}, _ = outbound.fuse() => {} }
     };
-    let _ = Abortable::new(operation, registration).await;
+    futures::pin_mut!(operation);
+    futures::select! { _ = operation.fuse() => {}, _ = cancelled => {} }
 }
