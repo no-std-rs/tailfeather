@@ -309,13 +309,19 @@ async fn control_loop(
         let session = control_session(reactor, node, actions, authority, status, config);
         if let Err(stage) = session.await {
             let rejected = matches!(stage, "registration rejected" | "netmap rejected");
-            if rejected && !node.resident {
+            if rejected && (!node.resident || stage == "registration rejected") {
                 return Err(stage);
             }
             if rejected {
                 // A retained owner waits for a fresh accepted map. Never reset
                 // persisted enrollment or substitute a new node on rejection.
+                // Reject the previous data-plane authority too: retaining an
+                // enrollment does not retain permission from a rejected map.
+                node.borrow_mut()
+                    .adopt_reconnected_map(&mut tailfeather::netmap::Netmap::new())
+                    .map_err(node_error)?;
                 status.send_replace(crate::Status::default());
+                actions.ready.notify_one();
             }
             if reactor.clock_millis().saturating_sub(started) >= 60_000 {
                 retry_delay = 1000;
@@ -735,6 +741,10 @@ async fn packets(
         if let Some(address) = status.borrow().address {
             net.borrow_mut()
                 .set_address(address, reactor.clock_millis(), seed);
+        } else {
+            net.borrow_mut().clear_address();
+            outgoing.clear();
+            punches.clear();
         }
         let queued = actions.borrow_mut().len();
         for _ in 0..queued {
@@ -747,7 +757,9 @@ async fn packets(
                     packet,
                     ..
                 } => {
-                    let _ = udp.send_to(packet.as_slice(), &to).await;
+                    if status.borrow().address.is_some() {
+                        let _ = udp.send_to(packet.as_slice(), &to).await;
+                    }
                 }
                 NodeAction::DeliveredIpv4 { peer, packet } => {
                     let bytes = packet.as_slice();
@@ -770,6 +782,11 @@ async fn packets(
                     }
                 }
                 NodeAction::Derp(command) => {
+                    if status.borrow().address.is_none()
+                        && matches!(command, tailfeather::DerpCommand::Send { .. })
+                    {
+                        continue;
+                    }
                     if let Some(command) = crate::relay::dispatch(
                         slots,
                         command,

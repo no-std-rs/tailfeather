@@ -33,12 +33,32 @@ fn main() {
         let client_ip=tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap();
         println!("PASS: real Headscale registration/map with private CA; server={server_ip}, client={client_ip}");
         if resident {
+            use tokio::io::{AsyncReadExt,AsyncWriteExt};
+            let mut old_listener=server.listen(2223).await.unwrap();
+            let mut old_from=client.connect(server_ip,2223).await.unwrap();
+            let mut old_to=tokio::time::timeout(Duration::from_secs(10),old_listener.accept()).await.unwrap().unwrap();
+            old_from.write_all(b"before-rejection").await.unwrap();
+            let mut prior=[0;16];old_to.read_exact(&mut prior).await.unwrap();
+            assert_eq!(&prior,b"before-rejection");
             println!("READY: reject map for resident retry");
             use std::io::Write;std::io::stdout().flush().unwrap();
             tokio::time::timeout(Duration::from_secs(60),async {
                 while !root.join("rejected").exists(){tokio::time::sleep(Duration::from_millis(20)).await;}
                 while server.status().address.is_some(){tokio::time::sleep(Duration::from_millis(20)).await;}
             }).await.unwrap();
+            let mut byte=[0];
+            assert_eq!(tokio::time::timeout(Duration::from_secs(3),old_from.read(&mut byte)).await.unwrap().unwrap(),0);
+            assert_eq!(tokio::time::timeout(Duration::from_secs(3),old_to.read(&mut byte)).await.unwrap().unwrap(),0);
+            drop(old_listener);drop(old_from);drop(old_to);
+            // The deliberately revoked stream must report its failed drain;
+            // consume that outcome before testing a new successful transfer.
+            tokio::time::timeout(Duration::from_secs(10),async {
+                loop {
+                    if client.drain().await.is_err(){break;}
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            println!("PASS: rejected resident map closes established TCP streams before recovery");
             println!("READY: restore resident map");
             std::io::stdout().flush().unwrap();
             tokio::time::timeout(Duration::from_secs(60),async {
@@ -97,5 +117,9 @@ fn main() {
         let error=tokio::time::timeout(Duration::from_secs(10),rejected.ready()).await.unwrap().unwrap_err();
         assert_eq!(error.to_string(),"registration rejected");
         println!("PASS: rejected preauth key returns an error instead of hanging ready()");
+        let rejected=Client::start_resident(config(&root,"hosted-resident-rejected","fixture-invalid-key".into())).unwrap();
+        let error=tokio::time::timeout(Duration::from_secs(10),rejected.ready()).await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(),"registration rejected");
+        println!("PASS: resident initial registration rejection is terminal");
     });
 }

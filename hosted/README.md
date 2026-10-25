@@ -136,9 +136,11 @@ hosted applications enable its CPU-dispatched fused AEAD provider. See
 matrix, CPU capability diagnostics, and local packet-engine benchmarks.
 
 Resident supervisors can use `Client::start_resident` and retain that client
-across readiness timeouts. Rejected control maps then retry with the same
+across readiness timeouts. Rejected control maps withdraw data-plane access and close existing TCP streams,
+then retry with the same
 identity and persisted enrollment, with delays capped at one minute. A fresh
 accepted map restores readiness; rejection never resets state or enrolls a
 replacement node. Dropping the final client still logs out an ephemeral node.
-The ordinary `Client::start` keeps reporting registration/map rejection as a
+Initial registration rejection is terminal in either mode.
+The ordinary `Client::start` also reports map rejection as a
 terminal error. Corrupt state and authority mismatches remain errors in both.
