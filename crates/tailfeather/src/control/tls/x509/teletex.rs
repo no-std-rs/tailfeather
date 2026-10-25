@@ -86,7 +86,7 @@ impl Iterator for TeletexChars<'_> {
 fn accent(byte: u8) -> Option<(char, char, &'static [u8])> {
     Some(match byte {
         0xc1 => ('\u{300}', '`', b"AEIOUaeiou"),
-        0xc2 => ('\u{301}', '´', b"ACEILNORSUYZaceilnorsuyz"),
+        0xc2 => ('\u{301}', '´', b"ACEILNORSUYZacegilnorsuyz"),
         0xc3 => ('\u{302}', '^', b"ACEGHIJOSUWYaceghijosuwy"),
         0xc4 => ('\u{303}', '~', b"AINOUainou"),
         0xc5 => ('\u{304}', '¯', b"AEIOUaeiou"),
@@ -95,7 +95,7 @@ fn accent(byte: u8) -> Option<(char, char, &'static [u8])> {
         // 0xc9 is the deprecated 1980 umlaut code retained by T.61 (1988).
         0xc8 | 0xc9 => ('\u{308}', '¨', b"AEIOUYaeiouy"),
         0xca => ('\u{30a}', '˚', b"AUau"),
-        0xcb => ('\u{327}', '¸', b"CGKLNRSTcgklnrst"),
+        0xcb => ('\u{327}', '¸', b"CGKLNRSTcklnrst"),
         0xcd => ('\u{30b}', '˝', b"OUou"),
         0xce => ('\u{328}', '˛', b"AEIUaeiu"),
         0xcf => ('\u{30c}', 'ˇ', b"CDELNRSTZcdelnrstz"),
@@ -108,7 +108,7 @@ fn graphic(byte: u8) -> Option<char> {
         // T.61 Figure 2 note 4: receive the legacy primary aliases for
         // NUMBER SIGN and CURRENCY SIGN, too. 0x24 is not DOLLAR SIGN.
         0x24 | 0xa8 => '¤',
-        0x20..=0x5b | 0x5d | 0x5f | 0x61..=0x7a => char::from(byte),
+        0x20..=0x5b | 0x5d | 0x5f | 0x61..=0x7a | 0x7c => char::from(byte),
         0xa1 => '¡',
         0xa2 => '¢',
         0xa3 => '£',
@@ -176,8 +176,10 @@ mod tests {
     fn graphic_repertoire_and_prefix_diacritics_decode_without_allocation() {
         let cases: &[(&[u8], &str)] = &[
             (b"Example CA", "Example CA"),
+            (b"Root|CA", "Root|CA"),
             (&[0xc1, b'A'], "A\u{300}"),
             (&[0xc2, b'e'], "e\u{301}"),
+            (&[0xc2, b'g'], "g\u{301}"),
             (&[0xc3, b'C'], "C\u{302}"),
             (&[0xc4, b'n'], "n\u{303}"),
             (&[0xc5, b'E'], "E\u{304}"),
@@ -192,6 +194,7 @@ mod tests {
             (&[0xc9, b'A'], "A\u{308}"),
             (&[0xca, b'a'], "a\u{30a}"),
             (&[0xcb, b'T'], "T\u{327}"),
+            (&[0xcb, b'G'], "G\u{327}"),
             (&[0xcd, b'O'], "O\u{30b}"),
             (&[0xce, b'I'], "I\u{328}"),
             (&[0xcf, b'L'], "L\u{30c}"),
@@ -213,6 +216,8 @@ mod tests {
         let cases: &[&[u8]] = &[
             &[0xc2],
             &[0xc2, b'b'],
+            &[0xc2, b'G'],
+            &[0xcb, b'g'],
             &[0xc2, b'e', 0xc2],
             &[0xc0, b'A'],
             &[0xc7, b'i'],

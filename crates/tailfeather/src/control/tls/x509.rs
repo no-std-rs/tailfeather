@@ -1803,6 +1803,53 @@ mod tests {
     }
 
     #[test]
+    fn teletex_vertical_line_matches_each_unicode_directory_encoding() {
+        let teletex = string_value(0x14, b"Root|CA");
+        for (tag, bytes) in [
+            (0x0c, b"root|ca".to_vec()),
+            (
+                0x1e,
+                "root|ca"
+                    .chars()
+                    .flat_map(|c| (c as u16).to_be_bytes())
+                    .collect(),
+            ),
+            (
+                0x1c,
+                "root|ca"
+                    .chars()
+                    .flat_map(|c| (c as u32).to_be_bytes())
+                    .collect(),
+            ),
+        ] {
+            assert!(directory_value_equal(teletex, string_value(tag, &bytes)));
+        }
+        assert!(directory_value_equal(teletex, teletex));
+        for reserved in [b'\\', b'^', b'`', b'{', b'}', b'~', 0x7f] {
+            let bytes = [b'|', reserved];
+            let invalid = string_value(0x14, &bytes);
+            assert!(!directory_value_equal(invalid, invalid));
+        }
+    }
+
+    #[test]
+    fn teletex_accent_pairs_follow_the_defined_case_sensitive_repertoire() {
+        // T.61 Annex B defines lowercase g acute and uppercase G cedilla,
+        // but their opposite-case encodings are not members of its repertoire.
+        // Unicode directory-string comparison still performs full case folding.
+        for (encoded, unicode) in [(&[0xc2, b'g'][..], "Ǵ"), (&[0xcb, b'G'][..], "ģ")] {
+            assert!(directory_value_equal(
+                string_value(0x14, encoded),
+                string_value(0x0c, unicode.as_bytes())
+            ));
+        }
+        for encoded in [&[0xc2, b'G'][..], &[0xcb, b'g'][..]] {
+            let invalid = string_value(0x14, encoded);
+            assert!(!directory_value_equal(invalid, invalid));
+        }
+    }
+
+    #[test]
     fn hosted_rsa_path_rejects_name_time_order_overflow_and_tbs_mutation() {
         let certificates = rsa_chain();
         assert!(
