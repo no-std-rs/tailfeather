@@ -21,6 +21,8 @@ pub const PATH: &str = "/machine/register";
 /// because a node that accidentally sent a *past* expiry would register and then
 /// immediately be logged out.
 pub const NO_EXPIRY: &str = "0001-01-01T00:00:00Z";
+/// Upstream Tailscale logs out by requesting an expiry far in the past.
+pub const LOGOUT_EXPIRY: &str = "1970-01-01T00:02:03Z";
 
 /// What a node sends to register.
 pub struct RegisterRequest<'a> {
@@ -58,6 +60,29 @@ impl RegisterRequest<'_> {
         followup: &str,
         out: &'o mut [u8],
     ) -> Result<&'o [u8], JsonError> {
+        self.write_with_expiry(followup, NO_EXPIRY, out)
+    }
+
+    /// Log out the current machine-authenticated identity without reusing its
+    /// enrollment credential. An ephemeral coordinator node is removed now.
+    pub fn write_logout<'o>(&self, out: &'o mut [u8]) -> Result<&'o [u8], JsonError> {
+        let request = Self {
+            version: self.version,
+            node_key: self.node_key,
+            old_node_key: None,
+            auth_key: "",
+            hostinfo: self.hostinfo,
+            ephemeral: self.ephemeral,
+        };
+        request.write_with_expiry("", LOGOUT_EXPIRY, out)
+    }
+
+    fn write_with_expiry<'o>(
+        &self,
+        followup: &str,
+        expiry: &str,
+        out: &'o mut [u8],
+    ) -> Result<&'o [u8], JsonError> {
         let mut key_text = [0u8; 128];
         let node_key = self
             .node_key
@@ -80,7 +105,7 @@ impl RegisterRequest<'_> {
             .field_u64("Version", self.version as u64)
             .field_str("NodeKey", node_key)
             .field_str("OldNodeKey", old_node_key)
-            .field_str("Expiry", NO_EXPIRY)
+            .field_str("Expiry", expiry)
             .field_bool("Ephemeral", self.ephemeral);
         // Headscale distinguishes an absent Auth object from an empty one.
         // Durable reconnects use the existing node identity; Auth:{AuthKey:""}
@@ -201,6 +226,26 @@ mod tests {
         assert!(!text.contains("AuthKey"));
         assert!(text.contains("NodeKey"));
     }
+    #[test]
+    fn logout_expires_the_owned_identity_without_an_enrollment_credential() {
+        let key = node_key();
+        let request = RegisterRequest {
+            version: 131,
+            node_key: &key,
+            old_node_key: Some(&key),
+            auth_key: "must-not-be-sent-on-logout",
+            hostinfo: Hostinfo::default(),
+            ephemeral: true,
+        };
+        let mut out = [0; 1024];
+        let text = core::str::from_utf8(request.write_logout(&mut out).unwrap()).unwrap();
+        assert!(text.contains(r#""Expiry":"1970-01-01T00:02:03Z""#));
+        assert!(text.contains(r#""Ephemeral":true"#));
+        assert!(!text.contains("Auth"));
+        assert!(!text.contains("must-not-be-sent"));
+        assert!(text.contains("NodeKey"));
+    }
+
     #[test]
     fn a_first_registration_carries_the_node_key_and_the_preauth_key() {
         let key = node_key();

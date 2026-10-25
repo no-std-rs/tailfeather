@@ -375,8 +375,7 @@ dependencies = [
 [[package]]
 name = "embedded-tls"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ff3c16c9cedcab3ef5c79fd46349152adbb98f997b937cb1ead7655f5c07e43"
+source = "git+https://github.com/pawelchcki/embedded-tls?rev=48fef49e6e7cbdaa44e9003a45078656f8955d3d#48fef49e6e7cbdaa44e9003a45078656f8955d3d"
 dependencies = [
  "aes-gcm",
  "digest",
@@ -546,6 +545,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1023,6 +1032,7 @@ dependencies = [
  "embedded-io-async",
  "getrandom 0.3.4",
  "heapless",
+ "if-addrs",
  "rustix",
  "serde_json",
  "smoltcp",

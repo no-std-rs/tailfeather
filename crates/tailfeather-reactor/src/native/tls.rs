@@ -56,3 +56,37 @@ impl embedded_io_async::Write for Stream {
         tokio::io::AsyncWriteExt::flush(&mut self.0).await
     }
 }
+
+pub struct Reader<'a>(
+    tokio::io::ReadHalf<&'a mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+);
+pub struct Writer<'a>(
+    tokio::io::WriteHalf<&'a mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+);
+impl crate::runtime::SplitStream for Stream {
+    type Reader<'a> = Reader<'a>;
+    type Writer<'a> = Writer<'a>;
+    fn split(&mut self) -> (Reader<'_>, Writer<'_>) {
+        let (read, write) = tokio::io::split(&mut self.0);
+        (Reader(read), Writer(write))
+    }
+}
+impl embedded_io_async::ErrorType for Reader<'_> {
+    type Error = io::Error;
+}
+impl embedded_io_async::ErrorType for Writer<'_> {
+    type Error = io::Error;
+}
+impl embedded_io_async::Read for Reader<'_> {
+    async fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        tokio::io::AsyncReadExt::read(&mut self.0, output).await
+    }
+}
+impl embedded_io_async::Write for Writer<'_> {
+    async fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        tokio::io::AsyncWriteExt::write(&mut self.0, input).await
+    }
+    async fn flush(&mut self) -> io::Result<()> {
+        tokio::io::AsyncWriteExt::flush(&mut self.0).await
+    }
+}

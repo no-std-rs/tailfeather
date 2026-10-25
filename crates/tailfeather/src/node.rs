@@ -1276,6 +1276,27 @@ impl<const PEERS: usize> Node<PEERS> {
         now_ms: u64,
         rng: &mut impl crate::disco::packet::Rng,
     ) -> Result<Option<NodeAction>, NodeError> {
+        self.poll_disco_matching(None, now_ms, rng)
+    }
+
+    /// Probe an active peer without waiting for unrelated unreachable peers.
+    /// Adapters with on-demand application sockets should poll those peers
+    /// rather than serially probing the entire control-plane peer list.
+    pub fn poll_disco_for(
+        &mut self,
+        peer: &NodePublic,
+        now_ms: u64,
+        rng: &mut impl crate::disco::packet::Rng,
+    ) -> Result<Option<NodeAction>, NodeError> {
+        self.poll_disco_matching(Some(peer), now_ms, rng)
+    }
+
+    fn poll_disco_matching(
+        &mut self,
+        peer: Option<&NodePublic>,
+        now_ms: u64,
+        rng: &mut impl crate::disco::packet::Rng,
+    ) -> Result<Option<NodeAction>, NodeError> {
         if !self.direct_paths {
             return Ok(None);
         }
@@ -1291,7 +1312,8 @@ impl<const PEERS: usize> Node<PEERS> {
             }
         }
         let Some(index) = self.paths.iter().position(|path| {
-            (!path.direct_healthy || path.direct_probe_pending)
+            peer.is_none_or(|peer| path.key == *peer)
+                && (!path.direct_healthy || path.direct_probe_pending)
                 && !path.advertised.is_empty()
                 && path.disco.is_some()
                 && usize::from(path.disco_attempts) < path.advertised.len().saturating_mul(3)
@@ -2311,6 +2333,49 @@ mod tests {
                 .unwrap(),
             Some(NodeAction::Derp(DerpCommand::Send { region: 9, .. }))
         ));
+    }
+
+    #[test]
+    fn active_peer_discovery_is_not_blocked_by_an_unreachable_earlier_peer() {
+        let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+        let generation = match node.poll(0).unwrap().unwrap() {
+            NodeAction::PersistState(state) => state.generation(),
+            _ => unreachable!(),
+        };
+        node.persistence_result(generation, true).unwrap();
+        let mut lease = Netmap::<2>::new();
+        let mut keys = heapless::Vec::<NodePublic, 2>::new();
+        for id in 1..=2u8 {
+            let key = NodePrivate::from_bytes([id; 32]).public();
+            keys.push(key).unwrap();
+            let mut peer = Peer::new(u64::from(id), key);
+            peer.disco_key = Some(DiscoPrivate::from_bytes([id + 10; 32]).public());
+            peer.endpoints
+                .push(SocketAddrV4::new(
+                    core::net::Ipv4Addr::new(192, 0, 2, id),
+                    41641,
+                ))
+                .unwrap();
+            lease.peers.upsert(peer).unwrap();
+        }
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        for now in [0, 1000, 2000] {
+            assert!(
+                matches!(node.poll_disco_for(&keys[1], now, &mut Counter(9)).unwrap(), Some(NodeAction::DirectTransmit { peer, .. }) if peer == keys[1])
+            );
+        }
+        assert_eq!(node.paths[0].disco_attempts, 0);
+        assert_eq!(node.paths[1].disco_attempts, 3);
+        node.set_direct_paths(false);
+        assert!(
+            node.poll_disco_for(&keys[1], 3000, &mut Counter(10))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

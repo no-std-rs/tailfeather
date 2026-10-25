@@ -14,11 +14,11 @@ pub const MAX_FILTER_RULES: usize = 32;
 #[cfg(not(feature = "hosted-policy"))]
 pub const MAX_FILTER_SOURCES: usize = 8;
 #[cfg(feature = "hosted-policy")]
-pub const MAX_FILTER_SOURCES: usize = 256;
+pub const MAX_FILTER_SOURCES: usize = 512;
 #[cfg(not(feature = "hosted-policy"))]
 pub const MAX_FILTER_DESTINATIONS: usize = 8;
 #[cfg(feature = "hosted-policy")]
-pub const MAX_FILTER_DESTINATIONS: usize = 256;
+pub const MAX_FILTER_DESTINATIONS: usize = 512;
 pub const MAX_FILTER_PROTOCOLS: usize = 8;
 pub const MAX_FILTER_SET_NAME: usize = 32;
 
