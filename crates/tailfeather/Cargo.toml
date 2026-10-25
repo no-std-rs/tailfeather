@@ -33,7 +33,7 @@ crypto-bigint = { version = "0.5.5", default-features = false }
 critical-section = "1.2.0"
 crypto_box = { version = "0.9", default-features = false, features = ["salsa20"] }
 embedded-io-async = "0.7"
-embedded-tls = { version = "0.19", default-features = false }
+embedded-tls = { git = "https://github.com/pawelchcki/embedded-tls", rev = "f1fdbf1e49a3c109063384d5ee669e190f08ff58", default-features = false }
 heapless = "0.9"
 micro-h2 = "=0.2.0"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }

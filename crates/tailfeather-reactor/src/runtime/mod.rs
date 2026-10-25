@@ -29,6 +29,38 @@ mod derp;
 
 pub type Error = &'static str;
 
+/// Borrow independent directions after the TLS/protocol handshake. Relay reads
+/// remain alive while outgoing packets and pongs progress, so adapters need not
+/// make record reads cancellation-safe.
+pub trait SplitStream: Read + Write {
+    type Reader<'a>: Read
+    where
+        Self: 'a;
+    type Writer<'a>: Write
+    where
+        Self: 'a;
+    fn split(&mut self) -> (Self::Reader<'_>, Self::Writer<'_>);
+}
+
+#[cfg(feature = "tls")]
+impl<S, C> SplitStream for embedded_tls::TlsConnection<'_, S, C>
+where
+    S: SplitStream,
+    C: embedded_tls::TlsCipherSuite + 'static,
+{
+    type Reader<'a>
+        = embedded_tls::TlsReader<'a, S::Reader<'a>, C>
+    where
+        Self: 'a;
+    type Writer<'a>
+        = embedded_tls::TlsWriter<'a, S::Writer<'a>, C>
+    where
+        Self: 'a;
+    fn split(&mut self) -> (Self::Reader<'_>, Self::Writer<'_>) {
+        self.split_with(|socket| socket.split())
+    }
+}
+
 /// Local delivery of authenticated inner IPv4 packets. Implement this for a
 /// kernel TUN interface, or use [`Tcp`] for the shared userspace TCP stack.
 /// The driver must be cancellation-safe and must not bypass [`PacketIo`]'s
@@ -72,7 +104,7 @@ impl<const N: usize, const Q: usize, B: PacketQueue<Q>> Device for Tcp<'_, N, Q,
 /// TCP/TLS must authenticate the requested DNS name against `ca` or trusted
 /// public roots; an empty private CA must never disable certificate validation.
 pub trait Network: Clock {
-    type Stream<'a>: Read + Write
+    type Stream<'a>: SplitStream
     where
         Self: 'a;
     type Rng: Rng
@@ -744,6 +776,13 @@ mod tests {
         }
         async fn flush(&mut self) -> Result<(), Self::Error> {
             Ok(())
+        }
+    }
+    impl SplitStream for PendingStream {
+        type Reader<'a> = Self;
+        type Writer<'a> = Self;
+        fn split(&mut self) -> (Self, Self) {
+            (Self, Self)
         }
     }
     struct Offline(Cell<u64>);
