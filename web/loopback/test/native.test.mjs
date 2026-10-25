@@ -121,6 +121,19 @@ test("page controller isolates sessions, backpressures bytes, and drops native/S
     const [data] = await once(socket, "data");
     assert.equal(data.toString(), "opaque-TLS-or-HTTP-bytes");
     assert.deepEqual(forwarded, [{ host: "127.0.0.1", port }]);
+    const payload = Buffer.from(Uint8Array.from({ length: 256 * 1024 }, (_unused, index) => index % 251));
+    const chunks = [];
+    let length = 0;
+    await new Promise((resolve, reject) => {
+      socket.on("data", (chunk) => {
+        chunks.push(chunk);
+        length += chunk.length;
+        if (length >= payload.length) resolve();
+      });
+      socket.once("close", () => { if (length < payload.length) reject(Error("large transfer reset")); });
+      socket.write(payload);
+    });
+    assert.deepEqual(Buffer.concat(chunks), payload);
     controller.dispose();
     await once(socket, "close");
     assert.equal(closed, 1);

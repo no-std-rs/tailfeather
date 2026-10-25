@@ -39,6 +39,11 @@ export async function loopbackTest(context, { nativeExtension = false } = {}) {
   const remote = createServer((request, response) => {
     const url = new URL(request.url, callback);
     if (url.pathname === "/favicon.ico") { response.writeHead(204).end(); return; }
+    if (url.pathname === "/roundtrip") {
+      response.writeHead(200, { "Content-Type": "application/octet-stream" });
+      request.pipe(response);
+      return;
+    }
     if (url.pathname === "/auth") {
       assert.equal(url.searchParams.get("state"), "fixture-state");
       response.writeHead(302, { Location: `http://127.0.0.1:${providerPort}/authorize?redirect_uri=${encodeURIComponent(callback)}&state=fixture-state` }).end();
@@ -125,6 +130,12 @@ export async function loopbackTest(context, { nativeExtension = false } = {}) {
     await popup.click("button");
     await popup.waitForURL(`${callback}?code=fixture-code&state=fixture-state`);
     check(await popup.textContent("body") === "Authorization complete" && finished, "OAuth callback did not reach original remote listener");
+    check(await popup.evaluate(async () => {
+      const body = Uint8Array.from({ length: 256 * 1024 }, (_unused, index) => index % 251);
+      const response = await fetch("/roundtrip", { method: "POST", body });
+      const returned = new Uint8Array(await response.arrayBuffer());
+      return returned.length === body.length && returned.every((value, index) => value === body[index]);
+    }), "forwarded binary request/response lost bytes across frame boundaries");
     check(forwards.length >= 1 && forwards.every((info) => info.destIP === "127.0.0.1" && info.destPort === port), "forwarding changed the remote destination");
     const secretState = await page.evaluate(() => ({ stored: JSON.stringify({ ...localStorage }), logs: window.tailfeather.logs.join("\n") }));
     check(!/fixture-state|fixture-code/.test(secretState.stored + secretState.logs), "OAuth values escaped into logs/storage");

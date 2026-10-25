@@ -100,6 +100,22 @@ npm run test:links
 npm run test:e2e -- --local
 ```
 
+For the actual Firefox extension/native-messaging acceptance test on Linux with
+`bwrap` installed, install Playwright's Firefox into a temporary browser cache
+and run:
+
+```sh
+cd web/client
+PLAYWRIGHT_BROWSERS_PATH=/tmp/tailfeather-firefox-browsers npx --no-install playwright-core install firefox
+PLAYWRIGHT_BROWSERS_PATH=/tmp/tailfeather-firefox-browsers npm run test:firefox-loopback
+```
+
+This runner uses Firefox's WebDriver BiDi temporary-add-on installation API and
+creates its own temporary profile and native manifest. Bubblewrap mounts a fresh
+home overlay with only the required source, dependencies, and browser cache
+readable; the user's actual home and Firefox profile are not modified. The
+temporary profile and manifest are removed afterward.
+
 The `ssh-loopback` browser test runs the actual WASM SSH client, a real local
 SSH server enforcing `direct-tcpip`, the shipped extension content script, and
 the native companion's real TCP listeners. It replaces Firefox's extension
@@ -111,11 +127,16 @@ secret-free logs/storage, and port reuse after disconnect. Separate tests cover
 the native messaging frame parser, loopback-only binds, resource teardown, and
 streamed URL recognition.
 
-This verifies the complete routing and callback mechanism with a simulated
-provider. It does not claim live Google account authorization, real rclone
-completion, or an installed Firefox native-messaging session has been exercised
-in CI. Those require a desktop installation and the user's OAuth credentials;
-the manual sequence above is the acceptance procedure.
+The same OAuth fixture was also exercised locally with an actual isolated
+desktop Firefox installation, its installed temporary extension, and native
+messaging to the companion. Firefox's profile and native-host manifests were
+isolated in temporary directories; no real browser profile was modified.
+The mock flow also round-trips a 256 KiB binary request/response across frame
+boundaries. CI uses the Chromium runtime shim described above.
+
+This verifies routing and callbacks with a simulated provider. It does not claim
+live Google account authorization or real rclone completion. Those require the
+user's OAuth credentials; the manual sequence above is the acceptance procedure.
 
 To uninstall, remove the extension, its `org.tailfeather.loopback.json` manifest,
 and `~/.local/lib/tailfeather-loopback/`.
