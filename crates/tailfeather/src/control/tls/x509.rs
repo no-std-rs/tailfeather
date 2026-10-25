@@ -1780,6 +1780,29 @@ mod tests {
     }
 
     #[test]
+    fn teletex_capital_eth_folds_as_eth_without_aliasing_d_with_stroke() {
+        let eth = string_value(0x14, &[0xe2]);
+        for value in ["Ð", "ð"] {
+            assert!(directory_value_equal(
+                eth,
+                string_value(0x0c, value.as_bytes())
+            ));
+        }
+        assert!(directory_value_equal(eth, string_value(0x14, &[0xf3])));
+        for value in ["Đ", "đ"] {
+            assert!(!directory_value_equal(
+                eth,
+                string_value(0x0c, value.as_bytes())
+            ));
+        }
+        assert!(!directory_value_equal(eth, string_value(0x14, &[0xf2])));
+        assert!(directory_value_equal(
+            string_value(0x14, &[0xf2]),
+            string_value(0x0c, "Đ".as_bytes())
+        ));
+    }
+
+    #[test]
     fn hosted_rsa_path_rejects_name_time_order_overflow_and_tbs_mutation() {
         let certificates = rsa_chain();
         assert!(

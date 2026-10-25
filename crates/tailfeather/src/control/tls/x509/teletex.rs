@@ -133,7 +133,10 @@ fn graphic(byte: u8) -> Option<char> {
         0xbf => '¿',
         0xe0 => 'Ω',
         0xe1 => 'Æ',
-        0xe2 => 'Đ',
+        // RFC 1345's T.61 table names 0xe2 D- (ETH), not D/ (D WITH
+        // STROKE). T.61 LD62 shares the printed glyph, but Unicode folding
+        // distinguishes the two letters: ETH folds to U+00F0, not U+0111.
+        0xe2 => 'Ð',
         0xe3 => 'ª',
         0xe4 => 'Ħ',
         0xe6 => 'Ĳ',
@@ -181,6 +184,11 @@ mod tests {
             (&[0xc6, b'G'], "G\u{306}"),
             (&[0xc7, b'Z'], "Z\u{307}"),
             (&[0xcc, 0xc8, b'u'], "u\u{308}\u{332}"),
+            // T.61 §3.2.3.9 allows underline on any repertoire graphic,
+            // including Space; the narrower DCE/XDS profile is not used.
+            (&[0xcc, 0x24], "¤\u{332}"),
+            (&[0xcc, 0xe1], "Æ\u{332}"),
+            (&[0xcc, b' '], " \u{332}"),
             (&[0xc9, b'A'], "A\u{308}"),
             (&[0xca, b'a'], "a\u{30a}"),
             (&[0xcb, b'T'], "T\u{327}"),
@@ -189,7 +197,7 @@ mod tests {
             (&[0xcf, b'L'], "L\u{30c}"),
             (&[0xc1, b' '], "`"),
             (&[0xc2, b' '], "´"),
-            (&[0xa3, 0xe1, 0xe2, 0xf3, 0xfb], "£ÆĐðß"),
+            (&[0xa3, 0xe1, 0xe2, 0xf3, 0xfb], "£ÆÐðß"),
             (&[b'#', 0xa6, b'$', 0xa8, 0xa4], "##¤¤$"),
         ];
         for &(input, expected) in cases {
