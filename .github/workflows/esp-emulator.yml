@@ -1,0 +1,55 @@
+name: ESP32-C6 emulator
+
+on:
+  pull_request:
+    paths: ['firmware/**', 'crates/tailfeather/**', 'crates/tailfeather-gateway/**', 'crates/wirefeather/**', 'bazel/**', 'platforms/**', 'MODULE.bazel*', 'Cargo.*', 'BUILD.bazel', '.bazel*', 'scripts/esp-emulator-smoke.py', '.github/workflows/esp-emulator.yml']
+  push:
+    branches: [main]
+    paths: ['firmware/**', 'crates/tailfeather/**', 'crates/tailfeather-gateway/**', 'crates/wirefeather/**', 'bazel/**', 'platforms/**', 'MODULE.bazel*', 'Cargo.*', 'BUILD.bazel', '.bazel*', 'scripts/esp-emulator-smoke.py', '.github/workflows/esp-emulator.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: esp-emulator-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware-smoke:
+    name: ESP32-C6 firmware smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: bazel-contrib/setup-bazel@8cb04a772ab4c1eb984e9c1b493a182e96c5e425 # 0.19.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+      - name: Download checksum-pinned emulator and image converter
+        run: |
+          mkdir -p "$RUNNER_TEMP/esp-tools"
+          cd "$RUNNER_TEMP/esp-tools"
+          curl --fail --location --retry 3 --output emulator.tar.gz https://github.com/espressif/esp-emulator/releases/download/v0.50.0/esp-emu-0.50.0-x86_64-unknown-linux-gnu.tar.gz
+          echo '3f388f44ae38e829c74d637a68f4d80a136c375ff4d7d168acf87c8d274f0075  emulator.tar.gz' | sha256sum --check
+          tar -xzf emulator.tar.gz
+          curl --fail --location --retry 3 --output espflash.zip https://github.com/esp-rs/espflash/releases/download/v4.4.0/espflash-x86_64-unknown-linux-gnu.zip
+          echo 'ac2031bd1f04c9107d9ba0e977535daa885a9f533f937dc369debd77f83665cd  espflash.zip' | sha256sum --check
+          unzip espflash.zip
+          chmod +x espflash
+          echo "$RUNNER_TEMP/esp-tools" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/esp-tools/esp-emu-0.50.0-x86_64-unknown-linux-gnu" >> "$GITHUB_PATH"
+      - name: Build real firmware with inert CI provisioning
+        run: bazel build --noannounce_rc --config=local --config=optimized //firmware:ci_image
+      - name: Exercise boot, Wi-Fi, persistence, and interrupted first write
+        run: python3 scripts/esp-emulator-smoke.py --elf bazel-bin/firmware/esp_gateway_firmware --logs-dir "$RUNNER_TEMP/esp-emulator-logs"
+      - name: Retain emulator console diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: esp-emulator-logs
+          path: ${{ runner.temp }}/esp-emulator-logs/
+          if-no-files-found: ignore
+          retention-days: 7
