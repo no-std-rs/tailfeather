@@ -4,6 +4,7 @@
 //! userspace TCP implementation. No OS VPN service or virtual adapter is used.
 #![forbid(unsafe_code)]
 mod bridge;
+mod discovery;
 mod exec;
 mod logic;
 mod net;

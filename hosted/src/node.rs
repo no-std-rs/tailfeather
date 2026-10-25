@@ -256,7 +256,11 @@ async fn control_session(
         {
             let candidate = core::net::SocketAddrV4::new(*local.ip(), bound.port());
             node.local_candidate.set(Some(candidate));
-            node.candidate(candidate);
+            if node.direct {
+                for candidate in crate::discovery::local_candidates(Some(candidate)) {
+                    node.candidate(candidate);
+                }
+            }
         }
         let tls = crate::tls::connect(socket, authority.host(), ca, &mut read, &mut write);
         let mut stream = match exec::select(tls, reactor.sleep(20000)).await {
@@ -521,9 +525,7 @@ async fn select_home(reactor: &Reactor, node: &Shared) -> u16 {
     if !node.direct {
         return best.home();
     }
-    let mut candidates: Vec<_> = node
-        .local_candidate
-        .get()
+    let mut candidates: Vec<_> = crate::discovery::local_candidates(node.local_candidate.get())
         .into_iter()
         .map(|a| a.to_string())
         .collect();
@@ -746,9 +748,9 @@ async fn packets(
                 })
                 .collect();
             punches.retain(|(peer, _, _)| active.contains(peer));
-            for peer in active {
-                if !punches.iter().any(|(key, _, _)| *key == peer) {
-                    punches.push((peer, 0, 0));
+            for peer in &active {
+                if !punches.iter().any(|(key, _, _)| key == peer) {
+                    punches.push((*peer, 0, 0));
                 }
             }
             let candidates: Vec<core::net::SocketAddr> = node
@@ -769,11 +771,19 @@ async fn packets(
                     *next = now + 1000;
                 }
             }
+            for peer in &active {
+                if actions.borrow_mut().len() >= 16 {
+                    break;
+                }
+                enqueue(
+                    actions,
+                    node.borrow_mut()
+                        .poll_disco_for(peer, now, &mut OsRng)
+                        .ok()
+                        .flatten(),
+                );
+            }
         }
-        enqueue(
-            actions,
-            node.borrow_mut().poll_disco(now, &mut OsRng).ok().flatten(),
-        );
         enqueue(actions, node.borrow_mut().poll_derp().ok().flatten());
         let timestamp = node.timestamp.borrow().candidate()?;
         let handshake = node

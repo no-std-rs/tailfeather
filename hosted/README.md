@@ -75,9 +75,16 @@ TLS, real DERP TCP exchange and reconnects against a local Headscale fixture at
 `keys.json` array of two fixture-only preauth keys; `--ephemeral` exercises
 ephemeral registration on both ends. It never accepts keys as command arguments.
 
-Direct mode advertises the bound UDP port on the control connection's local
-interface and validates STUN replies received on that same data socket before
-publishing reflexive candidates. `relay_only` omits these candidates. TCP races
+Direct mode advertises the bound UDP port on usable local IPv4 interfaces,
+including LANs that do not carry the control connection. It keeps up to four
+local candidates and reserves the remaining four endpoint slots for validated
+STUN replies received on that same data socket. Other LAN interfaces precede
+the control connection's interface, so a reachable NAT path does not prevent
+discovery of a private link. Loopback is used only when no other local address
+is available; overlay, multicast and unspecified addresses are excluded.
+Application sockets drive DISCO probes for their active peers, so unrelated
+unreachable peers cannot delay their discovery. `relay_only` omits these
+candidates and probes. TCP races
 up to 16 distinct IPv4 DNS answers within a 15-second total connection deadline.
 Custom CA DER is validated before the runtime starts. DERP protocol handshakes
 have a 20-second deadline and disconnect commands cancel pending handshakes;
