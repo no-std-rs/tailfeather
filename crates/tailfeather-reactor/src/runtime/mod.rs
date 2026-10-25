@@ -955,12 +955,7 @@ mod tests {
             .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 use core::future::Future;
-                struct Wake;
-                impl std::task::Wake for Wake {
-                    fn wake(self: std::sync::Arc<Self>) {}
-                }
-                let waker = core::task::Waker::from(std::sync::Arc::new(Wake));
-                let mut cx = core::task::Context::from_waker(&waker);
+                let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
                 for failure in [None, Some("TUN interface closed")] {
                     let network = Offline(Cell::new(0));
                     let state = MemoryState::default();

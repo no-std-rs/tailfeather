@@ -37,6 +37,14 @@ rng!(tailfeather::disco::packet::Rng);
 rng!(tailfeather::derp::client::Rng);
 
 struct PendingStream;
+impl tailfeather_reactor::runtime::SplitStream for PendingStream {
+    type Reader<'a> = PendingStream;
+    type Writer<'a> = PendingStream;
+    fn split(&mut self) -> (PendingStream, PendingStream) {
+        // This fixture has no transport state; both directions stay pending.
+        (PendingStream, PendingStream)
+    }
+}
 impl embedded_io_async::ErrorType for PendingStream {
     type Error = core::convert::Infallible;
 }
