@@ -33,6 +33,14 @@ the coordinator controls offline node removal timing. The same identity is kept
 across reconnects during that session. Keep the temporary directory alive until
 all client clones and streams have been dropped. Persistent consumers can set
 `ephemeral: false` and reuse their private directory without a new auth key.
+Dropping the final client for an enrolled ephemeral session sends an
+authenticated logout request, matching upstream Tailscale's immediate removal
+behavior. Shutdown waits at most five seconds for this best-effort operation.
+Discard an ephemeral session's directory afterward; its logged-out identity and
+consumed enrollment key are not a persistent reconnect profile. Persistent
+clients do not log out on drop. Crashes and unavailable coordinators still
+depend on provider inactivity cleanup; an auth key's expiry does not set the
+lifetime of a node that has already enrolled.
 State is bound to the HTTPS control origin, replaced atomically, and protected by
 an exclusive directory lock. Corrupt or mismatched state fails closed.
 Android uses rustix file locking because the standard library's file locking
@@ -51,9 +59,9 @@ Established connections retain their sockets when the total capacity is reached.
 `TAILFEATHER_NET_TRACE=1` prints TCP states and queue sizes without packet contents.
 Dropping the last client shuts down the node. Dropping a listener stops new
 acceptance. This adapter exposes IPv4 TCP, not system-wide networking or UDP
-application sockets. Hosted peer capacity is 128; the core's embedded default remains 32. Hosted
+application sockets. Hosted peer capacity is 256; the core's embedded default remains 32. Hosted
 clients enable the `hosted-policy` feature: each of the 32 ACL rules can retain
-256 source and 256 destination networks, so provider-expanded device tags do
+512 source and 512 destination networks, so 256 dual-stack devices and provider-expanded device tags do
 not overflow the firmware's eight-address budget. Oversized policies still
 fail closed; no ACL entries are truncated. Embedded builds retain their small
 defaults. The hosted worker reserves a 64 MiB stack for the larger bounded map

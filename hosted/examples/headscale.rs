@@ -68,9 +68,13 @@ fn main() {
             println!("PASS: direct TCP works with control and DERP offline");return;
         }
         drop(to);drop(listener);drop(server);
-        let client=Client::start(config(&root,"hosted-client",String::new())).unwrap();
-        assert_eq!(tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap(),client_ip);
-        println!("PASS: session identity reconnects without an auth key and keeps its address");
+        if !std::env::args().any(|arg|arg=="--ephemeral") {
+            let client=Client::start(config(&root,"hosted-client",String::new())).unwrap();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap(),client_ip);
+            println!("PASS: persistent session identity reconnects without an auth key and keeps its address");
+        } else {
+            println!("PASS: ephemeral clients log out when their final handle is dropped");
+        }
         let rejected=Client::start(config(&root,"hosted-rejected","fixture-invalid-key".into())).unwrap();
         let error=tokio::time::timeout(Duration::from_secs(10),rejected.ready()).await.unwrap().unwrap_err();
         assert_eq!(error.to_string(),"registration rejected");

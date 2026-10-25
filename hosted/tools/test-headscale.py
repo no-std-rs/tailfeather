@@ -93,17 +93,22 @@ def main():
 
             wait_for(ready)
             user = json.loads(cli('users', 'create', 'fixture', '--output', 'json').stdout)['id']
-            for mode in ('relay', 'direct'):
+            modes = ('relay', 'relay-persistent', 'direct') if RUNTIME == 'hosted' else ('relay', 'direct')
+            for mode in modes:
                 case = root / mode
                 case.mkdir(mode=0o700)
                 shutil.copyfile(root / 'ca.der', case / 'ca.der')
-                keys = [json.loads(cli('preauthkeys', 'create', '--user', str(user), '--ephemeral',
-                    '--expiration', '10m', '--output', 'json').stdout)['key'] for _ in range(2)]
+                key_args = ['preauthkeys', 'create', '--user', str(user), '--expiration', '10m', '--output', 'json']
+                if mode != 'relay-persistent':
+                    key_args += ['--ephemeral']
+                keys = [json.loads(cli(*key_args).stdout)['key'] for _ in range(2)]
                 private(case / 'keys.json', keys)
                 log = case / 'run.log'
                 if RUNTIME == 'hosted':
                     args = ['cargo', 'run', '--manifest-path', 'hosted/Cargo.toml', '--locked',
-                        '--example', 'headscale', '--', str(case), '--ephemeral']
+                        '--example', 'headscale', '--', str(case)]
+                    if mode != 'relay-persistent':
+                        args += ['--ephemeral']
                 elif RUNTIME in ('reactor-fixed', 'reactor-owned'):
                     features = 'std,accelerated-crypto' if RUNTIME == 'reactor-owned' else 'std'
                     args = ['cargo', 'run', '--manifest-path', 'crates/tailfeather-reactor/Cargo.toml',
@@ -135,6 +140,9 @@ def main():
                             # addresses only, never the captured preauth keys.
                             print(text[-4000:], flush=True)
                             raise RuntimeError('real Headscale ' + mode + ' fixture failed')
+                        if RUNTIME == 'hosted' and mode == 'relay':
+                            wait_for(lambda: not json.loads(cli('nodes', 'list', '--output', 'json').stdout))
+                            print('PASS: Headscale removed ephemeral nodes immediately on logout', flush=True)
                     finally:
                         if process.poll() is None:
                             process.terminate()

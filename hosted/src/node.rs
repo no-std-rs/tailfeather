@@ -12,7 +12,7 @@ use tailfeather::control::{
     transport::{self, MapEvent, MapStream},
 };
 use tailfeather::{ControlCommand, ControlEvent, Node, NodeAction, PersistState};
-pub const PEERS: usize = 128;
+pub const PEERS: usize = 256;
 const HOST_OS: &str = if cfg!(target_os = "macos") {
     "darwin"
 } else {
@@ -122,6 +122,7 @@ pub async fn run(
     config: crate::Config,
     mut commands: tokio::sync::mpsc::Receiver<crate::Command>,
     status: tokio::sync::watch::Sender<crate::Status>,
+    stopped: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Error> {
     let reactor = Reactor::new();
     let authority = Authority::parse(&config.control_url, false).map_err(|_| "HTTPS authority")?;
@@ -160,11 +161,95 @@ pub async fn run(
     };
     let actions = Actions::default();
     let slots = [crate::relay::Slot::new(), crate::relay::Slot::new()];
-    tokio::select! {
+    let result = tokio::select! {
         result=control_loop(&reactor, &node, &actions, &store, &authority, &status, &config)=>result,
         result=packets(&reactor, &node, &actions, &node.udp, &slots, &mut commands, &status)=>result,
         result=crate::relay::worker(&reactor, &node, &actions, &slots[0], &config.control_ca_der)=>result,
         result=crate::relay::worker(&reactor, &node, &actions, &slots[1], &config.control_ca_der)=>result,
+        _=stopped=>Ok(()),
+    };
+    if config.ephemeral && node.borrow().is_enrolled() {
+        // Bound shutdown even if DNS or the coordinator is unavailable. A
+        // crash/offline exit still relies on the provider's inactive-node GC.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            logout(&reactor, &node, &authority, &config),
+        )
+        .await;
+    }
+    result
+}
+
+async fn logout(
+    reactor: &Reactor,
+    node: &Shared,
+    authority: &Authority,
+    config: &crate::Config,
+) -> Result<(), Error> {
+    let mut read = [0; tailfeather::control::tls::TLS_READ_BUFFER];
+    let mut write = [0; tailfeather::control::tls::TLS_WRITE_BUFFER];
+    let host = format!("{}:{}", authority.host(), authority.port());
+    let socket = tcp(reactor, authority.host(), authority.port()).await?;
+    let mut stream = crate::tls::connect(
+        socket,
+        authority.host(),
+        &config.control_ca_der,
+        &mut read,
+        &mut write,
+    )
+    .await
+    .map_err(|_| "logout TLS")?;
+    let key = transport::fetch_server_key(&mut stream, &host)
+        .await
+        .map_err(|_| "logout server key")?;
+    drop(stream);
+    let socket = tcp(reactor, authority.host(), authority.port()).await?;
+    let stream = crate::tls::connect(
+        socket,
+        authority.host(),
+        &config.control_ca_der,
+        &mut read,
+        &mut write,
+    )
+    .await
+    .map_err(|_| "logout TLS")?;
+    let identity = node.borrow().identity().clone();
+    let noise = transport::establish(stream, &host, &identity, &key, &mut OsRng)
+        .await
+        .map_err(|_| "logout Noise")?;
+    let mut http = noise.into_https2().await.map_err(|_| "logout HTTP/2")?;
+    let public = identity.node.public();
+    let request = RegisterRequest {
+        version: tailfeather::control::CAPABILITY_VERSION,
+        node_key: &public,
+        old_node_key: None,
+        auth_key: "",
+        hostinfo: Hostinfo {
+            hostname: &config.hostname,
+            os: HOST_OS,
+            ..Default::default()
+        },
+        ephemeral: true,
+    };
+    let mut body = [0; 2048];
+    let body = request
+        .write_logout(&mut body)
+        .map_err(|_| "logout request size")?;
+    let mut response = [0; 4096];
+    let (status, _) = http
+        .request(
+            "POST",
+            tailfeather::control::register::PATH,
+            &host,
+            body,
+            &mut response,
+        )
+        .await
+        .map_err(|_| "logout request")?;
+    if status == 200 {
+        Ok(())
+    } else {
+        Err("logout rejected")
     }
 }
 fn persist(node: &Shared, store: &crate::store::FileStore, now: u64) -> Result<(), Error> {
@@ -1078,9 +1163,48 @@ mod tests {
             });
     }
     #[test]
+    fn hosted_peer_capacity_keeps_the_last_peer_and_reports_overflow() {
+        crate::on_worker_stack(|| {
+            for count in [PEERS, PEERS + 1] {
+                let peers = (1..=count)
+                    .map(|id| {
+                        let mut private = [0; 32];
+                        private[..8].copy_from_slice(&(id as u64).to_le_bytes());
+                        let key = tailfeather::keys::NodePrivate::from_bytes(private).public();
+                        let mut encoded = [0; 128];
+                        let key = key.encode(&mut encoded).unwrap();
+                        format!(
+                            r#"{{"ID":{id},"Key":"{key}","Addresses":["100.64.{}.{}/32"]}}"#,
+                            id / 256,
+                            id % 256
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let json = format!(r#"{{"Peers":[{peers}]}}"#);
+                let mut map = tailfeather::netmap::Netmap::<PEERS>::new();
+                let mut parser = tailfeather::netmap::Parser::new();
+                let result = parser
+                    .push(&mut map, json.as_bytes())
+                    .and_then(|()| parser.finish(&mut map));
+                if count <= PEERS {
+                    result.unwrap();
+                    assert_eq!(map.peers.len(), PEERS);
+                    assert!(map.peers.iter().any(|peer| peer.id == PEERS as u64));
+                    assert!(!map.peers_truncated);
+                } else {
+                    result.unwrap();
+                    assert_eq!(map.peers.len(), PEERS);
+                    assert!(map.peers_truncated);
+                }
+            }
+        });
+    }
+
+    #[test]
     fn expanded_fleet_acl_is_complete_and_still_bounded() {
         std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
-            for count in [40, 256, 257] {
+            for count in [40, 512, 513] {
                 let sources = (1..=count).map(|n| format!("\"100.64.{}.{}/32\"", n / 256, n % 256)).collect::<Vec<_>>().join(",");
                 let destinations = (1..=count).map(|n| format!(r#"{{"IP":"100.65.{}.{}/32","Ports":{{"First":2222,"Last":2222}}}}"#, n / 256, n % 256)).collect::<Vec<_>>().join(",");
                 let json = format!(r#"{{"PacketFilter":[{{"SrcIPs":[{sources}],"DstPorts":[{destinations}],"IPProto":[6]}}]}}"#);
@@ -1088,7 +1212,7 @@ mod tests {
                 let mut parser = tailfeather::netmap::Parser::new();
                 parser.push(&mut map, json.as_bytes()).unwrap();
                 let result = parser.finish(&mut map);
-                if count > 256 {
+                if count > 512 {
                     assert!(matches!(result, Err(tailfeather::netmap::Error::Full(_))));
                 } else {
                     result.unwrap();

@@ -27,7 +27,8 @@ pub struct Config {
     pub auth_key: String,
     pub control_ca_der: Vec<u8>,
     pub relay_only: bool,
-    /// Register a disposable node; the control server removes it after disconnect.
+    /// Register a disposable node and log it out on final drop. Discard this
+    /// session's state directory afterward. Offline shutdown uses provider GC.
     pub ephemeral: bool,
 }
 #[derive(Clone, Debug, Default)]
@@ -117,12 +118,10 @@ impl Client {
                 {
                     Ok(runtime) => {
                         let local = tokio::task::LocalSet::new();
-                        let result = local.block_on(&runtime, async {
-                            tokio::select! {
-                                result=node::run(config,receiver,status_tx.clone())=>result,
-                                _=stopped=>Ok(()),
-                            }
-                        });
+                        let result = local.block_on(
+                            &runtime,
+                            node::run(config, receiver, status_tx.clone(), stopped),
+                        );
                         drop(local);
                         // OS DNS lookups may outlive cancellation, but cannot
                         // keep this node's state lock or worker alive.
