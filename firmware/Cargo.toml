@@ -68,7 +68,7 @@ embassy-futures = "0.1"
 embassy-executor = { version = "0.10.0", features = ["log"] }
 embassy-sync = "0.8"
 embassy-time = { version = "0.5.0", features = ["log"] }
-embedded-tls = { git = "https://github.com/pawelchcki/embedded-tls", rev = "f1fdbf1e49a3c109063384d5ee669e190f08ff58", default-features = false }
+embedded-tls = { git = "https://github.com/pawelchcki/embedded-tls", rev = "48fef49e6e7cbdaa44e9003a45078656f8955d3d", default-features = false }
 embedded-io-async = "0.7"
 rand_core = { version = "0.6.4", default-features = false }
 esp-radio = { version = "0.18.0", features = [
