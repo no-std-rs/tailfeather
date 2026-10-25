@@ -41,10 +41,19 @@ In Firefox, open `about:debugging#/runtime/this-firefox`, choose **Load Temporar
 Add-on**, and select `web/loopback/extension/manifest.json`. Reload Tailfeather
 after loading the extension. This developer installation lasts until Firefox
 restarts; load it again after restarting. No signed persistent add-on is
-distributed yet. The extension allows the official GitHub Pages client, the
-documented Cloudflare Worker client, and local development pages. For a private
-deployment, add its exact HTTPS URL pattern to the manifest's `matches` list
-before loading. Treat permitted pages as trusted clients of the companion.
+distributed yet. The shipped extension allows only the official GitHub Pages
+client and the documented Cloudflare Worker client. Forwarded loopback service
+pages and OAuth callback pages receive no extension bridge; they use ordinary
+browser TCP connections to the listener opened by your Tailfeather terminal.
+For a private deployment, use a separate manifest copy with its exact trusted
+HTTPS application URL pattern in `matches` before loading.
+
+Local development requires an explicit opt-in: copy `extension/` to a temporary
+directory, add your local application's match pattern to that copy's `matches`,
+and load only the copy in an isolated throwaway Firefox profile. Local patterns
+also trust any remote service pages matching those patterns. Keep that developer
+copy out of your normal browser. The automated acceptance runner makes this
+temporary opt-in copy itself; the distributed manifest stays HTTPS-only.
 
 Sandboxed/Flatpak Firefox must be able to execute the installed Node binary and
 read the native-host manifest; use a desktop Firefox installation with native
@@ -110,8 +119,12 @@ PLAYWRIGHT_BROWSERS_PATH=/tmp/tailfeather-firefox-browsers npx --no-install play
 PLAYWRIGHT_BROWSERS_PATH=/tmp/tailfeather-firefox-browsers npm run test:firefox-loopback
 ```
 
-This runner uses Firefox's WebDriver BiDi temporary-add-on installation API and
-creates its own temporary profile and native manifest. Bubblewrap mounts a fresh
+This runner uses Firefox's WebDriver BiDi temporary-add-on installation API. It
+first installs the shipped extension and verifies that local service/callback
+pages cannot create native companion listeners. It then installs a temporary
+extension copy explicitly permitting the local test application and runs the
+OAuth/forwarding fixture. It creates its own temporary profile and native
+manifest. Bubblewrap mounts a fresh
 home overlay with only the required source, dependencies, and browser cache
 readable; the user's actual home and Firefox profile are not modified. The
 temporary profile and manifest are removed afterward.

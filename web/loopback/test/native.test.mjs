@@ -3,8 +3,16 @@ import { test } from "node:test";
 import { createServer, connect } from "node:net";
 import { once } from "node:events";
 import { PassThrough } from "node:stream";
+import { readFile } from "node:fs/promises";
 import { LoopbackHost, nativeMain } from "../native.mjs";
 import { LoopbackForwarding } from "../../client/www/loopback-forwarding.js";
+
+test("production extension trusts only the official HTTPS app paths, never forwarded loopback pages", async () => {
+  const manifest = JSON.parse(await readFile(new URL("../extension/manifest.json", import.meta.url), "utf8"));
+  assert.deepEqual(manifest.content_scripts.flatMap((script) => script.matches), [
+    "https://no-std-rs.github.io/tailfeather/*", "https://tailfeather-web.pawelchcki.workers.dev/*",
+  ]);
+});
 
 async function freePort() {
   const server = createServer();

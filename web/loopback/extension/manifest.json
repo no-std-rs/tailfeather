@@ -7,7 +7,7 @@
   "permissions": ["nativeMessaging"],
   "background": { "scripts": ["background.js"] },
   "content_scripts": [{
-    "matches": ["https://no-std-rs.github.io/tailfeather/*", "https://tailfeather-web.pawelchcki.workers.dev/*", "http://127.0.0.1/*", "http://localhost/*"],
+    "matches": ["https://no-std-rs.github.io/tailfeather/*", "https://tailfeather-web.pawelchcki.workers.dev/*"],
     "js": ["content.js"],
     "run_at": "document_start"
   }]

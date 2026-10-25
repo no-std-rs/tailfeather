@@ -2,17 +2,68 @@
 // Bubblewrap overlays the native-manifest directory and isolates the profile:
 // nothing is installed in the user's home or existing Firefox profile.
 import { firefox } from "playwright-core";
-import { mkdtemp, mkdir, writeFile, rm, realpath } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, cp, rm, realpath } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
+import { createServer as httpServer } from "node:http";
 import { once } from "node:events";
 import { loopbackTest } from "./loopback.mjs";
 
 const script = fileURLToPath(import.meta.url);
 const root = fileURLToPath(new URL("../../../", import.meta.url));
+
+async function productionOriginIsolation(context) {
+  const server = httpServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/html" }).end("<!doctype html><body>Remote loopback service</body>");
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const page = await context.newPage();
+  try {
+    for (const host of ["127.0.0.1", "localhost"]) {
+      const reserve = createServer();
+      reserve.listen(0, "127.0.0.1");
+      await once(reserve, "listening");
+      const port = reserve.address().port;
+      await new Promise((resolve) => reserve.close(resolve));
+      await page.goto(`http://${host}:${server.address().port}/auth?state=fixture-untrusted`);
+      const access = await page.evaluate((port) => new Promise((resolve) => {
+        const session = crypto.randomUUID();
+        let acknowledged = false;
+        let opened = false;
+        const receive = (event) => {
+          if (event.data?.source !== "tailfeather-loopback-extension" || event.data.session !== session) return;
+          if (event.data.type === "hello") acknowledged = true;
+          if (event.data.type === "reply" && event.data.request === "untrusted" && event.data.ok) opened = true;
+        };
+        addEventListener("message", receive);
+        const post = (data) => window.postMessage({
+          ...data, source: "tailfeather-loopback-page", session,
+        }, location.origin);
+        post({ type: "hello" });
+        post({ type: "listen", request: "untrusted", id: "untrusted", host: "127.0.0.1", port });
+        setTimeout(() => {
+          removeEventListener("message", receive);
+          post({ type: "disconnect" });
+          resolve({ acknowledged, opened });
+        }, 250);
+      }), port);
+      if (access.acknowledged || access.opened) throw Error("A remote loopback page acquired native companion access from the production extension");
+      const unused = createServer();
+      unused.listen(port, "127.0.0.1");
+      await once(unused, "listening");
+      await new Promise((resolve) => unused.close(resolve));
+    }
+    console.log("PASS production extension denies companion/listener access to remote loopback pages");
+  } finally {
+    await page.close();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
 
 async function runFirefox(scratch) {
   const reserve = createServer();
@@ -54,6 +105,9 @@ async function runFirefox(scratch) {
       extensionData: { type: "path", path: join(root, "web", "loopback", "extension") },
     });
     if (installed.extension !== "loopback@tailfeather.no-std-rs") throw Error("Firefox did not install the expected extension");
+    await productionOriginIsolation(context);
+    await send("webExtension.uninstall", { extension: installed.extension });
+    await send("webExtension.install", { extensionData: { type: "path", path: join(scratch, "extension") } });
     await loopbackTest(context, { nativeExtension: true });
     console.log("PASS actual Firefox extension/native messaging OAuth and binary forwarding");
   } finally {
@@ -73,6 +127,14 @@ if (process.argv[2] === "--inside") {
     const manifests = join(mozilla, "native-messaging-hosts");
     await mkdir(manifests, { recursive: true });
     await mkdir(join(scratch, "cache"));
+    // The shipped extension never trusts loopback origins. Only this temporary
+    // browser/profile's copied manifest opts into the local app fixture.
+    const testExtension = join(scratch, "extension");
+    await cp(join(root, "web", "loopback", "extension"), testExtension, { recursive: true });
+    const manifestPath = join(testExtension, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.content_scripts[0].matches.push("http://127.0.0.1/*", "http://localhost/*");
+    await writeFile(manifestPath, JSON.stringify(manifest));
     const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
     const launcher = join(scratch, "native-host");
     await writeFile(launcher,
