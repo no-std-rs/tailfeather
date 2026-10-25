@@ -47,6 +47,8 @@ embassy-net = { version = "0.9.1", features = [
   # misbehaves.
   "auto-icmp-echo-reply",
   "dhcpv4",
+  "proto-ipv6",
+  "slaac",
   "dns",
   "log",
   "medium-ethernet",
@@ -84,6 +86,7 @@ smoltcp = { version = "0.13.0", default-features = false, features = [
   "medium-ethernet",
   "proto-dhcpv4",
   "proto-ipv4",
+  "proto-ipv6",
   "socket-raw",
   "socket-tcp",
   "socket-udp",

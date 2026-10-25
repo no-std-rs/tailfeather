@@ -2,7 +2,9 @@
 """Boot the real ESP32-C6 image and check Wi-Fi and flash recovery in ESP-EMU."""
 
 import argparse
+import ipaddress
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -15,7 +17,24 @@ SLOTS = (0x370000, 0x371000)
 SECTOR_SIZE = 4096
 
 
-def boot(emulator, elf, image, log, seconds, expected, *, save=False, exit_on=None):
+def ipv6_ready(text):
+    for address, gateway in re.findall(
+            r"IPv6 uplink:\s+(\S+)\s+gateway=Some\(([^)]+)\)", text):
+        try:
+            source = ipaddress.IPv6Interface(address).ip
+            router = ipaddress.IPv6Address(gateway)
+        except ValueError:
+            continue
+        if (not (source.is_unspecified or source.is_loopback or source.is_multicast
+                 or source.is_link_local or source.ipv4_mapped is not None)
+                and not (router.is_unspecified or router.is_loopback or router.is_multicast
+                         or router.ipv4_mapped is not None)):
+            return True
+    return False
+
+
+def boot(emulator, elf, image, log, seconds, expected, *, save=False, exit_on=None,
+         require_ipv6=False):
     command = [
         str(emulator), "--chip", "esp32c6", "--firmware", str(image),
         "--elf", str(elf), "--wifi-ssid", SSID, "--wifi-password", SSID,
@@ -32,6 +51,8 @@ def boot(emulator, elf, image, log, seconds, expected, *, save=False, exit_on=No
         )
     text = log.read_text(errors="replace")
     missing = [marker for marker in expected if marker not in text]
+    if require_ipv6 and not ipv6_ready(text):
+        missing.append("non-link-local IPv6 SLAAC address and default gateway")
     failures = [marker for marker in (
         "panicked at", "Guru Meditation", "load partition table error",
         "could not verify both identity state slots", "Exception was unhandled",
@@ -63,6 +84,8 @@ def main():
     parser.add_argument("--logs-dir", type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=15,
                         help="maximum emulation time per full boot (default: 15)")
+    parser.add_argument("--require-ipv6", action="store_true",
+                        help="require a non-link-local IPv6 address and default gateway on every boot")
     args = parser.parse_args()
     if not args.esp_emu or not args.espflash:
         parser.error("esp-emu and espflash must be installed or supplied explicitly")
@@ -89,10 +112,13 @@ def main():
         shutil.copyfile(fresh, persisted)
         markers = [f"associated with {SSID}", "link_up = true", "DHCP lease:"]
         boot(emulator, elf, persisted, args.logs_dir / "first-boot.log", args.seconds,
-             markers + ["state=identity-created reason=first-boot"], save=True)
+             markers + ["state=identity-created reason=first-boot"], save=True,
+             require_ipv6=args.require_ipv6)
         require_redundant_state(persisted)
         boot(emulator, elf, persisted, args.logs_dir / "restore.log", args.seconds,
-             markers + ["state=identity-restored"], exit_on="state=identity-restored")
+             markers + ["state=identity-restored"],
+             exit_on=None if args.require_ipv6 else "state=identity-restored",
+             require_ipv6=args.require_ipv6)
         # Model power loss during the very first body write: one partial sector
         # beside an erased sector. The actual flash adapter must recover it.
         torn = Path(directory) / "torn-first-write.bin"
@@ -100,9 +126,12 @@ def main():
         flash[SLOTS[0]] = 0
         torn.write_bytes(flash)
         boot(emulator, elf, torn, args.logs_dir / "torn-first-write.log", args.seconds,
-             markers + ["state=identity-created reason=first-boot"], save=True)
+             markers + ["state=identity-created reason=first-boot"], save=True,
+             require_ipv6=args.require_ipv6)
         require_redundant_state(torn)
     print("PASS ESP32-C6 firmware boot, Wi-Fi/DHCP, identity restore, and torn-write recovery")
+    if args.require_ipv6:
+        print("PASS IPv6 SLAAC address and default gateway on all three boots")
 
 
 if __name__ == "__main__":
