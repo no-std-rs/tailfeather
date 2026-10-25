@@ -1063,7 +1063,7 @@ async fn handle_delivered_ipv6(
     let Some(uplink) = uplink else {
         return;
     };
-    if !node.netmap().default_routes_approved() {
+    if !node.netmap().ipv6_default_route_approved() {
         return;
     }
     let result = if let Some(out) = scratch.inner.get_mut(..packet.len()) {
@@ -1173,7 +1173,7 @@ async fn handle_delivered_ipv4(
         .and_then(|our_tunnel_ip| crate::inner::icmp_echo_reply(packet, our_tunnel_ip, inner))
     {
         encapsulate_and_send(node, peer, &inner[..reply_len], wg_socket, derp_regions).await;
-    } else if !node.netmap().default_routes_approved() {
+    } else if !node.netmap().ipv4_default_route_approved() {
         warn!("exit-policy drop=routes-not-approved");
     } else if !nat::ipv4_ttl_is_forwardable(packet) {
         warn!("exit-policy drop=expired-ttl");
@@ -1302,7 +1302,7 @@ async fn handle_peerapi_segment(
 /// no approved default routes is not an exit node yet, so there is nothing to
 /// resolve *through*.
 fn client_may_resolve(node: &Node<PEERS>, client_ip: [u8; 4]) -> bool {
-    node.netmap().default_routes_approved()
+    node.netmap().ipv4_default_route_approved()
         && tailfeather_gateway::peerapi::client_may_resolve(client_ip, |client| {
             node.netmap()
                 .packet_filter

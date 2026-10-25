@@ -183,21 +183,26 @@ impl<const PEERS: usize> Netmap<PEERS> {
             .any(|route| matches!(route.address, core::net::IpAddr::V4(_)))
     }
 
+    /// Approval of `0.0.0.0/0` is independent of IPv6 uplink capability.
+    pub fn ipv4_default_route_approved(&self) -> bool {
+        self.primary_routes.iter().any(|route| {
+            route.prefix == 0
+                && route.address == core::net::IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED)
+        })
+    }
+
+    /// Only an explicitly approved `::/0` authorizes IPv6 exit forwarding.
+    pub fn ipv6_default_route_approved(&self) -> bool {
+        self.primary_routes.iter().any(|route| {
+            route.prefix == 0
+                && route.address == core::net::IpAddr::V6(core::net::Ipv6Addr::UNSPECIFIED)
+        })
+    }
+
+    /// Whether both exit-route families are approved. Family-specific packet
+    /// paths must use the corresponding approval query instead.
     pub fn default_routes_approved(&self) -> bool {
-        let mut ipv4 = false;
-        let mut ipv6 = false;
-        for route in &self.primary_routes {
-            match route.address {
-                core::net::IpAddr::V4(address) if address.is_unspecified() && route.prefix == 0 => {
-                    ipv4 = true;
-                }
-                core::net::IpAddr::V6(address) if address.is_unspecified() && route.prefix == 0 => {
-                    ipv6 = true;
-                }
-                _ => {}
-            }
-        }
-        ipv4 && ipv6
+        self.ipv4_default_route_approved() && self.ipv6_default_route_approved()
     }
 }
 

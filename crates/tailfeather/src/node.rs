@@ -924,7 +924,9 @@ impl<const PEERS: usize> Node<PEERS> {
                 self.reconcile_peers()?;
                 let status = if !self.netmap.packet_filter.is_valid() {
                     NodeStatus::MapChanged
-                } else if !self.netmap.default_routes_approved() {
+                } else if !self.netmap.ipv4_default_route_approved()
+                    && !self.netmap.ipv6_default_route_approved()
+                {
                     NodeStatus::AwaitingRouteApproval
                 } else {
                     NodeStatus::MapActive
@@ -1469,7 +1471,7 @@ impl<const PEERS: usize> Node<PEERS> {
     pub fn exit_control_ready(&self) -> bool {
         self.netmap.has_assigned_ipv4()
             && self.netmap.packet_filter.is_valid()
-            && self.netmap.default_routes_approved()
+            && self.netmap.ipv4_default_route_approved()
             && self.netmap.home_derp != 0
             && self.connected_derp.contains(&self.netmap.home_derp)
     }
@@ -3447,6 +3449,39 @@ mod tests {
             _ => unreachable!(),
         };
         node.persistence_result(generation, true).unwrap();
+    }
+
+    #[test]
+    fn exit_readiness_uses_the_approved_address_family() {
+        for (routes, ipv4_ready, status) in [
+            ("[]", false, NodeStatus::AwaitingRouteApproval),
+            (r#"["0.0.0.0/0"]"#, true, NodeStatus::MapActive),
+            (r#"["::/0"]"#, false, NodeStatus::MapActive),
+            (r#"["0.0.0.0/0","::/0"]"#, true, NodeStatus::MapActive),
+        ] {
+            let mut node = Node::<1>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+            persisted(&mut node);
+            node.connected_derp.push(9).unwrap();
+            let mut lease = Netmap::new();
+            let mut parser = crate::netmap::Parser::new();
+            let json = std::format!(
+                r#"{{"Node":{{"Addresses":["100.64.0.1/32"],"PrimaryRoutes":{routes}}},"PacketFilter":[]}}"#
+            );
+            parser.push(&mut lease, json.as_bytes()).unwrap();
+            parser.finish(&mut lease).unwrap();
+            lease.home_derp = 9;
+            lease.derp.insert(relay_region(9)).unwrap();
+            assert!(matches!(
+                node.handle_control_event(ControlEvent::MapFinished {
+                    lease: &mut lease,
+                    result: Ok(()),
+                }).unwrap(),
+                Some(NodeAction::StatusChanged(actual)) if actual == status
+            ));
+            assert_eq!(node.exit_control_ready(), ipv4_ready, "routes: {routes}");
+            node.connected_derp.clear();
+            assert!(!node.exit_control_ready());
+        }
     }
 
     #[test]

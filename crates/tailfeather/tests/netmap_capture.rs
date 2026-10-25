@@ -184,6 +184,27 @@ fn both_approved_default_routes_are_required() {
 }
 
 #[test]
+fn default_route_approval_is_independent_and_revocable_per_family() {
+    for field in ["PrimaryRoutes", "AllowedIPs"] {
+        let mut netmap = Netmap::<32>::new();
+        for (routes, ipv4, ipv6) in [
+            (r#"["0.0.0.0/0"]"#, true, false),
+            (r#"["::/0"]"#, false, true),
+            (r#"["0.0.0.0/0","::/0"]"#, true, true),
+            (r#"["0.0.0.0/32","::/128"]"#, false, false),
+            (r#"["0.0.0.0/0"]"#, true, false),
+            ("[]", false, false),
+        ] {
+            let document = format!(r#"{{"Node":{{"{field}":{routes}}}}}"#);
+            apply(&mut netmap, &document, 1);
+            assert_eq!(netmap.ipv4_default_route_approved(), ipv4, "{document}");
+            assert_eq!(netmap.ipv6_default_route_approved(), ipv6, "{document}");
+            assert_eq!(netmap.default_routes_approved(), ipv4 && ipv6, "{document}");
+        }
+    }
+}
+
+#[test]
 fn hosted_allowed_ips_carry_approved_exit_routes() {
     let mut netmap = Netmap::<32>::new();
     apply(
