@@ -1,7 +1,7 @@
 //! Bounded decoding of the basic T.61 (1988) graphic repertoire for X.509 DNs.
 //!
 //! Mapping: ITU-T T.61, Figure 2, Tables 1–2 and Annex B, Figure B-1:
-//! https://www.itu.int/rec/T-REC-T.61-198811-S/en
+//! <https://www.itu.int/rec/T-REC-T.61-198811-S/en>
 //! Prefix accents are emitted after their base as Unicode combining scalars.
 //! Optional national repertoires, escape/shift sequences and presentation
 //! controls are unsupported and rejected, never interpreted as UTF-8/Latin-1.
