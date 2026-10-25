@@ -12,7 +12,7 @@ import { WebSocketServer, createWebSocketStream } from "ws";
 
 const { Server, utils } = ssh2;
 
-function shell(stream) {
+function shell(stream, onCommand) {
   let line = "";
   stream.write("welcome to e2e-sshd\r\n$ ");
   stream.on("data", (data) => {
@@ -45,6 +45,7 @@ function shell(stream) {
           return;
         }
         else if (command.startsWith("echo ")) stream.write(`${command.slice(5)}\r\n`);
+        else if (onCommand(command, stream)) return;
         else if (command) stream.write(`unknown: ${command}\r\n`);
       }
       stream.write("$ ");
@@ -54,6 +55,7 @@ function shell(stream) {
 
 export async function startLocalSsh(httpServer, {
   forwardTarget = null, onForward = () => {}, forwardDelay = () => 0, onForwardClose = () => {},
+  onShellCommand = () => false,
 } = {}) {
   const hostKey = utils.generateKeyPairSync("ed25519");
   const ssh = new Server(
@@ -75,7 +77,8 @@ export async function startLocalSsh(httpServer, {
           onForward(info);
           const delay = forwardDelay(info);
           // Emulate the remote namespace on a separate local backing port.
-          const upstream = connect(forwardTarget.backingPort, "127.0.0.1");
+          const upstream = forwardTarget.backingSocket
+            ? connect(forwardTarget.backingSocket) : connect(forwardTarget.backingPort, "127.0.0.1");
           upstream.on("error", () => { try { reject(); } catch {} });
           upstream.on("connect", () => {
             const open = () => {
@@ -92,7 +95,7 @@ export async function startLocalSsh(httpServer, {
           const session = accept();
           session.on("pty", (acceptPty) => acceptPty && acceptPty());
           session.on("window-change", (acceptChange) => acceptChange && acceptChange());
-          session.on("shell", (acceptShell) => shell(acceptShell()));
+          session.on("shell", (acceptShell) => shell(acceptShell(), onShellCommand));
         });
       });
       client.on("error", () => {});

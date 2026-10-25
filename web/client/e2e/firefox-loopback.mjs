@@ -11,6 +11,7 @@ import { createServer } from "node:net";
 import { createServer as httpServer } from "node:http";
 import { once } from "node:events";
 import { loopbackTest } from "./loopback.mjs";
+import { realRcloneTest } from "./rclone-loopback.mjs";
 
 const script = fileURLToPath(import.meta.url);
 const root = fileURLToPath(new URL("../../../", import.meta.url));
@@ -109,6 +110,7 @@ async function runFirefox(scratch) {
     await send("webExtension.uninstall", { extension: installed.extension });
     await send("webExtension.install", { extensionData: { type: "path", path: join(scratch, "extension") } });
     await loopbackTest(context, { nativeExtension: true });
+    if (process.env.RCLONE_TEST_BINARY) await realRcloneTest(context, process.env.RCLONE_TEST_BINARY);
     console.log("PASS actual Firefox extension/native messaging OAuth and binary forwarding");
   } finally {
     for (const { timer } of pending.values()) clearTimeout(timer);
@@ -146,6 +148,7 @@ if (process.argv[2] === "--inside") {
     const home = await realpath(homedir());
     const dependencies = await realpath(join(root, "web", "client", "node_modules"));
     const browserCache = dirname(dirname(dirname(firefox.executablePath())));
+    const rclone = process.env.RCLONE_TEST_BINARY ? await realpath(process.env.RCLONE_TEST_BINARY) : null;
     const result = spawnSync("bwrap", [
       "--ro-bind", "/", "/", "--bind", "/tmp", "/tmp",
       // A fresh empty home is a mount overlay, never a new HOME environment.
@@ -154,6 +157,7 @@ if (process.argv[2] === "--inside") {
       "--ro-bind", dependencies, dependencies,
       "--ro-bind", dirname(dirname(process.execPath)), dirname(dirname(process.execPath)),
       "--ro-bind", browserCache, browserCache,
+      ...(rclone ? ["--ro-bind", rclone, rclone, "--setenv", "RCLONE_TEST_BINARY", rclone] : []),
       "--bind", mozilla, join(home, ".mozilla"),
       "--dev-bind", "/dev", "/dev", "--proc", "/proc", "--unshare-pid", "--die-with-parent",
       "--setenv", "XDG_CACHE_HOME", join(scratch, "cache"),

@@ -119,6 +119,31 @@ PLAYWRIGHT_BROWSERS_PATH=/tmp/tailfeather-firefox-browsers npx --no-install play
 PLAYWRIGHT_BROWSERS_PATH=/tmp/tailfeather-firefox-browsers npm run test:firefox-loopback
 ```
 
+To also exercise **real rclone authorization and token exchange**, provide the
+pinned rclone v1.75.2 executable through `RCLONE_TEST_BINARY`. For Linux amd64,
+download the official release and verify the pinned archive checksum:
+
+```sh
+curl --fail --location --output /tmp/tailfeather-rclone.zip https://github.com/rclone/rclone/releases/download/v1.75.2/rclone-v1.75.2-linux-amd64.zip
+printf '%s  %s\n' 349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccdf3702 /tmp/tailfeather-rclone.zip | sha256sum --check -
+unzip -p /tmp/tailfeather-rclone.zip rclone-v1.75.2-linux-amd64/rclone > /tmp/tailfeather-rclone
+chmod 700 /tmp/tailfeather-rclone
+RCLONE_TEST_BINARY=/tmp/tailfeather-rclone PLAYWRIGHT_BROWSERS_PATH=/tmp/tailfeather-firefox-browsers npm run test:firefox-loopback
+```
+
+The real-rclone test uses Drive's documented
+[`auth_url` and `token_url` overrides](https://rclone.org/drive/#drive-auth-url)
+to point exclusively at a local mock OAuth provider. Real rclone runs in a
+private network namespace, modeling the remote SSH host's independent loopback
+interface. Private Unix sockets transport raw TCP to the SSH fixture and local
+provider; no service is exposed publicly. Rclone prints its own initial auth URL,
+the browser returns to its unchanged registered `http://127.0.0.1:53682/`, and
+rclone exchanges the code and exits successfully with verified mock access and
+refresh tokens. The command uses `--config /dev/null`; its token output stays
+in memory and is never emitted in test diagnostics. This uses rclone's supported
+OAuth-only [authorize implementation](https://github.com/rclone/rclone/blob/v1.75.2/fs/config/authorize.go),
+with dummy client values, no Google requests, and no real account credentials.
+
 This runner uses Firefox's WebDriver BiDi temporary-add-on installation API. It
 first installs the shipped extension and verifies that local service/callback
 pages cannot create native companion listeners. It then installs a temporary
@@ -147,9 +172,11 @@ isolated in temporary directories; no real browser profile was modified.
 The mock flow also round-trips a 256 KiB binary request/response across frame
 boundaries. CI uses the Chromium runtime shim described above.
 
-This verifies routing and callbacks with a simulated provider. It does not claim
-live Google account authorization or real rclone completion. Those require the
-user's OAuth credentials; the manual sequence above is the acceptance procedure.
+The pinned real-rclone acceptance test also completed locally through the actual
+Firefox extension/native companion and SSH transport, including rclone's token
+exchange and successful exit. The OAuth provider and tokens are local test
+fixtures. Live Google account sign-in remains a manual acceptance step requiring
+the user's OAuth credentials; the sequence above describes that procedure.
 
 To uninstall, remove the extension, its `org.tailfeather.loopback.json` manifest,
 and `~/.local/lib/tailfeather-loopback/`.
