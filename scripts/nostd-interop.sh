@@ -239,14 +239,16 @@ V6_CLIENT=fd7a:115c:a1e0::2
 V6_GATEWAY=fd7a:115c:a1e0::1
 V6_UPLINK=2001:db8:211::1
 V6_SERVER=2001:db8:211::2
+V6_UNROUTABLE=2001:db8:212::2
 ip -n "$CLIENT_NS" -6 addr add "$V6_CLIENT/128" dev wg0 nodad
 ip -n "$GATEWAY_NS" -6 addr add "$V6_UPLINK/64" dev "$GATEWAY_UPLINK" nodad
 ip -n "$SERVER_NS" -6 addr add "$V6_SERVER/64" dev "$SERVER_LINK" nodad
 ip netns exec "$CLIENT_NS" wg set wg0 peer "$(cat "$WORK/gateway.pub")" remove
 ip netns exec "$CLIENT_NS" wg set wg0 peer "$(cat "$WORK/gateway.pub")" \
     endpoint "$UNDERLAY_GATEWAY:$WG_PORT" \
-    allowed-ips "$SERVER/32,$TUNNEL_GATEWAY/32,$V6_SERVER/128,$V6_GATEWAY/128"
+    allowed-ips "$SERVER/32,$TUNNEL_GATEWAY/32,$V6_SERVER/128,$V6_GATEWAY/128,$V6_UNROUTABLE/128"
 ip -n "$CLIENT_NS" -6 route add "$V6_SERVER/128" dev wg0
+ip -n "$CLIENT_NS" -6 route add "$V6_UNROUTABLE/128" dev wg0
 ip -n "$CLIENT_NS" -6 route add "$V6_GATEWAY/128" dev wg0
 ip netns exec "$GATEWAY_NS" ip6tables -A OUTPUT -m mark --mark "$RAW_MARK" -j ACCEPT
 ip netns exec "$GATEWAY_NS" ip6tables -A OUTPUT -p tcp --tcp-flags RST RST \
@@ -264,6 +266,18 @@ ip netns exec "$CLIENT_NS" ping -6 -c 1 -W 3 "$V6_GATEWAY"
 echo "PASS: exit.forward.ipv6.local-echo"
 ip netns exec "$CLIENT_NS" ping -6 -c 2 -W 3 "$V6_SERVER"
 echo "PASS: exit.forward.ipv6.icmp"
+# Real raw send failures must not reserve NAT entries. This off-link test
+# address has no route in the isolated gateway, so its sendto fails before a
+# packet reaches the wire. Thirty-two distinct failed flows must leave room
+# for the successful UDP and TCP exchanges below.
+if ip -n "$GATEWAY_NS" -6 route get "$V6_UNROUTABLE" >"$WORK/udp6-no-route.log" 2>&1; then
+    echo "IPv6 failed-send fixture unexpectedly has an uplink route" >&2
+    exit 1
+fi
+for index in $(seq 1 32); do
+    printf 'rejected-send' | timeout 3 ip netns exec "$CLIENT_NS" socat -u - \
+        "UDP6:[$V6_UNROUTABLE]:42011,sourceport=$((43000 + index))" >>"$WORK/udp6-rejected.log" 2>&1
+done
 # No kernel IPv6 forwarding is enabled: replies must pass the shared no_std
 # translator. The observed server-side source is the uplink, not the tailnet.
 timeout 20 ip netns exec "$SERVER_NS" socat -d -d \
@@ -305,6 +319,7 @@ wait "$V6_TLS_PID"
 grep -q '^HTTP/1.0 200 ok' "$WORK/tcp6-response"
 [[ $(wc -c <"$WORK/tcp6-response") -gt 2048 ]]
 echo "PASS: exit.forward.ipv6.tcp"
+echo "PASS: exit.forward.ipv6.failed-send-state"
 # BusyBox ping's -t does not set the IPv6 unicast hop limit, and its IPv6
 # mode omits received ICMP error text. Set the actual IPv6 route metric and observe the kernel's
 # validated Time Exceeded counter rather than depending on ping's CLI/output.

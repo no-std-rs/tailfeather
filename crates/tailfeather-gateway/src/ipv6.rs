@@ -7,12 +7,15 @@
 //! MTU, following RFC 8200 and RFC 4443.
 
 use core::net::Ipv6Addr;
+use core::num::NonZeroU16;
 
 pub const HEADER: usize = 40;
 pub const MTU: usize = 1280;
 pub const SLOTS: usize = 32;
 const PORT_BASE: u16 = 45_000;
 const IDLE_MS: u64 = 120_000;
+const TCP_CLOSED_GRACE_MS: u64 = 2_000;
+const TCP_PORT_REUSE_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -162,14 +165,165 @@ struct Flow {
     client_port: u16,
     server_port: u16,
     protocol: u8,
-    external_port: u16,
+    // The fixed 45000..=65000 range supplies Option<Flow>'s empty niche, so
+    // exact TCP sequence state costs no additional table space.
+    external_port: NonZeroU16,
     touched: u64,
+    client_next: u32,
+    server_next: u32,
+    tcp_state: u8,
+}
+
+const CLIENT_SEQUENCE: u8 = 1;
+const SERVER_SEQUENCE: u8 = 2;
+const CLIENT_FIN: u8 = 4;
+const SERVER_FIN: u8 = 8;
+
+#[derive(Clone, Copy)]
+struct Tcp {
+    sequence: u32,
+    acknowledgement: u32,
+    next: u32,
+    flags: u8,
+}
+
+impl Tcp {
+    fn parse(packet: &[u8]) -> Self {
+        let sequence = u32::from_be_bytes(packet[44..48].try_into().unwrap());
+        let acknowledgement = u32::from_be_bytes(packet[48..52].try_into().unwrap());
+        let flags = packet[53];
+        let payload = packet.len() - HEADER - usize::from(packet[52] >> 4) * 4;
+        let next = sequence
+            .wrapping_add(payload as u32)
+            .wrapping_add(u32::from(flags & 2 != 0))
+            .wrapping_add(u32::from(flags & 1 != 0));
+        Self {
+            sequence,
+            acknowledgement,
+            next,
+            flags,
+        }
+    }
+    fn opens(self) -> bool {
+        self.flags & 0x17 == 2
+    }
+}
+
+impl Flow {
+    fn closed(self) -> bool {
+        self.protocol == 6
+            && self.tcp_state & (CLIENT_FIN | SERVER_FIN) == (CLIENT_FIN | SERVER_FIN)
+    }
+    fn live(self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.touched)
+            < if self.closed() {
+                TCP_CLOSED_GRACE_MS
+            } else {
+                IDLE_MS
+            }
+    }
+    /// Mirror IPv4's strict reset and in-order FIN checks. Invalid sequence
+    /// flags can still reach the endpoint, but never tear down NAT authority.
+    fn observe_tcp(&mut self, packet: Tcp, outbound: bool) -> bool {
+        if outbound
+            && packet.opens()
+            && self.tcp_state & CLIENT_SEQUENCE != 0
+            && self.client_next != packet.next
+        {
+            self.tcp_state = 0;
+        }
+        let (own_bit, peer_bit, fin_bit, own, peer) = if outbound {
+            (
+                CLIENT_SEQUENCE,
+                SERVER_SEQUENCE,
+                CLIENT_FIN,
+                &mut self.client_next,
+                self.server_next,
+            )
+        } else {
+            (
+                SERVER_SEQUENCE,
+                CLIENT_SEQUENCE,
+                SERVER_FIN,
+                &mut self.server_next,
+                self.client_next,
+            )
+        };
+        let own_known = self.tcp_state & own_bit != 0;
+        let peer_known = self.tcp_state & peer_bit != 0;
+        if packet.flags & 4 != 0 {
+            return if own_known {
+                packet.sequence == *own
+            } else {
+                packet.flags & 0x10 != 0 && peer_known && packet.acknowledgement == peer
+            };
+        }
+        let sequence_valid = if own_known {
+            packet.sequence == *own
+        } else {
+            outbound || packet.flags & 0x10 == 0 || (peer_known && packet.acknowledgement == peer)
+        };
+        if sequence_valid {
+            *own = packet.next;
+            self.tcp_state |= own_bit;
+            if packet.flags & 1 != 0 {
+                self.tcp_state |= fin_bit;
+            }
+        }
+        false
+    }
+}
+
+/// One translated outbound packet, not yet admitted to a network queue.
+/// Dropping this token discards the candidate without allocating, touching or
+/// closing any mapping or advancing the port-generation cursor.
+#[must_use = "commit the prepared mapping only after successful packet enqueue"]
+pub struct Prepared<'a> {
+    gateway: &'a mut Gateway,
+    flow: Flow,
+    uplink: Ipv6Addr,
+    slot: u8,
+    next_port: u16,
+    refresh: bool,
+    retire: bool,
+}
+
+impl Prepared<'_> {
+    pub fn destination(&self) -> Ipv6Addr {
+        self.flow.server
+    }
+    /// Commit only after the caller has successfully enqueued the packet.
+    pub fn commit(mut self, now_ms: u64) {
+        // Publish the ordinary cursor before recording any release. A release
+        // of an older-cycle port may replace it with wrap-pending quarantine.
+        self.gateway.next_port = self.next_port;
+        self.gateway.address(self.uplink, now_ms);
+        let previous = self.gateway.flows[usize::from(self.slot)];
+        if let Some(old) = previous
+            && old.protocol == 6
+            && old.external_port != self.flow.external_port
+        {
+            self.gateway.release_tcp(old.external_port, now_ms);
+        }
+        let first_close = self.flow.closed() && previous.is_some_and(|old| !old.closed());
+        if first_close || (self.flow.protocol == 6 && self.retire) {
+            self.gateway.release_tcp(self.flow.external_port, now_ms);
+        }
+        if self.refresh {
+            self.flow.touched = now_ms;
+        }
+        self.gateway.flows[usize::from(self.slot)] =
+            if self.retire { None } else { Some(self.flow) };
+    }
 }
 
 pub struct Gateway {
     flows: [Option<Flow>; SLOTS],
     uplink: Option<Ipv6Addr>,
     next_port: u16,
+    // One conservative quarantine protects all wrapped TCP tuples without
+    // unbounded per-port state. The deadline starts at release, never open.
+    last_tcp_release_ms: Option<u64>,
     last_error_ms: Option<u64>,
 }
 
@@ -185,15 +339,33 @@ impl Gateway {
             flows: [None; SLOTS],
             uplink: None,
             next_port: PORT_BASE,
+            last_tcp_release_ms: None,
             last_error_ms: None,
         }
     }
 
     /// Forget mappings when the runtime observes a change in authenticated
-    /// address ownership. Preserve port generation so delayed replies cannot
-    /// attach to the replacement owner's first mapping.
-    pub fn clear(&mut self) {
+    /// address ownership. Retain generation and release history so delayed
+    /// replies cannot attach to the replacement owner's first mapping.
+    pub fn clear(&mut self, now_ms: u64) {
+        for index in 0..SLOTS {
+            if let Some(flow) = self.flows[index]
+                && flow.protocol == 6
+            {
+                self.release_tcp(flow.external_port, now_ms);
+            }
+        }
         self.flows.fill(None);
+    }
+
+    fn release_tcp(&mut self, port: NonZeroU16, now_ms: u64) {
+        self.last_tcp_release_ms = Some(now_ms);
+        // In this cycle every newly allocated port is below the cursor. A
+        // released port ahead of it survived a previous wrap: do not revisit
+        // it in the current cycle before its remote TIME_WAIT has elapsed.
+        if self.next_port != 0 && port.get() >= self.next_port {
+            self.next_port = 0;
+        }
     }
 
     /// A shared ten-errors/second bound covers tunnel and uplink failures.
@@ -216,21 +388,20 @@ impl Gateway {
         Some(len)
     }
 
-    fn address(&mut self, uplink: Ipv6Addr) {
+    fn address(&mut self, uplink: Ipv6Addr, now_ms: u64) {
         if self.uplink != Some(uplink) {
-            self.flows.fill(None);
+            self.clear(now_ms);
             self.uplink = Some(uplink);
         }
     }
 
-    pub fn outbound(
+    pub fn prepare_outbound(
         &mut self,
         packet: &mut [u8],
         authenticated_source: Ipv6Addr,
         uplink: Ipv6Addr,
         now_ms: u64,
-    ) -> Result<Ipv6Addr, Error> {
-        self.address(uplink);
+    ) -> Result<Prepared<'_>, Error> {
         let parsed = Packet::parse(packet)?;
         if parsed.source != authenticated_source {
             return Err(Error::SpoofedSource);
@@ -248,67 +419,104 @@ impl Gateway {
         if parsed.protocol == 58 && packet[HEADER] != 128 {
             return Err(Error::Unsupported);
         }
-        let mut slot = self.flows.iter().position(|entry| {
-            entry.is_some_and(|flow| {
-                flow.client == parsed.source
-                    && flow.server == parsed.destination
-                    && flow.client_port == parsed.source_port
-                    && flow.server_port == parsed.destination_port
-                    && flow.protocol == parsed.protocol
-                    && now_ms.saturating_sub(flow.touched) < IDLE_MS
+        let tcp = (parsed.protocol == 6).then(|| Tcp::parse(packet));
+        let same_uplink = self.uplink == Some(uplink);
+        let existing = same_uplink
+            .then(|| {
+                self.flows.iter().position(|entry| {
+                    entry.is_some_and(|flow| {
+                        flow.client == parsed.source
+                            && flow.server == parsed.destination
+                            && flow.client_port == parsed.source_port
+                            && flow.server_port == parsed.destination_port
+                            && flow.protocol == parsed.protocol
+                            && flow.live(now_ms)
+                    })
+                })
             })
-        });
-        if slot.is_none() {
-            // TCP state may only be opened by an initial SYN, never by an ACK
-            // or a mid-stream packet arriving after an idle mapping expired.
-            if parsed.protocol == 6 && packet[HEADER + 13] & 0x17 != 0x02 {
-                return Err(Error::Unsolicited);
-            }
-            slot = self.flows.iter().position(|entry| {
-                entry.is_none_or(|flow| now_ms.saturating_sub(flow.touched) >= IDLE_MS)
-            });
-            let index = slot.ok_or(Error::Capacity)?;
-            let port = loop {
-                let candidate = self.next_port;
-                self.next_port = if candidate == 65_000 {
-                    PORT_BASE
-                } else {
-                    candidate + 1
-                };
-                if self
-                    .flows
-                    .iter()
-                    .all(|entry| entry.is_none_or(|flow| flow.external_port != candidate))
-                {
-                    break candidate;
+            .flatten();
+        let reuse = existing
+            .filter(|&slot| !self.flows[slot].unwrap().closed() || !tcp.is_some_and(Tcp::opens));
+        let (slot, mut flow, next_port) =
+            if let Some(slot) = reuse {
+                (slot, self.flows[slot].unwrap(), self.next_port)
+            } else {
+                if tcp.is_some_and(|tcp| !tcp.opens()) {
+                    return Err(Error::Unsolicited);
                 }
+                let slot = existing
+                    .or_else(|| (!same_uplink).then_some(0))
+                    .or_else(|| self.flows.iter().position(Option::is_none))
+                    .or_else(|| {
+                        self.flows.iter().position(|entry| {
+                            entry.is_some_and(|flow| !flow.live(now_ms) || flow.closed())
+                        })
+                    })
+                    .ok_or(Error::Capacity)?;
+                let mut candidate = self.next_port;
+                let (external_port, next_port) =
+                    loop {
+                        if candidate == 0 {
+                            if self.last_tcp_release_ms.is_some_and(|released| {
+                                now_ms.saturating_sub(released) < TCP_PORT_REUSE_MS
+                            }) {
+                                return Err(Error::Capacity);
+                            }
+                            candidate = PORT_BASE;
+                        }
+                        let next = if candidate == 65_000 {
+                            0
+                        } else {
+                            candidate + 1
+                        };
+                        if self.flows.iter().all(|entry| {
+                            entry.is_none_or(|flow| flow.external_port.get() != candidate)
+                        }) {
+                            break (NonZeroU16::new(candidate).unwrap(), next);
+                        }
+                        candidate = next;
+                    };
+                (
+                    slot,
+                    Flow {
+                        client: parsed.source,
+                        server: parsed.destination,
+                        client_port: parsed.source_port,
+                        server_port: parsed.destination_port,
+                        protocol: parsed.protocol,
+                        external_port,
+                        touched: now_ms,
+                        client_next: 0,
+                        server_next: 0,
+                        tcp_state: 0,
+                    },
+                    next_port,
+                )
             };
-            self.flows[index] = Some(Flow {
-                client: parsed.source,
-                server: parsed.destination,
-                client_port: parsed.source_port,
-                server_port: parsed.destination_port,
-                protocol: parsed.protocol,
-                external_port: port,
-                touched: now_ms,
-            });
-        }
-        let flow = self.flows[slot.unwrap()].as_mut().unwrap();
-        flow.touched = now_ms;
-        let destination = parsed.destination;
+        let refresh = !flow.closed();
+        let retire = tcp.is_some_and(|tcp| flow.observe_tcp(tcp, true));
         let port_offset = if flow.protocol == 58 {
             HEADER + 4
         } else {
             HEADER
         };
         packet[8..24].copy_from_slice(&uplink.octets());
-        packet[port_offset..port_offset + 2].copy_from_slice(&flow.external_port.to_be_bytes());
+        packet[port_offset..port_offset + 2]
+            .copy_from_slice(&flow.external_port.get().to_be_bytes());
         packet[7] -= 1;
         if flow.protocol == 6 {
             clamp_mss(packet);
         }
         update_checksum(packet);
-        Ok(destination)
+        Ok(Prepared {
+            gateway: self,
+            flow,
+            uplink,
+            slot: slot as u8,
+            next_port,
+            refresh,
+            retire,
+        })
     }
 
     /// Return the authenticated client's tailnet address after reversing the
@@ -319,7 +527,7 @@ impl Gateway {
         uplink: Ipv6Addr,
         now_ms: u64,
     ) -> Result<Ipv6Addr, Error> {
-        self.address(uplink);
+        self.address(uplink, now_ms);
         let parsed = Packet::parse(packet)?;
         if parsed.destination != uplink {
             return Err(Error::Unsolicited);
@@ -338,16 +546,17 @@ impl Gateway {
         } else {
             parsed.destination_port
         };
-        let flow = self
+        let slot = self
             .flows
-            .iter_mut()
-            .flatten()
-            .find(|flow| {
-                flow.server == parsed.source
-                    && flow.protocol == parsed.protocol
-                    && flow.external_port == external
-                    && (flow.protocol == 58 || flow.server_port == parsed.source_port)
-                    && now_ms.saturating_sub(flow.touched) < IDLE_MS
+            .iter()
+            .position(|entry| {
+                entry.is_some_and(|flow| {
+                    flow.server == parsed.source
+                        && flow.protocol == parsed.protocol
+                        && flow.external_port.get() == external
+                        && (flow.protocol == 58 || flow.server_port == parsed.source_port)
+                        && flow.live(now_ms)
+                })
             })
             .ok_or(Error::Unsolicited)?;
         if parsed.hop_limit <= 1 {
@@ -356,7 +565,15 @@ impl Gateway {
         if packet.len() > MTU {
             return Err(Error::PacketTooBig);
         }
-        flow.touched = now_ms;
+        let mut flow = self.flows[slot].unwrap();
+        let refresh = !flow.closed();
+        let retire = flow.protocol == 6 && flow.observe_tcp(Tcp::parse(packet), false);
+        if retire || (refresh && flow.closed()) {
+            self.release_tcp(flow.external_port, now_ms);
+        }
+        if refresh {
+            flow.touched = now_ms;
+        }
         let client = flow.client;
         packet[24..40].copy_from_slice(&client.octets());
         let port_offset = if flow.protocol == 58 {
@@ -367,6 +584,7 @@ impl Gateway {
         packet[port_offset..port_offset + 2].copy_from_slice(&flow.client_port.to_be_bytes());
         packet[7] -= 1;
         update_checksum(packet);
+        self.flows[slot] = if retire { None } else { Some(flow) };
         Ok(client)
     }
 
@@ -420,8 +638,8 @@ impl Gateway {
                 flow.server == server
                     && flow.server_port == server_port
                     && flow.protocol == protocol
-                    && flow.external_port == external
-                    && now_ms.saturating_sub(flow.touched) < IDLE_MS
+                    && flow.external_port.get() == external
+                    && flow.live(now_ms)
             })
             .ok_or(Error::Unsolicited)?;
         let client = flow.client;
@@ -558,10 +776,10 @@ pub fn echo_reply(original: &[u8], gateway: Ipv6Addr, out: &mut [u8]) -> Option<
 mod tests {
     use super::*;
 
-    fn address(text: &str) -> Ipv6Addr {
+    pub(super) fn address(text: &str) -> Ipv6Addr {
         text.parse().unwrap()
     }
-    fn udp(
+    pub(super) fn udp(
         source: Ipv6Addr,
         destination: Ipv6Addr,
         source_port: u16,
@@ -582,7 +800,7 @@ mod tests {
         packet
     }
 
-    fn tcp(
+    pub(super) fn tcp(
         source: Ipv6Addr,
         destination: Ipv6Addr,
         source_port: u16,
@@ -604,6 +822,19 @@ mod tests {
         packet
     }
 
+    fn outbound(
+        gateway: &mut Gateway,
+        packet: &mut [u8],
+        client: Ipv6Addr,
+        uplink: Ipv6Addr,
+        now_ms: u64,
+    ) -> Result<Ipv6Addr, Error> {
+        let prepared = gateway.prepare_outbound(packet, client, uplink, now_ms)?;
+        let destination = prepared.destination();
+        prepared.commit(now_ms);
+        Ok(destination)
+    }
+
     #[test]
     fn tcp_requires_syn_and_preserves_checksum_while_clamping_mss() {
         let client = address("fd7a:115c:a1e0::1");
@@ -614,12 +845,12 @@ mod tests {
         packet[53] = 0x10;
         update_checksum(&mut packet);
         assert_eq!(
-            gateway.outbound(&mut packet, client, uplink, 0),
+            outbound(&mut gateway, &mut packet, client, uplink, 0),
             Err(Error::Unsolicited)
         );
         packet[53] = 2;
         update_checksum(&mut packet);
-        gateway.outbound(&mut packet, client, uplink, 0).unwrap();
+        outbound(&mut gateway, &mut packet, client, uplink, 0).unwrap();
         assert_eq!(u16::from_be_bytes([packet[62], packet[63]]), 1220);
         let translated = Packet::parse(&packet).unwrap();
         let mut reply = tcp(server, uplink, 443, translated.source_port);
@@ -641,7 +872,7 @@ mod tests {
         update_checksum(&mut packet);
         let mut gateway = Gateway::new();
         assert_eq!(
-            gateway.outbound(&mut packet, client, uplink, 0),
+            outbound(&mut gateway, &mut packet, client, uplink, 0),
             Err(Error::PacketTooBig)
         );
         let mut reply = [0; MTU];
@@ -675,19 +906,17 @@ mod tests {
         let mut old_port = 0;
         for index in 0..SLOTS {
             let mut packet = udp(client, server, index as u16 + 1000, 443);
-            gateway.outbound(&mut packet, client, uplink, 0).unwrap();
+            outbound(&mut gateway, &mut packet, client, uplink, 0).unwrap();
             if index == 0 {
                 old_port = Packet::parse(&packet).unwrap().source_port;
             }
         }
         let mut packet = udp(client, server, 2000, 443);
         assert_eq!(
-            gateway.outbound(&mut packet, client, uplink, 1),
+            outbound(&mut gateway, &mut packet, client, uplink, 1),
             Err(Error::Capacity)
         );
-        gateway
-            .outbound(&mut packet, client, uplink, IDLE_MS)
-            .unwrap();
+        outbound(&mut gateway, &mut packet, client, uplink, IDLE_MS).unwrap();
         assert_ne!(Packet::parse(&packet).unwrap().source_port, old_port);
         assert_eq!(
             gateway.inbound(&mut udp(server, uplink, 443, old_port), uplink, IDLE_MS + 1),
@@ -702,7 +931,10 @@ mod tests {
         let uplink = address("2001:db8::1");
         let mut gateway = Gateway::new();
         let mut packet = udp(client, server, 12345, 443);
-        assert_eq!(gateway.outbound(&mut packet, client, uplink, 0), Ok(server));
+        assert_eq!(
+            outbound(&mut gateway, &mut packet, client, uplink, 0),
+            Ok(server)
+        );
         let translated = Packet::parse(&packet).unwrap();
         assert_eq!(translated.source, uplink);
         assert_eq!(translated.hop_limit, 63);
@@ -728,25 +960,25 @@ mod tests {
         let mut packet = udp(client, server, 12345, 443);
         packet[46] ^= 1;
         assert_eq!(
-            gateway.outbound(&mut packet, client, uplink, 0),
+            outbound(&mut gateway, &mut packet, client, uplink, 0),
             Err(Error::Malformed)
         );
         let mut packet = udp(client, server, 12345, 443);
         assert_eq!(
-            gateway.outbound(&mut packet, server, uplink, 0),
+            outbound(&mut gateway, &mut packet, server, uplink, 0),
             Err(Error::SpoofedSource)
         );
         for bad in ["::1", "::", "fe80::1", "ff02::1", "::ffff:192.0.2.1"] {
             let mut packet = udp(client, address(bad), 12345, 443);
             assert_eq!(
-                gateway.outbound(&mut packet, client, uplink, 0),
+                outbound(&mut gateway, &mut packet, client, uplink, 0),
                 Err(Error::IsolatedDestination)
             );
         }
         let mut packet = udp(client, server, 12345, 443);
         packet[7] = 1;
         assert_eq!(
-            gateway.outbound(&mut packet, client, uplink, 0),
+            outbound(&mut gateway, &mut packet, client, uplink, 0),
             Err(Error::ExpiredHopLimit)
         );
         let mut reply = [0; MTU];
@@ -763,7 +995,7 @@ mod tests {
         let uplink = address("2001:db8::1");
         let mut gateway = Gateway::new();
         let mut packet = udp(client, server, 12345, 443);
-        gateway.outbound(&mut packet, client, uplink, 0).unwrap();
+        outbound(&mut gateway, &mut packet, client, uplink, 0).unwrap();
         let port = Packet::parse(&packet).unwrap().source_port;
         assert_eq!(
             gateway.inbound(&mut udp(server, uplink, 443, port), uplink, IDLE_MS),
@@ -786,11 +1018,11 @@ mod tests {
         let uplink = address("2001:db8::1");
         let mut gateway = Gateway::new();
         let mut packet = udp(client, server, 12345, 443);
-        gateway.outbound(&mut packet, client, uplink, 0).unwrap();
+        outbound(&mut gateway, &mut packet, client, uplink, 0).unwrap();
         let old_port = Packet::parse(&packet).unwrap().source_port;
-        gateway.clear();
+        gateway.clear(1);
         let mut packet = udp(client, server, 12345, 443);
-        gateway.outbound(&mut packet, client, uplink, 1).unwrap();
+        outbound(&mut gateway, &mut packet, client, uplink, 1).unwrap();
         assert_ne!(Packet::parse(&packet).unwrap().source_port, old_port);
         assert_eq!(
             gateway.inbound(&mut udp(server, uplink, 443, old_port), uplink, 2),
@@ -805,7 +1037,7 @@ mod tests {
         let uplink = address("2001:db8::1");
         let mut gateway = Gateway::new();
         let mut packet = udp(client, server, 12345, 443);
-        gateway.outbound(&mut packet, client, uplink, 0).unwrap();
+        outbound(&mut gateway, &mut packet, client, uplink, 0).unwrap();
         let mut reply = [0; MTU];
         let len = error_reply(&packet, server, Error::PacketTooBig, &mut reply).unwrap();
         assert_eq!(gateway.inbound(&mut reply[..len], uplink, 1), Ok(client));
@@ -820,7 +1052,7 @@ mod tests {
         let uplink = address("2001:db8::1");
         let mut gateway = Gateway::new();
         let mut packet = udp(client, server, 12345, 443);
-        gateway.outbound(&mut packet, client, uplink, 0).unwrap();
+        outbound(&mut gateway, &mut packet, client, uplink, 0).unwrap();
         let mut reply = [0; MTU];
         let len = error_reply(&packet, server, Error::PacketTooBig, &mut reply).unwrap();
         // Keep the outer checksum valid to reach quotation validation.
@@ -841,3 +1073,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ipv6_lifecycle_tests.rs"]
+mod lifecycle_tests;

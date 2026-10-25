@@ -12,6 +12,14 @@ source translation through 32 fixed flow slots. It validates transport
 checksums, binds sources to authenticated peer addresses, decrements hop limits,
 clamps TCP MSS to the 1280-byte tunnel MTU, and reverses validated ICMPv6 error
 quotations. Time Exceeded and Packet Too Big replies are bounded and rate limited.
+Outbound translation returns a prepared mapping that the caller commits only
+once its network queue accepts the packet; failed sends leave flow and lifetime
+state unchanged. TCP tracks both sequence spaces, validates reset/FIN closure,
+and retains completed FIN mappings for a fixed two-second grace without letting
+late ACKs extend it. Closed slots can be reclaimed under pressure with a fresh
+external port. Reusing a TCP port after the bounded port counter wraps requires
+60 seconds since the latest release; ownership clears retain that history.
+Active UDP and echo mappings keep their 120-second idle lifetime.
 Firmware and the bare harness use this same implementation; namespace tests
 exercise real kernel IPv6 UDP, multi-packet TCP/TLS, echo and expired hop limits.
 

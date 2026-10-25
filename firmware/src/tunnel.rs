@@ -487,7 +487,7 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
                     .by_node_key(key)
                     .is_none_or(|peer| peer.tailscale_ipv6() != Some(*address))
             }) {
-                ipv6_gateway.clear();
+                ipv6_gateway.clear(now_ms());
             }
             ipv6_owners.clear();
             for peer in node.netmap().peers.iter() {
@@ -1057,28 +1057,25 @@ async fn handle_delivered_ipv6(
     }
     let result = if let Some(out) = scratch.inner.get_mut(..packet.len()) {
         out.copy_from_slice(packet);
-        gateway.outbound(out, source, uplink, now_ms())
+        gateway.prepare_outbound(out, source, uplink, now_ms())
     } else {
         Err(ipv6::Error::PacketTooBig)
     };
-    match result {
-        Ok(_) => {
-            let _ = socket.send(&scratch.inner[..packet.len()]).await;
-        }
-        Err(error) => {
-            if let Some(our_tunnel_ip) = assigned_ipv6(node)
-                && let Some(len) = gateway.error_response(
-                    packet,
-                    our_tunnel_ip,
-                    error,
-                    now_ms(),
-                    &mut scratch.inner,
-                )
-            {
-                encapsulate_and_send(node, peer, &scratch.inner[..len], wg_socket, derp_regions)
-                    .await;
+    let error = match result {
+        Ok(prepared) => {
+            if socket.send(&scratch.inner[..packet.len()]).await {
+                prepared.commit(now_ms());
             }
+            None
         }
+        Err(error) => Some(error),
+    };
+    if let Some(error) = error
+        && let Some(our_tunnel_ip) = assigned_ipv6(node)
+        && let Some(len) =
+            gateway.error_response(packet, our_tunnel_ip, error, now_ms(), &mut scratch.inner)
+    {
+        encapsulate_and_send(node, peer, &scratch.inner[..len], wg_socket, derp_regions).await;
     }
 }
 

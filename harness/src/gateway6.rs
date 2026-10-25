@@ -58,24 +58,32 @@ pub fn run(config: wg::Config, uplink: Ipv6Addr, client: Ipv6Addr, tunnel_ip: Ip
                                 reply_len = Some(len);
                             } else if packet.len() <= inner.len() {
                                 inner[..packet.len()].copy_from_slice(packet);
-                                match gateway.outbound(
+                                let error = match gateway.prepare_outbound(
                                     &mut inner[..packet.len()],
                                     client,
                                     uplink,
                                     clock.millis(),
                                 ) {
-                                    Ok(destination) => {
-                                        let _ = raw.send(&inner[..packet.len()], destination).await;
+                                    Ok(prepared) => {
+                                        if raw
+                                            .send(&inner[..packet.len()], prepared.destination())
+                                            .await
+                                            == Ok(packet.len())
+                                        {
+                                            prepared.commit(clock.millis());
+                                        }
+                                        None
                                     }
-                                    Err(error) => {
-                                        reply_len = gateway.error_response(
-                                            packet,
-                                            tunnel_ip,
-                                            error,
-                                            clock.millis(),
-                                            &mut inner,
-                                        )
-                                    }
+                                    Err(error) => Some(error),
+                                };
+                                if let Some(error) = error {
+                                    reply_len = gateway.error_response(
+                                        packet,
+                                        tunnel_ip,
+                                        error,
+                                        clock.millis(),
+                                        &mut inner,
+                                    );
                                 }
                             } else if ipv6::Packet::parse(packet).is_ok_and(|p| p.source == client)
                             {
