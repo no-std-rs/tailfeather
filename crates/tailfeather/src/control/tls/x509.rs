@@ -1635,14 +1635,18 @@ fn hostname_matches_san(hostname: &str, input: &[u8]) -> bool {
     let Ok(sequence) = single_tlv(input, 0x30) else {
         return false;
     };
-    let ipv4 = core::net::Ipv4Addr::from_str(hostname).ok();
+    let ip = core::net::IpAddr::from_str(hostname).ok();
     let mut offset = 0;
     while offset < sequence.value.len() {
         let Ok(name) = next_tlv(sequence.value, &mut offset) else {
             return false;
         };
-        if let Some(address) = ipv4 {
-            if name.tag == 0x87 && name.value == address.octets() {
+        if let Some(address) = ip {
+            let matches = match address {
+                core::net::IpAddr::V4(address) => name.value == address.octets(),
+                core::net::IpAddr::V6(address) => name.value == address.octets(),
+            };
+            if name.tag == 0x87 && matches {
                 return true;
             }
         } else if name.tag == 0x82 && dns_name_matches(name.value, hostname.as_bytes()) {
@@ -1692,6 +1696,21 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use embedded_tls::{CertificateVerifyRef, SignatureScheme, TlsVerifier as _};
+
+    #[test]
+    fn ip_certificate_identities_match_their_complete_address_family() {
+        let ipv6 = [
+            0x30, 0x12, 0x87, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        let ipv4 = [0x30, 0x06, 0x87, 0x04, 127, 0, 0, 1];
+        assert!(hostname_matches_san("::1", &ipv6));
+        assert!(hostname_matches_san("0:0:0:0:0:0:0:1", &ipv6));
+        assert!(!hostname_matches_san("::2", &ipv6));
+        assert!(!hostname_matches_san("127.0.0.1", &ipv6));
+        assert!(hostname_matches_san("127.0.0.1", &ipv4));
+        assert!(!hostname_matches_san("::ffff:127.0.0.1", &ipv4));
+        assert!(!hostname_matches_san("localhost", &ipv6));
+    }
 
     struct CaptureClock;
     impl TlsClock for CaptureClock {
