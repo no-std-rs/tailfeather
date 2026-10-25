@@ -120,10 +120,11 @@ struct StoredDestination {
     last_port: u16,
 }
 #[derive(Debug, Clone)]
-struct StoredFilterRule {
+struct StoredRule {
     sources: Vec<StoredNetwork, MAX_FILTER_SOURCES>,
     destinations: Vec<StoredDestination, MAX_FILTER_DESTINATIONS>,
-    protocols: Vec<u8, MAX_FILTER_PROTOCOLS>,
+    protocols: Vec<u8, MAX_FILTER_PROTOCOLS, u8>,
+    set: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,15 +168,23 @@ impl Default for FilterRule {
 }
 
 #[derive(Debug, Clone)]
-struct StoredRule {
-    set: u8,
-    rule: StoredFilterRule,
-}
-
-#[derive(Debug, Clone)]
 struct FilterSet {
     name: String<MAX_FILTER_SET_NAME>,
     id: u8,
+}
+
+/// An interned range needs no address-family tag: this pool stores only IPv6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V6Range {
+    first: [u8; 16],
+    last: [u8; 16],
+}
+
+impl V6Range {
+    const EMPTY: Self = Self {
+        first: [0; 16],
+        last: [0; 16],
+    };
 }
 
 /// Incremental named filter sets with one global rule bound.
@@ -184,7 +193,8 @@ pub struct PacketPolicy {
     sets: Vec<FilterSet, MAX_FILTER_SETS>,
     rules: Vec<StoredRule, MAX_FILTER_RULES>,
     valid: bool,
-    v6_networks: [Option<Network>; MAX_V6_NETWORKS],
+    v6_networks: [V6Range; MAX_V6_NETWORKS],
+    v6_occupied: [u32; MAX_V6_NETWORKS.div_ceil(32)],
 }
 
 impl PacketPolicy {
@@ -193,7 +203,8 @@ impl PacketPolicy {
             sets: Vec::new(),
             rules: Vec::new(),
             valid: false,
-            v6_networks: [None; MAX_V6_NETWORKS],
+            v6_networks: [V6Range::EMPTY; MAX_V6_NETWORKS],
+            v6_occupied: [0; MAX_V6_NETWORKS.div_ceil(32)],
         }
     }
 
@@ -224,6 +235,7 @@ impl PacketPolicy {
         }
         self.valid = source.valid;
         self.v6_networks = source.v6_networks;
+        self.v6_occupied = source.v6_occupied;
     }
 
     pub fn mark_present(&mut self) {
@@ -264,7 +276,8 @@ impl PacketPolicy {
     pub fn clear(&mut self) {
         self.sets.clear();
         self.rules.clear();
-        self.v6_networks.fill(None);
+        self.v6_networks.fill(V6Range::EMPTY);
+        self.v6_occupied.fill(0);
         self.valid = true;
     }
 
@@ -279,10 +292,11 @@ impl PacketPolicy {
             .map(|entry| entry.id)
             .ok_or(Error::Malformed)?;
         let result = (|| {
-            let mut compact = StoredFilterRule {
+            let mut compact = StoredRule {
                 sources: Vec::new(),
                 destinations: Vec::new(),
-                protocols: rule.protocols,
+                protocols: rule.protocols.cast_len_type(),
+                set,
             };
             for network in rule.sources {
                 let network = self.store_network(network)?;
@@ -303,7 +317,7 @@ impl PacketPolicy {
                     .map_err(|_| Error::Full(CapacityError::PacketPolicy))?;
             }
             self.rules
-                .push(StoredRule { set, rule: compact })
+                .push(compact)
                 .map_err(|_| Error::Full(CapacityError::PacketPolicy))
         })();
         if result.is_err() {
@@ -320,13 +334,13 @@ impl PacketPolicy {
             }),
             Network::V4 { first, last } if first <= last => Ok(StoredNetwork { first, last }),
             Network::V6 { first, last } if first <= last => {
-                let index = self
-                    .v6_networks
-                    .iter()
-                    .position(|entry| *entry == Some(network))
-                    .or_else(|| self.v6_networks.iter().position(Option::is_none))
+                let range = V6Range { first, last };
+                let index = (0..MAX_V6_NETWORKS)
+                    .find(|&index| self.v6_used(index) && self.v6_networks[index] == range)
+                    .or_else(|| (0..MAX_V6_NETWORKS).find(|&index| !self.v6_used(index)))
                     .ok_or(Error::Full(CapacityError::PacketPolicy))?;
-                self.v6_networks[index] = Some(network);
+                self.v6_networks[index] = range;
+                self.v6_occupied[index / 32] |= 1 << (index % 32);
                 Ok(StoredNetwork {
                     first: index as u32 + 1,
                     last: 0,
@@ -344,31 +358,38 @@ impl PacketPolicy {
         } else if stored.first == u32::MAX {
             Some(Network::Any)
         } else {
+            let index = stored.first as usize - 1;
             self.v6_networks
-                .get(stored.first as usize - 1)
-                .copied()
-                .flatten()
+                .get(index)
+                .filter(|_| self.v6_used(index))
+                .map(|range| Network::V6 {
+                    first: range.first,
+                    last: range.last,
+                })
         }
+    }
+    fn v6_used(&self, index: usize) -> bool {
+        self.v6_occupied[index / 32] & (1 << (index % 32)) != 0
     }
     fn collect_networks(&mut self) {
         for index in 0..MAX_V6_NETWORKS {
             let used = self.rules.iter().any(|stored| {
                 stored
-                    .rule
                     .sources
                     .iter()
-                    .chain(stored.rule.destinations.iter().map(|d| &d.network))
+                    .chain(stored.destinations.iter().map(|d| &d.network))
                     .any(|network| network.first == index as u32 + 1 && network.last == 0)
             });
             if !used {
-                self.v6_networks[index] = None;
+                self.v6_networks[index] = V6Range::EMPTY;
+                self.v6_occupied[index / 32] &= !(1 << (index % 32));
             }
         }
     }
     fn allows_ip(&self, source: IpAddr, destination: IpAddr, protocol: u8, port: u16) -> bool {
         self.valid
             && self.rules.iter().any(|stored| {
-                let rule = &stored.rule;
+                let rule = stored;
                 (rule.protocols.is_empty() || rule.protocols.contains(&protocol))
                     && rule
                         .sources
@@ -426,7 +447,7 @@ impl PacketPolicy {
     pub fn allows_dns_from(&self, source: Ipv4Addr) -> bool {
         self.valid
             && self.rules.iter().any(|stored| {
-                let rule = &stored.rule;
+                let rule = stored;
                 (rule.protocols.is_empty() || rule.protocols.contains(&17))
                     && rule.sources.iter().any(|network| {
                         self.network(*network)
@@ -547,6 +568,29 @@ mod tests {
     }
 
     #[test]
+    fn zero_ipv6_range_survives_copy_and_reclaims_without_aliasing_free_slots() {
+        let mut policy = PacketPolicy::new();
+        policy.replace_set("zero").unwrap();
+        let mut rule = any_rule();
+        rule.sources.clear();
+        rule.sources
+            .push(Network::parse("::/128").unwrap())
+            .unwrap();
+        policy.push_rule("zero", rule).unwrap();
+        let source = "::".parse().unwrap();
+        let destination = "2001:db8::1".parse().unwrap();
+        let mut copied = PacketPolicy::new();
+        copied.copy_from(&policy);
+        policy.clear();
+        assert!(!policy.allows_ip(source, destination, 6, 443));
+        assert!(copied.allows_ip(source, destination, 6, 443));
+        assert!(!copied.allows_ip("::1".parse().unwrap(), destination, 6, 443));
+        copied.delete_set("zero");
+        assert!(!copied.allows_ip(source, destination, 6, 443));
+        assert!(copied.v6_occupied.iter().all(|word| *word == 0));
+    }
+
+    #[test]
     fn replacing_named_sets_reclaims_interned_ipv6_networks() {
         let mut policy = PacketPolicy::new();
         for index in 0..MAX_V6_NETWORKS * 2 {
@@ -558,7 +602,14 @@ mod tests {
             write!(&mut text, "2001:db8::{index:x}").unwrap();
             rule.sources.push(Network::parse(&text).unwrap()).unwrap();
             policy.push_rule("rotating", rule).unwrap();
-            assert_eq!(policy.v6_networks.iter().flatten().count(), 1);
+            assert_eq!(
+                policy
+                    .v6_occupied
+                    .iter()
+                    .map(|word| word.count_ones())
+                    .sum::<u32>(),
+                1
+            );
         }
     }
 

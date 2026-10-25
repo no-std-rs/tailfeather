@@ -25,7 +25,7 @@ mod tunnel;
 mod wifi;
 
 use embassy_executor::Spawner;
-use embassy_net::{Runner, StackResources};
+use embassy_net::{Runner, StackResources, driver::Driver as _};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::rng::Rng;
@@ -68,11 +68,11 @@ const fn decimal_u64(text: &str) -> u64 {
     value
 }
 
-/// Backs the smoltcp sockets owned by the stack: DHCP, WireGuard, shared UDP,
-/// TCP and ICMP raw forwarding (peer-API DNS shares raw UDP), control, two DERP
+/// Backs the smoltcp sockets owned by the stack: DHCP, WireGuard, shared raw
+/// IPv4/IPv6 forwarding (including peer-API DNS), control, two DERP
 /// connections, and transient bootstrap DNS/STUN/NTP use. NAT table capacity
 /// no longer consumes socket handles.
-static STACK_RESOURCES: StaticCell<StackResources<13>> = StaticCell::new();
+static STACK_RESOURCES: StaticCell<StackResources<10>> = StaticCell::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -105,6 +105,13 @@ async fn main(spawner: Spawner) -> ! {
         .with_tx_queue_size(6);
     let (wifi_controller, interfaces) = esp_radio::wifi::new(peripherals.WIFI, radio_config)
         .expect("Failed to initialize Wi-Fi controller");
+
+    // Embassy's Ethernet driver MTU includes the 14-byte Ethernet header.
+    // Check configuration changes against the complete-IP receive arena.
+    assert!(
+        interfaces.station.capabilities().max_transmission_unit <= tunnel::UPLINK_IP_MTU + 14,
+        "Wi-Fi IP MTU exceeds forwarding receive buffer"
+    );
 
     let rng = Rng::new();
     // smoltcp randomizes ephemeral ports and the DHCP transaction ID from this.

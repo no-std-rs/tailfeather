@@ -11,9 +11,9 @@ use core::task::Poll;
 
 use embassy_executor::Spawner;
 use embassy_futures::poll_once;
-use embassy_futures::select::{Either, Either6, select, select6};
+use embassy_futures::select::{Either, Either4, select, select4};
 use embassy_net::dns::DnsQueryType;
-use embassy_net::raw::{IpProtocol, IpVersion, RawSocket};
+use embassy_net::raw::RawSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpEndpoint, Ipv4Address, Stack, raw, udp};
 use embassy_time::{Duration, Timer};
@@ -42,11 +42,6 @@ fn ipv6_uplink(stack: Stack<'_>) -> Option<core::net::Ipv6Addr> {
     ipv6::routable(address).then_some(address)
 }
 
-static V6_RX_META: StaticCell<[raw::PacketMetadata; 4]> = StaticCell::new();
-static V6_TX_META: StaticCell<[raw::PacketMetadata; 4]> = StaticCell::new();
-static V6_RX_BUFFER: StaticCell<[u8; ipv6::MTU * 2]> = StaticCell::new();
-static V6_TX_BUFFER: StaticCell<[u8; ipv6::MTU]> = StaticCell::new();
-
 /// The port we listen on, and the one the peer's `Endpoint` must point at.
 pub(crate) const LISTEN_PORT: u16 = 51820;
 
@@ -65,6 +60,10 @@ pub(crate) const PEERS: usize = 3;
 /// or DNS message. Keep the RX payload arena aligned with its metadata slots:
 /// undersizing it silently discards otherwise valid input.
 const WG_DATAGRAM_LEN: usize = wirefeather::MAX_DATAGRAM_LEN;
+// Full IP packets from the Ethernet Wi-Fi uplink, including oversized tunnel
+// replies that must receive PTB. main checks the actual driver MTU at startup.
+pub(crate) const UPLINK_IP_MTU: usize = 1500;
+const _: () = assert!(WG_DATAGRAM_LEN <= UPLINK_IP_MTU);
 const WG_RX_PACKETS: usize = 2;
 const WG_TX_PACKETS: usize = 1;
 const WG_RX_BUFFER_LEN: usize = WG_RX_PACKETS * WG_DATAGRAM_LEN;
@@ -82,7 +81,6 @@ static WG_TX_BUFFER: StaticCell<[u8; WG_TX_BUFFER_LEN]> = StaticCell::new();
 const TCP_RAW_RX_ARENA_PACKETS: usize = 4;
 const TCP_CLIENT_WINDOW_PACKETS: u16 = 4;
 const TCP_RAW_RX_BUFFER_LEN: usize = TCP_RAW_RX_ARENA_PACKETS * wirefeather::budget::INNER_MTU;
-const TCP_RAW_TX_BUFFER_LEN: usize = 2_048;
 const TCP_RAW_PACKETS: usize = 24;
 const CLIENT_TCP_RECEIVE_WINDOW: u16 = TCP_CLIENT_WINDOW_PACKETS * nat::MAX_MSS;
 const SERVER_TCP_RECEIVE_WINDOW: u16 = nat::MAX_MSS;
@@ -90,35 +88,27 @@ const SERVER_TCP_RECEIVE_WINDOW: u16 = nat::MAX_MSS;
 const _: () = assert!(CLIENT_TCP_RECEIVE_WINDOW as usize <= TCP_RAW_RX_BUFFER_LEN);
 const _: () = assert!(SERVER_TCP_RECEIVE_WINDOW as usize <= WG_DATAGRAM_LEN);
 
-static RAW_RX_META: StaticCell<[raw::PacketMetadata; TCP_RAW_PACKETS]> = StaticCell::new();
-static RAW_TX_META: StaticCell<[raw::PacketMetadata; TCP_RAW_PACKETS]> = StaticCell::new();
-static RAW_RX_BUFFER: StaticCell<[u8; TCP_RAW_RX_BUFFER_LEN]> = StaticCell::new();
-static RAW_TX_BUFFER: StaticCell<[u8; TCP_RAW_TX_BUFFER_LEN]> = StaticCell::new();
-
 /// All 32 UDP mappings share this raw socket. This replaces four independently
 /// buffered datagram sockets and funds the peer API's bounded connection state.
 const UDP_RAW_BUFFER_LEN: usize = wirefeather::budget::INNER_MTU;
 const UDP_RAW_PACKETS: usize = 4;
-static UDP_RAW_RX_META: StaticCell<[raw::PacketMetadata; UDP_RAW_PACKETS]> = StaticCell::new();
-static UDP_RAW_TX_META: StaticCell<[raw::PacketMetadata; UDP_RAW_PACKETS]> = StaticCell::new();
-static UDP_RAW_RX_BUFFER: StaticCell<[u8; UDP_RAW_BUFFER_LEN]> = StaticCell::new();
-// This arena used to live in RTC-fast, which had "exactly enough" room for it.
-// Exactly enough is not a budget: the next static to grow overflowed the bank,
-// and the one that grew was the staged netmap, which is the one occupant RTC
-// exists for. A transient TX arena retains nothing across a reset and has no
-// business competing for retained memory, so it sits in .bss and the 1,280
-// bytes of stack headroom it costs are bought back from the radio heap the way
-// the rest of this trade is — see the memory.x patch and `heap_allocator!`.
-static UDP_RAW_TX_BUFFER: StaticCell<[u8; UDP_RAW_BUFFER_LEN]> = StaticCell::new();
-
 /// Echo diagnostics need only small packets; bounding these arenas leaves
 /// main-stack headroom for the control TLS handshake.
 const ICMP_RAW_BUFFER_LEN: usize = 128;
 const ICMP_RAW_PACKETS: usize = 4;
-static ICMP_RX_META: StaticCell<[raw::PacketMetadata; ICMP_RAW_PACKETS]> = StaticCell::new();
-static ICMP_TX_META: StaticCell<[raw::PacketMetadata; ICMP_RAW_PACKETS]> = StaticCell::new();
-static ICMP_RX_BUFFER: StaticCell<[u8; ICMP_RAW_BUFFER_LEN]> = StaticCell::new();
-static ICMP_TX_BUFFER: StaticCell<[u8; ICMP_RAW_BUFFER_LEN]> = StaticCell::new();
+// One raw socket accepts both IP versions and dispatches by protocol. Keep the
+// sum of the previous per-protocol RX payload and metadata capacities, including
+// two full IPv6 packets, so sharing does not trim a receive-window burst.
+const UPLINK_RAW_RX_BUFFER_LEN: usize =
+    TCP_RAW_RX_BUFFER_LEN + UDP_RAW_BUFFER_LEN + ICMP_RAW_BUFFER_LEN + ipv6::MTU * 2;
+const UPLINK_RAW_PACKETS: usize = TCP_RAW_PACKETS + UDP_RAW_PACKETS + ICMP_RAW_PACKETS + 4;
+// The actor builds one <=1280-byte packet at a time. A single shared TX slot
+// applies backpressure while the independent network task empties it.
+const UPLINK_RAW_TX_BUFFER_LEN: usize = wirefeather::budget::INNER_MTU;
+static RAW_RX_META: StaticCell<[raw::PacketMetadata; UPLINK_RAW_PACKETS]> = StaticCell::new();
+static RAW_TX_META: StaticCell<[raw::PacketMetadata; 1]> = StaticCell::new();
+static RAW_RX_BUFFER: StaticCell<[u8; UPLINK_RAW_RX_BUFFER_LEN]> = StaticCell::new();
+static RAW_TX_BUFFER: StaticCell<[u8; UPLINK_RAW_TX_BUFFER_LEN]> = StaticCell::new();
 
 /// Fixed source port for raw upstream peer-API DNS. It is outside both NAT
 /// ranges, so replies are unambiguous before their DNS tuple is checked.
@@ -143,7 +133,7 @@ struct Scratch {
     /// Include the full 1500-byte uplink IP packet even when it exceeds the
     /// 1280-byte tunnel MTU, so IPv6 can send Packet Too Big instead of losing
     /// it in RawSocket::recv as a truncated packet.
-    datagram: [u8; 2048],
+    datagram: [u8; UPLINK_IP_MTU],
     /// An inner packet we have built and are about to encapsulate.
     inner: [u8; wirefeather::budget::INNER_MTU],
 }
@@ -380,7 +370,7 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
         .address();
     let endpoint_refresh_at = embassy_time::Instant::now() + Duration::from_secs(30 * 60);
     let scratch = SCRATCH.init(Scratch {
-        datagram: [0; 2048],
+        datagram: [0; UPLINK_IP_MTU],
         inner: [0; wirefeather::budget::INNER_MTU],
     });
     crate::derp::start(spawner, stack);
@@ -396,49 +386,20 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
     );
     wg_socket.bind(LISTEN_PORT).expect("port 51820 is free");
 
-    let udp_raw_socket = RawSocket::new(
-        stack,
-        Some(IpVersion::Ipv4),
-        Some(IpProtocol::Udp),
-        UDP_RAW_RX_META.init([raw::PacketMetadata::EMPTY; UDP_RAW_PACKETS]),
-        UDP_RAW_RX_BUFFER.init([0; UDP_RAW_BUFFER_LEN]),
-        UDP_RAW_TX_META.init([raw::PacketMetadata::EMPTY; UDP_RAW_PACKETS]),
-        UDP_RAW_TX_BUFFER.init([0; UDP_RAW_BUFFER_LEN]),
-    );
-    let mut table = nat::Table::new();
-
-    // One raw socket handles all TCP. Unlike UDP, a forwarded connection
-    // cannot use a `TcpSocket`, because that would terminate the connection
-    // here rather than pass it through.
+    // smoltcp raw sockets with neither filter accept complete IPv4 and IPv6
+    // packets; normal UDP/TCP socket delivery still proceeds independently.
     let raw_socket = RawSocket::new(
         stack,
-        Some(IpVersion::Ipv4),
-        Some(IpProtocol::Tcp),
-        RAW_RX_META.init([raw::PacketMetadata::EMPTY; TCP_RAW_PACKETS]),
-        RAW_RX_BUFFER.init([0; TCP_RAW_RX_BUFFER_LEN]),
-        RAW_TX_META.init([raw::PacketMetadata::EMPTY; TCP_RAW_PACKETS]),
-        RAW_TX_BUFFER.init([0; TCP_RAW_TX_BUFFER_LEN]),
-    );
-    let mut tcp_table = nat::TcpTable::new();
-    let icmp_socket = RawSocket::new(
-        stack,
-        Some(IpVersion::Ipv4),
-        Some(IpProtocol::Icmp),
-        ICMP_RX_META.init([raw::PacketMetadata::EMPTY; ICMP_RAW_PACKETS]),
-        ICMP_RX_BUFFER.init([0; ICMP_RAW_BUFFER_LEN]),
-        ICMP_TX_META.init([raw::PacketMetadata::EMPTY; ICMP_RAW_PACKETS]),
-        ICMP_TX_BUFFER.init([0; ICMP_RAW_BUFFER_LEN]),
-    );
-    let mut icmp_table = nat::IcmpTable::new();
-    let ipv6_socket = RawSocket::new(
-        stack,
-        Some(IpVersion::Ipv6),
         None,
-        V6_RX_META.init([raw::PacketMetadata::EMPTY; 4]),
-        V6_RX_BUFFER.init([0; ipv6::MTU * 2]),
-        V6_TX_META.init([raw::PacketMetadata::EMPTY; 4]),
-        V6_TX_BUFFER.init([0; ipv6::MTU]),
+        None,
+        RAW_RX_META.init([raw::PacketMetadata::EMPTY; UPLINK_RAW_PACKETS]),
+        RAW_RX_BUFFER.init([0; UPLINK_RAW_RX_BUFFER_LEN]),
+        RAW_TX_META.init([raw::PacketMetadata::EMPTY; 1]),
+        RAW_TX_BUFFER.init([0; UPLINK_RAW_TX_BUFFER_LEN]),
     );
+    let mut table = nat::Table::new();
+    let mut tcp_table = nat::TcpTable::new();
+    let mut icmp_table = nat::IcmpTable::new();
     let mut ipv6_gateway = ipv6::Gateway::new();
     let mut ipv6_owners: heapless::Vec<(core::net::Ipv6Addr, NodePublic), PEERS> =
         heapless::Vec::new();
@@ -473,44 +434,34 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
         // `wait_recv_ready` borrows immutably, so all the sockets can be waited
         // on together and only the one that fired is then borrowed mutably.
         let ready = if reverse_priority {
-            match select6(
+            match select4(
                 select(crate::control::next_notice(), crate::derp::next_notice()),
-                icmp_socket.wait_recv_ready(),
                 raw_socket.wait_recv_ready(),
-                udp_raw_socket.wait_recv_ready(),
                 wg_socket.wait_recv_ready(),
-                select(ipv6_socket.wait_recv_ready(), Timer::after(POLL_INTERVAL)),
+                Timer::after(POLL_INTERVAL),
             )
             .await
             {
-                Either6::First(Either::First(notice)) => Ready::Control(notice),
-                Either6::First(Either::Second(notice)) => Ready::Derp(notice),
-                Either6::Second(()) => Ready::Icmp,
-                Either6::Third(()) => Ready::Raw,
-                Either6::Fourth(()) => Ready::Udp,
-                Either6::Fifth(()) => Ready::Tunnel,
-                Either6::Sixth(Either::First(())) => Ready::Ipv6,
-                Either6::Sixth(Either::Second(())) => Ready::Timers,
+                Either4::First(Either::First(notice)) => Ready::Control(notice),
+                Either4::First(Either::Second(notice)) => Ready::Derp(notice),
+                Either4::Second(()) => Ready::Raw,
+                Either4::Third(()) => Ready::Tunnel,
+                Either4::Fourth(()) => Ready::Timers,
             }
         } else {
-            match select6(
+            match select4(
                 wg_socket.wait_recv_ready(),
-                udp_raw_socket.wait_recv_ready(),
                 raw_socket.wait_recv_ready(),
-                icmp_socket.wait_recv_ready(),
                 select(crate::control::next_notice(), crate::derp::next_notice()),
-                select(ipv6_socket.wait_recv_ready(), Timer::after(POLL_INTERVAL)),
+                Timer::after(POLL_INTERVAL),
             )
             .await
             {
-                Either6::First(()) => Ready::Tunnel,
-                Either6::Second(()) => Ready::Udp,
-                Either6::Third(()) => Ready::Raw,
-                Either6::Fourth(()) => Ready::Icmp,
-                Either6::Fifth(Either::First(notice)) => Ready::Control(notice),
-                Either6::Fifth(Either::Second(notice)) => Ready::Derp(notice),
-                Either6::Sixth(Either::First(())) => Ready::Ipv6,
-                Either6::Sixth(Either::Second(())) => Ready::Timers,
+                Either4::First(()) => Ready::Tunnel,
+                Either4::Second(()) => Ready::Raw,
+                Either4::Third(Either::First(notice)) => Ready::Control(notice),
+                Either4::Third(Either::Second(notice)) => Ready::Derp(notice),
+                Either4::Fourth(()) => Ready::Timers,
             }
         };
         reverse_priority = !reverse_priority;
@@ -565,15 +516,15 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
                         scratch,
                         len,
                         from,
-                        &ipv6_socket,
+                        &raw_socket,
                         &mut ipv6_gateway,
                         ipv6_uplink(stack),
                         &wg_socket,
-                        &udp_raw_socket,
+                        &raw_socket,
                         &mut table,
                         &raw_socket,
                         &mut tcp_table,
-                        &icmp_socket,
+                        &raw_socket,
                         &mut icmp_table,
                         our_ip,
                         uplink_prefix,
@@ -586,53 +537,78 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
                     .await;
                 }
             }
-            Ready::Udp => {
-                handle_udp_reply(
-                    node,
-                    scratch,
-                    &udp_raw_socket,
-                    &mut table,
-                    peer_api,
-                    &resolvers,
-                    &wg_socket,
-                    our_ip,
-                    &mut diagnostics,
-                    &mut derp_regions,
-                )
-                .await;
-            }
             Ready::Raw => {
-                // A receive-window burst is already ordered and bounded. Drain
-                // everything currently queued before timer bookkeeping so the
-                // raw ring reaches its wraparound slack promptly. Recheck with
-                // a one-poll future to avoid waiting for another packet here.
-                for _ in 0..TCP_RAW_PACKETS {
-                    handle_raw_reply(
-                        node,
-                        scratch,
-                        &raw_socket,
-                        &mut tcp_table,
-                        &wg_socket,
-                        our_ip,
-                        &mut derp_regions,
-                    )
-                    .await;
+                // Drain a bounded burst, then run timers and control maintenance.
+                // Only this receive future registers the shared raw RX waker.
+                for _ in 0..UPLINK_RAW_PACKETS {
+                    let Ok(len) = raw_socket.recv(&mut scratch.datagram).await else {
+                        break;
+                    };
+                    if len == 0 {
+                        continue;
+                    }
+                    match scratch.datagram[0] >> 4 {
+                        4 if len >= 20 => match scratch.datagram[9] {
+                            6 => {
+                                handle_raw_reply(
+                                    node,
+                                    scratch,
+                                    len,
+                                    &mut tcp_table,
+                                    &wg_socket,
+                                    our_ip,
+                                    &mut derp_regions,
+                                )
+                                .await
+                            }
+                            17 => {
+                                handle_udp_reply(
+                                    node,
+                                    scratch,
+                                    len,
+                                    &mut table,
+                                    peer_api,
+                                    &resolvers,
+                                    &wg_socket,
+                                    our_ip,
+                                    &mut diagnostics,
+                                    &mut derp_regions,
+                                )
+                                .await
+                            }
+                            1 => {
+                                handle_icmp_reply(
+                                    node,
+                                    scratch,
+                                    len,
+                                    &mut icmp_table,
+                                    &wg_socket,
+                                    our_ip,
+                                    &mut derp_regions,
+                                )
+                                .await
+                            }
+                            _ => {}
+                        },
+                        6 => {
+                            handle_ipv6_reply(
+                                node,
+                                scratch,
+                                len,
+                                &raw_socket,
+                                &mut ipv6_gateway,
+                                ipv6_uplink(stack),
+                                &wg_socket,
+                                &mut derp_regions,
+                            )
+                            .await
+                        }
+                        _ => {}
+                    }
                     if poll_once(raw_socket.wait_recv_ready()).is_pending() {
                         break;
                     }
                 }
-            }
-            Ready::Icmp => {
-                handle_icmp_reply(
-                    node,
-                    scratch,
-                    &icmp_socket,
-                    &mut icmp_table,
-                    &wg_socket,
-                    our_ip,
-                    &mut derp_regions,
-                )
-                .await;
             }
             Ready::Control(crate::control::Notice::Map(lease)) => {
                 let status = node
@@ -721,7 +697,7 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
                             packet.as_slice(),
                             scratch,
                             &wg_socket,
-                            &ipv6_socket,
+                            &raw_socket,
                             &mut ipv6_gateway,
                             ipv6_uplink(stack),
                             &mut derp_regions,
@@ -735,11 +711,11 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
                             packet.as_slice(),
                             scratch,
                             &wg_socket,
-                            &udp_raw_socket,
+                            &raw_socket,
                             &mut table,
                             &raw_socket,
                             &mut tcp_table,
-                            &icmp_socket,
+                            &raw_socket,
                             &mut icmp_table,
                             our_ip,
                             uplink_prefix,
@@ -767,38 +743,6 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
                     _ => {}
                 }
             }
-            Ready::Ipv6 => {
-                if let Ok(len) = ipv6_socket.recv(&mut scratch.datagram).await
-                    && let Some(uplink) = ipv6_uplink(stack)
-                {
-                    match ipv6_gateway.inbound(&mut scratch.datagram[..len], uplink, now_ms()) {
-                        Ok(client) => {
-                            let peer = peer_for_ipv6(node, client);
-                            if let Some(peer) = peer {
-                                encapsulate_and_send(
-                                    node,
-                                    &peer,
-                                    &scratch.datagram[..len],
-                                    &wg_socket,
-                                    &mut derp_regions,
-                                )
-                                .await;
-                            }
-                        }
-                        Err(error) => {
-                            if let Some(size) = ipv6_gateway.error_response(
-                                &scratch.datagram[..len],
-                                uplink,
-                                error,
-                                now_ms(),
-                                &mut scratch.inner,
-                            ) {
-                                let _ = ipv6_socket.send(&scratch.inner[..size]).await;
-                            }
-                        }
-                    }
-                }
-            }
             Ready::Timers => {}
         }
 
@@ -809,7 +753,7 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
             node,
             scratch,
             peer_api,
-            &udp_raw_socket,
+            &raw_socket,
             &resolvers,
             resolver_count,
             &wg_socket,
@@ -935,10 +879,7 @@ async fn bootstrap_time(stack: Stack<'static>, rng: &mut HwRng, floor: u64) -> O
 )]
 enum Ready {
     Tunnel,
-    Udp,
     Raw,
-    Icmp,
-    Ipv6,
     Control(crate::control::Notice),
     Derp(crate::derp::Notice),
     Timers,
@@ -1022,6 +963,47 @@ async fn handle_tunnel_datagram(
         }
         Ok(_) => {}
         Err(e) => warn!("rx: {e}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_ipv6_reply(
+    node: &mut Node<PEERS>,
+    scratch: &mut Scratch,
+    len: usize,
+    socket: &RawSocket<'_>,
+    gateway: &mut ipv6::Gateway,
+    uplink: Option<core::net::Ipv6Addr>,
+    wg_socket: &UdpSocket<'_>,
+    derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
+) {
+    let Some(uplink) = uplink else {
+        return;
+    };
+    match gateway.inbound(&mut scratch.datagram[..len], uplink, now_ms()) {
+        Ok(client) => {
+            if let Some(peer) = peer_for_ipv6(node, client) {
+                encapsulate_and_send(
+                    node,
+                    &peer,
+                    &scratch.datagram[..len],
+                    wg_socket,
+                    derp_regions,
+                )
+                .await;
+            }
+        }
+        Err(error) => {
+            if let Some(size) = gateway.error_response(
+                &scratch.datagram[..len],
+                uplink,
+                error,
+                now_ms(),
+                &mut scratch.inner,
+            ) {
+                let _ = socket.send(&scratch.inner[..size]).await;
+            }
+        }
     }
 }
 
@@ -1494,30 +1476,34 @@ async fn forward_icmp_out(
 async fn handle_icmp_reply(
     node: &mut Node<PEERS>,
     scratch: &mut Scratch,
-    socket: &RawSocket<'_>,
+    len: usize,
     table: &mut nat::IcmpTable,
     wg_socket: &UdpSocket<'_>,
     our_ip: [u8; 4],
     derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
 ) {
-    let Ok(len) = socket.recv(&mut scratch.inner).await else {
-        return;
-    };
-    let Some(info) = nat::parse_icmp4(&scratch.inner[..len]) else {
+    let Some(info) = nat::parse_icmp4(&scratch.datagram[..len]) else {
         return;
     };
     let Some(flow) = table.reverse(&info, our_ip, now_ms()) else {
         return;
     };
-    if !nat::rewrite_icmp_inbound(&mut scratch.inner[..len], flow)
-        || !nat::decrement_ipv4_ttl(&mut scratch.inner[..len])
+    if !nat::rewrite_icmp_inbound(&mut scratch.datagram[..len], flow)
+        || !nat::decrement_ipv4_ttl(&mut scratch.datagram[..len])
     {
         return;
     }
     let Some(peer) = peer_for_ip(node, flow.client_ip) else {
         return;
     };
-    encapsulate_and_send(node, &peer, &scratch.inner[..len], wg_socket, derp_regions).await;
+    encapsulate_and_send(
+        node,
+        &peer,
+        &scratch.datagram[..len],
+        wg_socket,
+        derp_regions,
+    )
+    .await;
 }
 
 /// Translate a tunnelled UDP datagram through the shared raw uplink socket.
@@ -1621,17 +1607,16 @@ async fn forward_tcp_out(
 async fn handle_raw_reply(
     node: &mut Node<PEERS>,
     scratch: &mut Scratch,
-    raw_socket: &RawSocket<'_>,
+    len: usize,
     tcp_table: &mut nat::TcpTable,
     wg_socket: &UdpSocket<'_>,
     our_ip: [u8; 4],
     derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
 ) {
-    let Scratch { inner, .. } = scratch;
+    let Scratch {
+        datagram: inner, ..
+    } = scratch;
 
-    let Ok(len) = raw_socket.recv(inner).await else {
-        return;
-    };
     let packet = &inner[..len];
     if !nat::ipv4_ttl_is_forwardable(packet) {
         return;
@@ -1687,7 +1672,7 @@ async fn handle_raw_reply(
 async fn handle_udp_reply(
     node: &mut Node<PEERS>,
     scratch: &mut Scratch,
-    socket: &RawSocket<'_>,
+    len: usize,
     table: &mut nat::Table,
     peer_api: &mut tailfeather_gateway::peerapi::Server,
     resolvers: &[Option<[u8; 4]>; 3],
@@ -1698,9 +1683,6 @@ async fn handle_udp_reply(
 ) {
     let Scratch { datagram, inner } = scratch;
 
-    let Ok(len) = socket.recv(datagram).await else {
-        return;
-    };
     let Some(packet) = nat::parse_udp4(&datagram[..len]) else {
         return;
     };
