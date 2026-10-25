@@ -3,7 +3,7 @@
 # `firmware/` and `harness/` are deliberately NOT members. Bazel resolves them
 # as independent Cargo metadata closures for their distinct target platforms.
 [workspace]
-exclude  = ["firmware", "harness", "web"]
+exclude  = ["firmware", "harness", "web", "hosted"]
 members  = [
   "crates/tailfeather",
   "crates/tailfeather-gateway",

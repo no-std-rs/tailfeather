@@ -81,11 +81,17 @@ impl RegisterRequest<'_> {
             .field_str("NodeKey", node_key)
             .field_str("OldNodeKey", old_node_key)
             .field_str("Expiry", NO_EXPIRY)
-            .field_bool("Ephemeral", self.ephemeral)
-            .key("Auth")
-            .begin_object()
-            .field_str("AuthKey", self.auth_key)
-            .end_object();
+            .field_bool("Ephemeral", self.ephemeral);
+        // Headscale distinguishes an absent Auth object from an empty one.
+        // Durable reconnects use the existing node identity; Auth:{AuthKey:""}
+        // starts an interactive reauthentication instead of resuming that node.
+        if !self.auth_key.is_empty() || !followup.is_empty() {
+            writer
+                .key("Auth")
+                .begin_object()
+                .field_str("AuthKey", self.auth_key)
+                .end_object();
+        }
         if !followup.is_empty() {
             writer.field_str("Followup", followup);
         }
@@ -178,6 +184,23 @@ mod tests {
         core::str::from_utf8(request.write(buffer).unwrap()).unwrap()
     }
 
+    #[test]
+    fn durable_reconnect_omits_empty_auth_for_headscale() {
+        let key = node_key();
+        let request = RegisterRequest {
+            version: 131,
+            node_key: &key,
+            old_node_key: None,
+            auth_key: "",
+            hostinfo: Hostinfo::default(),
+            ephemeral: false,
+        };
+        let mut buffer = [0; 512];
+        let text = body(&mut buffer, &request);
+        assert!(!text.contains("\"Auth\""));
+        assert!(!text.contains("AuthKey"));
+        assert!(text.contains("NodeKey"));
+    }
     #[test]
     fn a_first_registration_carries_the_node_key_and_the_preauth_key() {
         let key = node_key();
@@ -279,12 +302,13 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(r#""Ephemeral":true"#));
-        // Apart from the one field, the body is byte-for-byte the plain request.
+        // Interactive follow-up carries an empty Auth object; reconnects omit it.
         assert_eq!(
             text.replace(
                 r#""Followup":"https://login.tailscale.com/a/0123456789abcdef","#,
                 ""
-            ),
+            )
+            .replace(r#""Auth":{"AuthKey":""},"#, ""),
             plain
         );
 

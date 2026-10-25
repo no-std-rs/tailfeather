@@ -520,6 +520,7 @@ impl State {
             os: "js",
             routable_ips: &[],
             preferred_derp,
+            report_no_derp: false,
             peer_api_port: None,
             ssh_host_keys: &[],
         }

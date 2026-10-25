@@ -41,6 +41,8 @@ pub struct Hostinfo<'a> {
     /// Relay selected from measured STUN latency. Zero omits `NetInfo` until a
     /// usable region has actually answered.
     pub preferred_derp: u16,
+    /// Explicitly report zero to clear a previously advertised relay.
+    pub report_no_derp: bool,
     /// TCP port of the IPv4 peer API. When present, the node also advertises
     /// the exit-node DNS proxy capability whose sentinel port is always one.
     pub peer_api_port: Option<u16>,
@@ -66,6 +68,7 @@ impl Default for Hostinfo<'_> {
             os: "esp32",
             routable_ips: &[],
             preferred_derp: 0,
+            report_no_derp: false,
             peer_api_port: None,
             ssh_host_keys: &[],
         }
@@ -96,7 +99,7 @@ impl Hostinfo<'_> {
             writer.end_array();
         }
 
-        if self.preferred_derp != 0 {
+        if self.preferred_derp != 0 || self.report_no_derp {
             writer
                 .key("NetInfo")
                 .begin_object()
@@ -179,6 +182,14 @@ mod tests {
         let mut buffer = [0u8; 256];
         let text = rendered(&mut buffer, &Hostinfo::default());
         assert!(!text.contains("NetInfo"));
+        let cleared = rendered(
+            &mut buffer,
+            &Hostinfo {
+                report_no_derp: true,
+                ..Default::default()
+            },
+        );
+        assert!(cleared.contains(r#""NetInfo":{"PreferredDERP":0}"#));
 
         let hostinfo = Hostinfo {
             preferred_derp: 7,
