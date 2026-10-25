@@ -22,6 +22,7 @@ mod inner;
 mod nat;
 mod stack;
 mod tunnel;
+mod uplink;
 mod wifi;
 
 use embassy_executor::Spawner;
@@ -131,11 +132,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(net_task(runner).expect("each task is spawned once"));
     spawner.spawn(ipv6_status(stack).expect("each task is spawned once"));
 
-    stack.wait_config_up().await;
-    let address = stack
-        .config_v4()
-        .expect("the stack reports a v4 config once it is up")
-        .address;
+    let address = uplink::wait_ipv4(stack).await.address;
     info!("DHCP lease: {address}");
 
     let bootstrap = tunnel::provision(peripherals.FLASH);
