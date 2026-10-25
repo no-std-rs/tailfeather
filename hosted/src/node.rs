@@ -28,6 +28,7 @@ pub struct Shared {
     local_candidate: Cell<Option<core::net::SocketAddrV4>>,
     direct: bool,
     resident: bool,
+    slots: [crate::relay::Slot; 2],
 }
 struct Probe {
     transaction: [u8; 12],
@@ -161,14 +162,14 @@ pub async fn run(
         local_candidate: Cell::new(None),
         direct: !config.relay_only,
         resident,
+        slots: [crate::relay::Slot::new(), crate::relay::Slot::new()],
     };
     let actions = Actions::default();
-    let slots = [crate::relay::Slot::new(), crate::relay::Slot::new()];
     let result = tokio::select! {
         result=control_loop(&reactor, &node, &actions, &store, &authority, &status, &config)=>result,
-        result=packets(&reactor, &node, &actions, &node.udp, &slots, &mut commands, &status)=>result,
-        result=crate::relay::worker(&reactor, &node, &actions, &slots[0], &config.control_ca_der)=>result,
-        result=crate::relay::worker(&reactor, &node, &actions, &slots[1], &config.control_ca_der)=>result,
+        result=packets(&reactor, &node, &actions, &node.udp, &node.slots, &mut commands, &status)=>result,
+        result=crate::relay::worker(&reactor, &node, &actions, &node.slots[0], &config.control_ca_der)=>result,
+        result=crate::relay::worker(&reactor, &node, &actions, &node.slots[1], &config.control_ca_der)=>result,
         _=stopped=>Ok(()),
     };
     if config.ephemeral && node.borrow().is_enrolled() {
@@ -320,6 +321,9 @@ async fn control_loop(
                 node.borrow_mut()
                     .adopt_reconnected_map(&mut tailfeather::netmap::Netmap::new())
                     .map_err(node_error)?;
+                for slot in &node.slots {
+                    slot.revoke();
+                }
                 status.send_replace(crate::Status::default());
                 actions.ready.notify_one();
             }
@@ -991,6 +995,7 @@ mod tests {
             local_candidate: Cell::new(None),
             direct: true,
             resident: false,
+            slots: [crate::relay::Slot::new(), crate::relay::Slot::new()],
         }
     }
     #[test]
@@ -1007,6 +1012,34 @@ mod tests {
             let reactor=Reactor::new();
             assert!(tokio::time::timeout(std::time::Duration::from_millis(50),crate::relay::worker(&reactor,&node,&actions,&slots[0],&[])).await.is_err());
             assert!(matches!(server.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        });
+    }
+    #[test]
+    fn revocation_discards_a_full_relay_queue_and_releases_the_slot() {
+        crate::on_worker_stack(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let server=std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).unwrap();
+                server.set_nonblocking(true).unwrap();
+                let port=server.local_addr().unwrap().port();
+                let node=fixture().await;
+                let actions=Actions::default();
+                let slots=[crate::relay::Slot::new(),crate::relay::Slot::new()];
+                let endpoint=tailfeather::Endpoint::new("127.0.0.1",port).unwrap();
+                assert!(crate::relay::dispatch(&slots,tailfeather::DerpCommand::Connect{region:7,endpoint},&node,&actions,0).is_none());
+                for _ in 0..15 {
+                    let command=tailfeather::DerpCommand::Send {region:7,peer:tailfeather::keys::NodePublic::from_bytes([7;32]),packet:tailfeather::SecretBuffer::try_from_slice(b"revoked").unwrap()};
+                    assert!(crate::relay::dispatch(&slots,command,&node,&actions,0).is_none());
+                }
+                slots[0].revoke();
+                let reactor=Reactor::new();
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(50),crate::relay::worker(&reactor,&node,&actions,&slots[0],&[])).await.is_err());
+                assert!(matches!(server.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+                // A fresh region must reuse this slot and actually reach TCP.
+                let command=tailfeather::DerpCommand::Connect {region:8,endpoint:tailfeather::Endpoint::new("127.0.0.1",port).unwrap()};
+                assert!(crate::relay::dispatch(&slots,command,&node,&actions,0).is_none());
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(50),crate::relay::worker(&reactor,&node,&actions,&slots[0],&[])).await.is_err());
+                assert!(server.accept().is_ok(), "revoked slot could not reconnect");
+            });
         });
     }
     #[test]
