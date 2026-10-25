@@ -25,6 +25,7 @@ mod loopback_tests;
 
 mod control;
 mod derp;
+mod forwarding;
 mod js;
 mod netstack;
 mod runtime;
@@ -35,6 +36,7 @@ use std::net::Ipv4Addr;
 
 use wasm_bindgen::prelude::*;
 
+pub use forwarding::SshForwardPipe;
 pub use ssh::SshSession;
 
 use crate::js::{get_bool, get_function, get_number, get_string};

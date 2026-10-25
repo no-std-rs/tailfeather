@@ -52,7 +52,7 @@ function shell(stream) {
   });
 }
 
-export async function startLocalSsh(httpServer) {
+export async function startLocalSsh(httpServer, { forwardTarget = null, onForward = () => {} } = {}) {
   const hostKey = utils.generateKeyPairSync("ed25519");
   const ssh = new Server(
     { hostKeys: [hostKey.private], banner: "e2e-sshd banner: authorized testing only\nApprove: https://login.tailscale.com/a/banner-example\n" },
@@ -68,6 +68,19 @@ export async function startLocalSsh(httpServer) {
         context.reject(context.username === "kbd" ? ["keyboard-interactive"] : ["none"]);
       });
       client.on("ready", () => {
+        client.on("tcpip", (accept, reject, info) => {
+          if (!forwardTarget || info.destPort !== forwardTarget.port || !["localhost", "127.0.0.1", "::1"].includes(info.destIP)) return reject();
+          onForward(info);
+          // Emulate the remote namespace on a separate local backing port.
+          const upstream = connect(forwardTarget.backingPort, "127.0.0.1");
+          upstream.on("error", () => { try { reject(); } catch {} });
+          upstream.on("connect", () => {
+            const stream = accept();
+            upstream.pipe(stream).pipe(upstream);
+            stream.on("error", () => upstream.destroy());
+            stream.on("close", () => upstream.destroy());
+          });
+        });
         client.on("session", (accept) => {
           const session = accept();
           session.on("pty", (acceptPty) => acceptPty && acceptPty());

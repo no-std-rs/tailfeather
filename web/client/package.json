@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "./build.sh",
-    "test:links": "node --test e2e/terminal-links.test.mjs",
+    "test:links": "node --test e2e/terminal-links.test.mjs ../loopback/test/*.test.mjs",
     "test:labels": "node --test e2e/session-labels.test.mjs",
     "test:pages": "node e2e/pages.mjs",
     "test:e2e": "node e2e/run.mjs",

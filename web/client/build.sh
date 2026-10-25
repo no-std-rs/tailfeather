@@ -78,6 +78,7 @@ rm -rf "$dist"
 mkdir -p "$dist/pkg" "$dist/vendor"
 "$bindgen" --target web --no-typescript --out-dir "$dist/pkg" "$wasm"
 cp www/index.html www/*.js www/style.css "$dist/"
+cp -R ../loopback "$dist/loopback"
 if $static; then
   # Static hosts have no Worker endpoint for minting one-time auth keys.
   node --input-type=module - "$dist/index.html" <<'JS'

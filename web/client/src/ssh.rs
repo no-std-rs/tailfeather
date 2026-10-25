@@ -127,6 +127,7 @@ enum Input {
     Data(Vec<u8>),
     Resize(u32, u32),
     Close,
+    Forward(crate::forwarding::Request),
 }
 
 /// A running terminal session, handed to the page.
@@ -138,6 +139,27 @@ pub struct SshSession {
 
 #[wasm_bindgen]
 impl SshSession {
+    /// Open a loopback channel through this exact authenticated SSH session.
+    pub async fn open_forward(
+        &self,
+        host: String,
+        port: u16,
+        write: js_sys::Function,
+        closed: js_sys::Function,
+    ) -> Result<crate::forwarding::SshForwardPipe, JsError> {
+        use futures::SinkExt;
+        let (request, pipe, ready) = crate::forwarding::request(host, port, write, closed)?;
+        self.input
+            .clone()
+            .send(Input::Forward(request))
+            .await
+            .map_err(|_| JsError::new("SSH session closed"))?;
+        ready
+            .await
+            .map_err(|_| JsError::new("SSH session closed"))?
+            .map_err(|error| JsError::new(&error))?;
+        Ok(pipe)
+    }
     /// Keystrokes or pasted text for the remote shell.
     pub fn send(&self, data: &[u8]) {
         let _ = self.input.clone().try_send(Input::Data(data.to_vec()));
@@ -472,6 +494,9 @@ async fn run(
                     Some(Input::Resize(cols, rows)) => size = (cols, rows),
                     // There is no channel to type into yet.
                     Some(Input::Data(_)) => {}
+                    Some(Input::Forward(request)) => {
+                        let _ = request.ready.send(Err("SSH is not authenticated yet".into()));
+                    }
                     Some(Input::Close) | None => break None,
                 },
             }
@@ -488,8 +513,13 @@ async fn run(
         let _ = writer.window_change(size.0, size.1, 0, 0).await;
     }
     let mut exit_status = None;
+    let mut forwards = futures::stream::FuturesUnordered::new();
     loop {
         futures::select! {
+            _ = async {
+                if forwards.is_empty() { futures::future::pending::<()>().await; }
+                else { forwards.next().await; }
+            }.fuse() => {},
             message = reader.wait().fuse() => match message {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                     callbacks.write(&data);
@@ -500,6 +530,13 @@ async fn run(
                 Some(_) => {}
             },
             command = input.next() => match command {
+                Some(Input::Forward(request)) => {
+                    if forwards.len() < 32 {
+                        forwards.push(crate::forwarding::run(&session, request));
+                    } else {
+                        let _ = request.ready.send(Err("too many forwarding channels".into()));
+                    }
+                }
                 Some(Input::Data(bytes)) => {
                     if writer.data_bytes(bytes).await.is_err() {
                         break;

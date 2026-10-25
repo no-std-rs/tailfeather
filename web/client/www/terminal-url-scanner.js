@@ -19,6 +19,15 @@ export function isTailscaleAuthUrl(text) {
     /^\/a\/[A-Za-z0-9_-]+\/?$/.test(url.pathname);
 }
 
+export function loopbackDestination(text) {
+  const safe = safeWebUrl(text);
+  if (!safe) return null;
+  const url = new URL(safe);
+  if (!["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return null;
+  return { url: safe, host: url.hostname.replace(/^\[|\]$/g, ""),
+    port: Number(url.port || (url.protocol === "https:" ? 443 : 80)) };
+}
+
 function trimPunctuation(text, prefix) {
   // Keep balanced parentheses in a URL, but drop a surrounding sentence's
   // closing punctuation, e.g. '(https://example.org/page)'.

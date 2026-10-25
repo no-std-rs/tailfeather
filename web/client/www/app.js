@@ -566,6 +566,7 @@ function createTab({ base, label }, { ip, port, user, url }) {
   tab.links = installTerminalLinks({
     terminal,
     container: links,
+    getSession: () => tab.disposed ? null : tab.handle,
     onAuthUrl: (url) => {
       if (!tab.disposed) tab.sshAuthUrl = url;
     },
@@ -641,6 +642,7 @@ function revealTab(tab) {
 function endSession(tab) {
   const handle = tab.handle;
   tab.handle = null;
+  tab.links.finish();
   cancelPrompt(tab);
   if (handle) handle.close();
   updateTab(tab);

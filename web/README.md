@@ -162,6 +162,13 @@ output and detected links are kept in memory only, and disappear with the tab.
 Dismiss the approval notice once finished; it also hides when SSH closes. The
 URL remains available in that tab's links list.
 
+Remote loopback HTTP(S) URLs instead offer **Open remote host:port**, tied to
+that SSH connection. OAuth callbacks keep their original loopback redirect URI
+through an optional desktop Firefox extension and local Node companion. Install
+the integration and see the rclone flow, supported platforms, forwarding-policy
+requirements, and verification boundaries in
+[`loopback/README.md`](loopback/README.md).
+
 Focus mode expands the workspace to the viewport. Fullscreen uses the browser
 API when available, with focus mode as the fallback. Mobile controls provide
 Ctrl, Esc, Tab, arrow keys and keyboard focus for the active connection.
