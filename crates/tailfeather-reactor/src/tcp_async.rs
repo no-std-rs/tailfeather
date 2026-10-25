@@ -256,13 +256,22 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> Tcp<'a, N, Q, B> {
     }
 
     pub fn listen(&self, port: u16) -> Result<Listener<'_, 'a, N, Q, B>, Error> {
+        self.listen_with_backlog(port, 4.min(N))
+    }
+
+    /// Keep a product-sized backlog while sharing the caller's bounded arena.
+    pub fn listen_with_backlog(
+        &self,
+        port: u16,
+        backlog: usize,
+    ) -> Result<Listener<'_, 'a, N, Q, B>, Error> {
         if self.listeners.get() >= 4 || self.ports.borrow().contains(&port) {
             return Err(Error::Unavailable);
         }
         let listener = self
             .stack
             .borrow_mut()
-            .listen_backlog(port)
+            .listen_with_backlog(port, backlog)
             .map_err(|_| Error::Unavailable)?;
         self.changed.signal(());
         self.listeners.set(self.listeners.get() + 1);
