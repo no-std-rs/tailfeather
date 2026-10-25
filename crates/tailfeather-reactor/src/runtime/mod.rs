@@ -29,11 +29,82 @@ mod derp;
 
 pub type Error = &'static str;
 
+/// Borrow independent directions after the TLS/protocol handshake. Relay reads
+/// remain alive while outgoing packets and pongs progress, so adapters need not
+/// make record reads cancellation-safe.
+pub trait SplitStream: Read + Write {
+    type Reader<'a>: Read
+    where
+        Self: 'a;
+    type Writer<'a>: Write
+    where
+        Self: 'a;
+    fn split(&mut self) -> (Self::Reader<'_>, Self::Writer<'_>);
+}
+
+#[cfg(feature = "tls")]
+impl<S, C> SplitStream for embedded_tls::TlsConnection<'_, S, C>
+where
+    S: SplitStream,
+    C: embedded_tls::TlsCipherSuite + 'static,
+{
+    type Reader<'a>
+        = embedded_tls::TlsReader<'a, S::Reader<'a>, C>
+    where
+        Self: 'a;
+    type Writer<'a>
+        = embedded_tls::TlsWriter<'a, S::Writer<'a>, C>
+    where
+        Self: 'a;
+    fn split(&mut self) -> (Self::Reader<'_>, Self::Writer<'_>) {
+        self.split_with(|socket| socket.split())
+    }
+}
+
+/// Local delivery of authenticated inner IPv4 packets. Implement this for a
+/// kernel TUN interface, or use [`Tcp`] for the shared userspace TCP stack.
+/// The driver must be cancellation-safe and must not bypass [`PacketIo`]'s
+/// authenticated ingress. Address removal also invalidates local connections.
+#[allow(async_fn_in_trait)]
+pub trait Device {
+    fn set_address(&self, address: Option<Ipv4Addr>, now_ms: u64, seed: u64) -> Result<(), Error>;
+    fn visit_remote_addresses(&self, _visit: impl FnMut(Ipv4Addr)) {}
+    async fn run<C: Clock, I: PacketIo<Error = Error>>(
+        &self,
+        reactor: &Reactor<C>,
+        io: &I,
+    ) -> Result<(), Error>;
+}
+
+impl<const N: usize, const Q: usize, B: PacketQueue<Q>> Device for Tcp<'_, N, Q, B> {
+    fn set_address(&self, address: Option<Ipv4Addr>, now_ms: u64, seed: u64) -> Result<(), Error> {
+        if let Some(address) = address {
+            Tcp::set_address(self, address, now_ms, seed);
+        } else {
+            self.clear_address();
+        }
+        Ok(())
+    }
+    fn visit_remote_addresses(&self, visit: impl FnMut(Ipv4Addr)) {
+        self.remote_addresses().into_iter().for_each(visit);
+    }
+    async fn run<C: Clock, I: PacketIo<Error = Error>>(
+        &self,
+        reactor: &Reactor<C>,
+        io: &I,
+    ) -> Result<(), Error> {
+        match Tcp::run(self, reactor, io).await {
+            Ok(never) => match never {},
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// Each returned RNG must draw fresh cryptographically secure randomness.
 /// TCP/TLS must authenticate the requested DNS name against `ca` or trusted
 /// public roots; an empty private CA must never disable certificate validation.
 pub trait Network: Clock {
-    type Stream<'a>: Read + Write
+    type Stream<'a>: SplitStream
     where
         Self: 'a;
     type Rng: Rng
@@ -246,7 +317,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             reserved_timestamp: Cell::new(floor),
             running: Cell::new(false),
         };
-        result.status.sender().send(Status::default());
+        result.publish_status(Status::default());
         if let Some(address) = result
             .node
             .borrow()
@@ -258,7 +329,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                 _ => None,
             })
         {
-            result.status.sender().send(Status {
+            result.publish_status(Status {
                 address: Some(address),
                 error: None,
             });
@@ -267,8 +338,32 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
         Ok(result)
     }
 
+    fn publish_status(&self, status: Status) {
+        self.status.sender().send(status);
+        self.ready.signal(());
+    }
+
     pub fn status(&self) -> Status {
         self.status.anon_receiver().try_get().unwrap_or_default()
+    }
+
+    /// Observe completed map updates, including peer changes at the same local
+    /// address, and terminal shutdown. Each subscriber holds one bounded slot.
+    pub fn subscribe_status(
+        &self,
+    ) -> Result<embassy_sync::watch::Receiver<'_, NoopRawMutex, Status, 16>, Error> {
+        self.status.receiver().ok_or("status waiter capacity")
+    }
+
+    /// Current peer IPv4 addresses from the last completely applied netmap.
+    pub fn peer_addresses(&self) -> Vec<Ipv4Addr, PEERS> {
+        self.node
+            .borrow()
+            .netmap()
+            .peers
+            .iter()
+            .filter_map(|peer| peer.tailscale_ipv4())
+            .collect()
     }
 
     pub async fn ready(&self) -> Result<Ipv4Addr, Error> {
@@ -324,21 +419,33 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
         tcp: &Tcp<'_, N, Q, B>,
         buffers: &mut Buffers<PEERS>,
     ) -> Result<(), Error> {
+        self.run_device(tcp, buffers).await
+    }
+
+    /// Run the same control, relay, discovery and WireGuard actor with a local
+    /// packet device. Dropping this future clears its assigned address.
+    pub async fn run_device<D: Device>(
+        &self,
+        device: &D,
+        buffers: &mut Buffers<PEERS>,
+    ) -> Result<(), Error> {
         if self.status().error.is_some() {
             return Err("client stopped; restore before restarting");
         }
         if self.running.replace(true) {
             return Err("client already running");
         }
-        struct Guard<'r, 'a, P: Network, S: State, const PEERS: usize, const A: usize>(
+        struct Guard<'r, 'a, P: Network, S: State, D: Device, const PEERS: usize, const A: usize>(
             &'r Runtime<'a, P, S, PEERS, A>,
+            &'r D,
         );
-        impl<P: Network, S: State, const PEERS: usize, const A: usize> Drop
-            for Guard<'_, '_, P, S, PEERS, A>
+        impl<P: Network, S: State, D: Device, const PEERS: usize, const A: usize> Drop
+            for Guard<'_, '_, P, S, D, PEERS, A>
         {
             fn drop(&mut self) {
+                let _ = self.1.set_address(None, self.0.network.now_millis(), 0);
                 if self.0.status().error.is_none() {
-                    self.0.status.sender().send(Status {
+                    self.0.publish_status(Status {
                         address: None,
                         error: Some("client stopped"),
                     });
@@ -346,29 +453,26 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                 self.0.running.set(false);
             }
         }
-        let _guard = Guard(self);
+        let _guard = Guard(self, device);
         let reactor = Reactor::with_clock(self.network);
         let [first, second] = &mut buffers.relays;
         use embassy_futures::select::{Either5, select5};
         let result = match select5(
             control::run(self, &reactor, &mut buffers.control, &mut buffers.staging),
-            self.packets(tcp, &reactor),
+            self.packets(device, &reactor),
             derp::worker(self, &reactor, &self.slots[0], first),
             derp::worker(self, &reactor, &self.slots[1], second),
-            tcp.run(&reactor, self),
+            device.run(&reactor, self),
         )
         .await
         {
             Either5::First(result)
             | Either5::Second(result)
             | Either5::Third(result)
-            | Either5::Fourth(result) => result,
-            Either5::Fifth(result) => match result {
-                Ok(never) => match never {},
-                Err(error) => Err(error),
-            },
+            | Either5::Fourth(result)
+            | Either5::Fifth(result) => result,
         };
-        self.status.sender().send(Status {
+        self.publish_status(Status {
             address: None,
             error: Some(result.as_ref().err().copied().unwrap_or("client stopped")),
         });
@@ -425,11 +529,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                 .set(self.candidate_generation.get().wrapping_add(1));
         }
     }
-    async fn packets<const N: usize, const Q: usize, B: PacketQueue<Q>>(
-        &self,
-        tcp: &Tcp<'_, N, Q, B>,
-        reactor: &Reactor<&P>,
-    ) -> Result<(), Error> {
+    async fn packets<D: Device>(&self, device: &D, reactor: &Reactor<&P>) -> Result<(), Error> {
         let mut datagram = [0; tailfeather::tunnel::MAX_DATAGRAM_LEN];
         let mut transmit: Vec<
             (
@@ -451,9 +551,11 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             }
             let current_address = self.status().address;
             if current_address != address {
-                if let Some(current) = current_address {
-                    tcp.set_address(current, reactor.clock_millis(), u64::from_le_bytes(seed));
-                }
+                device.set_address(
+                    current_address,
+                    reactor.clock_millis(),
+                    u64::from_le_bytes(seed),
+                )?;
                 address = current_address;
             }
             for _ in 0..A {
@@ -518,7 +620,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                         generation = self.candidate_generation.get();
                     }
                     let mut active: Vec<tailfeather::keys::NodePublic, PEERS> = Vec::new();
-                    for address in tcp.remote_addresses() {
+                    device.visit_remote_addresses(|address| {
                         if let Some(peer) = crate::routing::route_ipv4(
                             self.node.borrow().netmap().peers.iter(),
                             address,
@@ -526,7 +628,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                         {
                             let _ = active.push(peer);
                         }
-                    }
+                    });
                     punches.retain(|(peer, _, _)| active.contains(peer));
                     for peer in active {
                         if !punches.iter().any(|(key, _, _)| *key == peer) {
@@ -677,6 +779,13 @@ mod tests {
             Ok(())
         }
     }
+    impl SplitStream for PendingStream {
+        type Reader<'a> = Self;
+        type Writer<'a> = Self;
+        fn split(&mut self) -> (Self, Self) {
+            (Self, Self)
+        }
+    }
     struct Offline(Cell<u64>);
     impl Clock for Offline {
         fn now_millis(&self) -> u64 {
@@ -813,6 +922,94 @@ mod tests {
                     ready.as_mut().poll(&mut cx),
                     core::task::Poll::Ready(Err("client stopped"))
                 );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    struct LocalDevice {
+        addresses: RefCell<std::vec::Vec<Option<Ipv4Addr>>>,
+        failure: Option<Error>,
+    }
+    impl Device for LocalDevice {
+        fn set_address(&self, address: Option<Ipv4Addr>, _: u64, _: u64) -> Result<(), Error> {
+            self.addresses.borrow_mut().push(address);
+            Ok(())
+        }
+        async fn run<C: Clock, I: PacketIo<Error = Error>>(
+            &self,
+            _: &Reactor<C>,
+            _: &I,
+        ) -> Result<(), Error> {
+            if let Some(error) = self.failure {
+                Err(error)
+            } else {
+                core::future::pending().await
+            }
+        }
+    }
+
+    #[test]
+    fn packet_device_address_lifecycle_and_failures_follow_runtime() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                use core::future::Future;
+                let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+                for failure in [None, Some("TUN interface closed")] {
+                    let network = Offline(Cell::new(0));
+                    let state = MemoryState::default();
+                    let config = config();
+                    let mut node = restore::<_, _, 1>(&config, &network, &state).unwrap();
+                    let runtime =
+                        Runtime::<_, _, 1, 4>::new(config, &mut node, &network, &state).unwrap();
+                    let mut subscribers = heapless::Vec::<_, 16>::new();
+                    for _ in 0..16 {
+                        subscribers
+                            .push(runtime.subscribe_status().unwrap())
+                            .ok()
+                            .unwrap();
+                    }
+                    assert!(runtime.subscribe_status().is_err());
+                    let address = Ipv4Addr::new(100, 64, 0, 1);
+                    runtime.publish_status(Status {
+                        address: Some(address),
+                        error: None,
+                    });
+                    let device = LocalDevice {
+                        addresses: RefCell::new(std::vec::Vec::new()),
+                        failure,
+                    };
+                    let mut buffers = Buffers::new();
+                    let mut future =
+                        std::boxed::Box::pin(runtime.run_device(&device, &mut buffers));
+                    let result = future.as_mut().poll(&mut cx);
+                    if let Some(error) = failure {
+                        assert_eq!(result, core::task::Poll::Ready(Err(error)));
+                        assert_eq!(runtime.status().error, Some(error));
+                    } else {
+                        assert!(result.is_pending());
+                        assert_eq!(device.addresses.borrow().as_slice(), &[Some(address)]);
+                        runtime.publish_status(Status {
+                            address: None,
+                            error: None,
+                        });
+                        assert!(future.as_mut().poll(&mut cx).is_pending());
+                        assert_eq!(device.addresses.borrow().last(), Some(&None));
+                    }
+                    drop(future);
+                    assert_eq!(device.addresses.borrow().last(), Some(&None));
+                    assert!(runtime.status().address.is_none());
+                    assert!(!runtime.running.get());
+                    let mut buffers = Buffers::new();
+                    let restart = runtime.run_device(&device, &mut buffers);
+                    let mut restart = core::pin::pin!(restart);
+                    assert_eq!(
+                        restart.as_mut().poll(&mut cx),
+                        core::task::Poll::Ready(Err("client stopped; restore before restarting"))
+                    );
+                }
             })
             .unwrap()
             .join()
