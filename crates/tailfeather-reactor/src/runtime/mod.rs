@@ -596,6 +596,8 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                             self.delivered.send(packet).await;
                         }
                     }
+                    // This adapter exposes an IPv4 local device only.
+                    NodeAction::DeliveredIpv6 { .. } => {}
                     NodeAction::Derp(command) => {
                         if let Some(command) = derp::dispatch(self, command) {
                             let _ = self.actions.borrow_mut().push(NodeAction::Derp(command));

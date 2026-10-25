@@ -785,6 +785,8 @@ async fn packets(
                         net.borrow_mut().deliver(bytes);
                     }
                 }
+                // This adapter exposes an IPv4 local device only.
+                NodeAction::DeliveredIpv6 { .. } => {}
                 NodeAction::Derp(command) => {
                     if status.borrow().address.is_none()
                         && matches!(command, tailfeather::DerpCommand::Send { .. })

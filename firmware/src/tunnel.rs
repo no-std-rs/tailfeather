@@ -7,13 +7,11 @@
 //! and a single actor means [`tailfeather::Node`] needs no locking.
 
 use core::net::{Ipv4Addr as CoreIpv4Addr, SocketAddr, SocketAddrV4};
-use core::task::Poll;
 
 use embassy_executor::Spawner;
 use embassy_futures::poll_once;
-use embassy_futures::select::{Either, Either6, select, select6};
+use embassy_futures::select::{Either, Either4, select, select4};
 use embassy_net::dns::DnsQueryType;
-use embassy_net::raw::{IpProtocol, IpVersion, RawSocket};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpEndpoint, Ipv4Address, Stack, raw, udp};
 use embassy_time::{Duration, Timer};
@@ -27,6 +25,21 @@ use tailfeather::{DerpCommand, DerpEvent, Node, NodeAction};
 use wirefeather::Rng;
 
 use crate::nat;
+use crate::uplink::{Uplink, wait_ipv4};
+use tailfeather_gateway::ipv6;
+
+static IPV6_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) fn exit_routes() -> &'static [&'static str] {
+    tailfeather::control::hostinfo::exit_node_routes(
+        IPV6_READY.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+fn ipv6_uplink(stack: Stack<'_>) -> Option<core::net::Ipv6Addr> {
+    let config = stack.config_v6()?;
+    config.gateway?;
+    let address = core::net::Ipv6Addr::from(config.address.address().octets());
+    ipv6::routable(address).then_some(address)
+}
 
 /// The port we listen on, and the one the peer's `Endpoint` must point at.
 pub(crate) const LISTEN_PORT: u16 = 51820;
@@ -46,6 +59,10 @@ pub(crate) const PEERS: usize = 3;
 /// or DNS message. Keep the RX payload arena aligned with its metadata slots:
 /// undersizing it silently discards otherwise valid input.
 const WG_DATAGRAM_LEN: usize = wirefeather::MAX_DATAGRAM_LEN;
+// Full IP packets from the Ethernet Wi-Fi uplink, including oversized tunnel
+// replies that must receive PTB. main checks the actual driver MTU at startup.
+pub(crate) const UPLINK_IP_MTU: usize = 1500;
+const _: () = assert!(WG_DATAGRAM_LEN <= UPLINK_IP_MTU);
 const WG_RX_PACKETS: usize = 2;
 const WG_TX_PACKETS: usize = 1;
 const WG_RX_BUFFER_LEN: usize = WG_RX_PACKETS * WG_DATAGRAM_LEN;
@@ -63,7 +80,6 @@ static WG_TX_BUFFER: StaticCell<[u8; WG_TX_BUFFER_LEN]> = StaticCell::new();
 const TCP_RAW_RX_ARENA_PACKETS: usize = 4;
 const TCP_CLIENT_WINDOW_PACKETS: u16 = 4;
 const TCP_RAW_RX_BUFFER_LEN: usize = TCP_RAW_RX_ARENA_PACKETS * wirefeather::budget::INNER_MTU;
-const TCP_RAW_TX_BUFFER_LEN: usize = 2_048;
 const TCP_RAW_PACKETS: usize = 24;
 const CLIENT_TCP_RECEIVE_WINDOW: u16 = TCP_CLIENT_WINDOW_PACKETS * nat::MAX_MSS;
 const SERVER_TCP_RECEIVE_WINDOW: u16 = nat::MAX_MSS;
@@ -71,35 +87,27 @@ const SERVER_TCP_RECEIVE_WINDOW: u16 = nat::MAX_MSS;
 const _: () = assert!(CLIENT_TCP_RECEIVE_WINDOW as usize <= TCP_RAW_RX_BUFFER_LEN);
 const _: () = assert!(SERVER_TCP_RECEIVE_WINDOW as usize <= WG_DATAGRAM_LEN);
 
-static RAW_RX_META: StaticCell<[raw::PacketMetadata; TCP_RAW_PACKETS]> = StaticCell::new();
-static RAW_TX_META: StaticCell<[raw::PacketMetadata; TCP_RAW_PACKETS]> = StaticCell::new();
-static RAW_RX_BUFFER: StaticCell<[u8; TCP_RAW_RX_BUFFER_LEN]> = StaticCell::new();
-static RAW_TX_BUFFER: StaticCell<[u8; TCP_RAW_TX_BUFFER_LEN]> = StaticCell::new();
-
 /// All 32 UDP mappings share this raw socket. This replaces four independently
 /// buffered datagram sockets and funds the peer API's bounded connection state.
 const UDP_RAW_BUFFER_LEN: usize = wirefeather::budget::INNER_MTU;
 const UDP_RAW_PACKETS: usize = 4;
-static UDP_RAW_RX_META: StaticCell<[raw::PacketMetadata; UDP_RAW_PACKETS]> = StaticCell::new();
-static UDP_RAW_TX_META: StaticCell<[raw::PacketMetadata; UDP_RAW_PACKETS]> = StaticCell::new();
-static UDP_RAW_RX_BUFFER: StaticCell<[u8; UDP_RAW_BUFFER_LEN]> = StaticCell::new();
-// This arena used to live in RTC-fast, which had "exactly enough" room for it.
-// Exactly enough is not a budget: the next static to grow overflowed the bank,
-// and the one that grew was the staged netmap, which is the one occupant RTC
-// exists for. A transient TX arena retains nothing across a reset and has no
-// business competing for retained memory, so it sits in .bss and the 1,280
-// bytes of stack headroom it costs are bought back from the radio heap the way
-// the rest of this trade is — see the memory.x patch and `heap_allocator!`.
-static UDP_RAW_TX_BUFFER: StaticCell<[u8; UDP_RAW_BUFFER_LEN]> = StaticCell::new();
-
 /// Echo diagnostics need only small packets; bounding these arenas leaves
 /// main-stack headroom for the control TLS handshake.
 const ICMP_RAW_BUFFER_LEN: usize = 128;
 const ICMP_RAW_PACKETS: usize = 4;
-static ICMP_RX_META: StaticCell<[raw::PacketMetadata; ICMP_RAW_PACKETS]> = StaticCell::new();
-static ICMP_TX_META: StaticCell<[raw::PacketMetadata; ICMP_RAW_PACKETS]> = StaticCell::new();
-static ICMP_RX_BUFFER: StaticCell<[u8; ICMP_RAW_BUFFER_LEN]> = StaticCell::new();
-static ICMP_TX_BUFFER: StaticCell<[u8; ICMP_RAW_BUFFER_LEN]> = StaticCell::new();
+// One raw socket accepts both IP versions and dispatches by protocol. Keep the
+// sum of the previous per-protocol RX payload and metadata capacities, including
+// two full IPv6 packets, so sharing does not trim a receive-window burst.
+const UPLINK_RAW_RX_BUFFER_LEN: usize =
+    TCP_RAW_RX_BUFFER_LEN + UDP_RAW_BUFFER_LEN + ICMP_RAW_BUFFER_LEN + ipv6::MTU * 2;
+const UPLINK_RAW_PACKETS: usize = TCP_RAW_PACKETS + UDP_RAW_PACKETS + ICMP_RAW_PACKETS + 4;
+// The actor builds one <=1280-byte packet at a time. A single shared TX slot
+// applies backpressure while the independent network task empties it.
+const UPLINK_RAW_TX_BUFFER_LEN: usize = wirefeather::budget::INNER_MTU;
+static RAW_RX_META: StaticCell<[raw::PacketMetadata; UPLINK_RAW_PACKETS]> = StaticCell::new();
+static RAW_TX_META: StaticCell<[raw::PacketMetadata; 1]> = StaticCell::new();
+static RAW_RX_BUFFER: StaticCell<[u8; UPLINK_RAW_RX_BUFFER_LEN]> = StaticCell::new();
+static RAW_TX_BUFFER: StaticCell<[u8; UPLINK_RAW_TX_BUFFER_LEN]> = StaticCell::new();
 
 /// Fixed source port for raw upstream peer-API DNS. It is outside both NAT
 /// ranges, so replies are unambiguous before their DNS tuple is checked.
@@ -121,8 +129,10 @@ static PEER_API: StaticCell<tailfeather_gateway::peerapi::Server> = StaticCell::
 /// The working buffers stay out of the task's future. They use main SRAM so
 /// RTC-fast can hold the complete bounded staged map for the live tailnet.
 struct Scratch {
-    /// A received outer datagram, or a received NAT reply payload.
-    datagram: [u8; wirefeather::MAX_DATAGRAM_LEN],
+    /// Include the full 1500-byte uplink IP packet even when it exceeds the
+    /// 1280-byte tunnel MTU, so IPv6 can send Packet Too Big instead of losing
+    /// it in RawSocket::recv as a truncated packet.
+    datagram: [u8; UPLINK_IP_MTU],
     /// An inner packet we have built and are about to encapsulate.
     inner: [u8; wirefeather::budget::INNER_MTU],
 }
@@ -236,12 +246,18 @@ pub(crate) fn now_ms() -> u64 {
     embassy_time::Instant::now().as_millis()
 }
 
-#[embassy_executor::task]
-pub async fn tunnel(
-    stack: Stack<'static>,
-    flash: esp_hal::peripherals::FLASH<'static>,
-    spawner: Spawner,
-) -> ! {
+/// Provision before the large data-plane future is polled. Returning a
+/// reference keeps by-value Node restoration temporaries off that future's
+/// already-large stack frame; its nested frames otherwise overwrite Wi-Fi BSS.
+pub(crate) struct Bootstrap {
+    node: &'static mut Node<PEERS>,
+    authority: Authority,
+    state_store: TwoSlot<crate::flash::FlashSlots<'static>>,
+    rng: HwRng,
+}
+
+#[inline(never)]
+pub(crate) fn provision(flash: esp_hal::peripherals::FLASH<'static>) -> Bootstrap {
     let authority = Authority::parse(
         crate::TS_CONTROL_URL,
         cfg!(feature = "test-insecure-control"),
@@ -256,7 +272,7 @@ pub async fn tunnel(
     let replacement_generation = loaded
         .replacement_generation()
         .expect("persistent state generation is not exhausted");
-    let node = match loaded.into_state() {
+    let node = NODE.init_with(|| match loaded.into_state() {
         Some(state) => match Node::restore_for_authority(&state, authority.digest()) {
             Ok(node) => {
                 if needs_repair && !node.requires_persistence() {
@@ -284,8 +300,7 @@ pub async fn tunnel(
                 authority.digest(),
             )
         }
-    };
-    let node = NODE.init(node);
+    });
     if node.requires_persistence() {
         let state = match node.poll(0) {
             Ok(Some(NodeAction::PersistState(state))) => state,
@@ -306,6 +321,22 @@ pub async fn tunnel(
             panic!("could not verify both identity state slots");
         }
     }
+    Bootstrap {
+        node,
+        authority,
+        state_store,
+        rng,
+    }
+}
+
+#[embassy_executor::task]
+pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner: Spawner) -> ! {
+    let Bootstrap {
+        node,
+        authority,
+        state_store,
+        mut rng,
+    } = bootstrap;
     let clock_floor = node.trusted_time_floor().max(crate::BUILD_TIME_FLOOR);
     let provisional_time = if authority.is_secure() {
         let Some(provisional_time) = bootstrap_time(stack, &mut rng, clock_floor).await else {
@@ -317,19 +348,25 @@ pub async fn tunnel(
     } else {
         clock_floor
     };
+    let ipv6_capable = ipv6_uplink(stack).is_some();
+    IPV6_READY.store(ipv6_capable, core::sync::atomic::Ordering::Relaxed);
+    info!("ipv6-exit-capable={ipv6_capable}");
+    if let Some(config) = stack.config_v6() {
+        info!(
+            "IPv6 uplink: {} gateway={:?}",
+            config.address, config.gateway
+        );
+    }
     spawner.spawn(
         crate::control::run(stack, node, authority, state_store, provisional_time)
             .expect("the control task is spawned once"),
     );
     let crate::control::BootstrapNotice::Ready(node) = crate::control::next_bootstrap().await;
-    let published_uplink = stack
-        .config_v4()
-        .expect("control bootstrap requires an IPv4 lease")
-        .address
-        .address();
+    let uplink = wait_ipv4(stack).await;
+    let published_uplink = uplink.address.address();
     let endpoint_refresh_at = embassy_time::Instant::now() + Duration::from_secs(30 * 60);
     let scratch = SCRATCH.init(Scratch {
-        datagram: [0; wirefeather::MAX_DATAGRAM_LEN],
+        datagram: [0; UPLINK_IP_MTU],
         inner: [0; wirefeather::budget::INNER_MTU],
     });
     crate::derp::start(spawner, stack);
@@ -345,45 +382,20 @@ pub async fn tunnel(
     );
     wg_socket.bind(LISTEN_PORT).expect("port 51820 is free");
 
-    let udp_raw_socket = RawSocket::new(
-        stack,
-        Some(IpVersion::Ipv4),
-        Some(IpProtocol::Udp),
-        UDP_RAW_RX_META.init([raw::PacketMetadata::EMPTY; UDP_RAW_PACKETS]),
-        UDP_RAW_RX_BUFFER.init([0; UDP_RAW_BUFFER_LEN]),
-        UDP_RAW_TX_META.init([raw::PacketMetadata::EMPTY; UDP_RAW_PACKETS]),
-        UDP_RAW_TX_BUFFER.init([0; UDP_RAW_BUFFER_LEN]),
-    );
+    // Initialize once, then lend fresh short borrows to each socket generation.
+    // Dropping a stalled socket clears its TX head and frees its stack handle.
+    let raw_rx_meta = RAW_RX_META.init([raw::PacketMetadata::EMPTY; UPLINK_RAW_PACKETS]);
+    let raw_rx_buffer = RAW_RX_BUFFER.init([0; UPLINK_RAW_RX_BUFFER_LEN]);
+    let raw_tx_meta = RAW_TX_META.init([raw::PacketMetadata::EMPTY; 1]);
+    let raw_tx_buffer = RAW_TX_BUFFER.init([0; UPLINK_RAW_TX_BUFFER_LEN]);
     let mut table = nat::Table::new();
-
-    // One raw socket handles all TCP. Unlike UDP, a forwarded connection
-    // cannot use a `TcpSocket`, because that would terminate the connection
-    // here rather than pass it through.
-    let raw_socket = RawSocket::new(
-        stack,
-        Some(IpVersion::Ipv4),
-        Some(IpProtocol::Tcp),
-        RAW_RX_META.init([raw::PacketMetadata::EMPTY; TCP_RAW_PACKETS]),
-        RAW_RX_BUFFER.init([0; TCP_RAW_RX_BUFFER_LEN]),
-        RAW_TX_META.init([raw::PacketMetadata::EMPTY; TCP_RAW_PACKETS]),
-        RAW_TX_BUFFER.init([0; TCP_RAW_TX_BUFFER_LEN]),
-    );
     let mut tcp_table = nat::TcpTable::new();
-    let icmp_socket = RawSocket::new(
-        stack,
-        Some(IpVersion::Ipv4),
-        Some(IpProtocol::Icmp),
-        ICMP_RX_META.init([raw::PacketMetadata::EMPTY; ICMP_RAW_PACKETS]),
-        ICMP_RX_BUFFER.init([0; ICMP_RAW_BUFFER_LEN]),
-        ICMP_TX_META.init([raw::PacketMetadata::EMPTY; ICMP_RAW_PACKETS]),
-        ICMP_TX_BUFFER.init([0; ICMP_RAW_BUFFER_LEN]),
-    );
     let mut icmp_table = nat::IcmpTable::new();
+    let mut ipv6_gateway = ipv6::Gateway::new();
+    let mut ipv6_owners: heapless::Vec<(core::net::Ipv6Addr, NodePublic), PEERS> =
+        heapless::Vec::new();
 
-    // Translated packets must carry this device's own address as their source.
-    let uplink = stack
-        .config_v4()
-        .expect("the tunnel task starts only after DHCP has completed");
+    // Translated packets must carry the current IPv4 snapshot as their source.
     let mut resolvers = [None; 3];
     let mut resolver_count = 0usize;
     for resolver in uplink.dns_servers.iter().take(resolvers.len()) {
@@ -407,237 +419,115 @@ pub async fn tunnel(
     );
 
     loop {
-        // `wait_recv_ready` borrows immutably, so all the sockets can be waited
-        // on together and only the one that fired is then borrowed mutably.
-        let ready = if reverse_priority {
-            match select6(
-                select(crate::control::next_notice(), crate::derp::next_notice()),
-                icmp_socket.wait_recv_ready(),
-                raw_socket.wait_recv_ready(),
-                udp_raw_socket.wait_recv_ready(),
-                wg_socket.wait_recv_ready(),
-                Timer::after(POLL_INTERVAL),
-            )
-            .await
-            {
-                Either6::First(Either::First(notice)) => Ready::Control(notice),
-                Either6::First(Either::Second(notice)) => Ready::Derp(notice),
-                Either6::Second(()) => Ready::Icmp,
-                Either6::Third(()) => Ready::Raw,
-                Either6::Fourth(()) => Ready::Udp,
-                Either6::Fifth(()) => Ready::Tunnel,
-                Either6::Sixth(()) => Ready::Timers,
+        let mut raw_socket = Uplink::new(
+            stack,
+            &mut raw_rx_meta[..],
+            &mut raw_rx_buffer[..],
+            &mut raw_tx_meta[..],
+            &mut raw_tx_buffer[..],
+        );
+        loop {
+            // No notice has been selected here. Preserve every control lease
+            // and DERP event; only this raw socket's queues are recreated.
+            if raw_socket.stalled() {
+                warn!("raw uplink stalled; resetting queues");
+                break;
             }
-        } else {
-            match select6(
-                wg_socket.wait_recv_ready(),
-                udp_raw_socket.wait_recv_ready(),
-                raw_socket.wait_recv_ready(),
-                icmp_socket.wait_recv_ready(),
-                select(crate::control::next_notice(), crate::derp::next_notice()),
-                Timer::after(POLL_INTERVAL),
-            )
-            .await
-            {
-                Either6::First(()) => Ready::Tunnel,
-                Either6::Second(()) => Ready::Udp,
-                Either6::Third(()) => Ready::Raw,
-                Either6::Fourth(()) => Ready::Icmp,
-                Either6::Fifth(Either::First(notice)) => Ready::Control(notice),
-                Either6::Fifth(Either::Second(notice)) => Ready::Derp(notice),
-                Either6::Sixth(()) => Ready::Timers,
-            }
-        };
-        reverse_priority = !reverse_priority;
-
-        // DHCP may replace the address while this long-lived task and its
-        // sockets remain active. Every translation must use the current lease.
-        let Some(uplink) = stack.config_v4() else {
-            stack.wait_config_up().await;
-            continue;
-        };
-        let our_ip = uplink.address.address().octets();
-        let uplink_prefix = uplink.address.prefix_len();
-        if uplink.address.address() != published_uplink
-            || embassy_time::Instant::now() >= endpoint_refresh_at
-        {
-            warn!("endpoint-publication stale; restarting control bootstrap");
-            esp_hal::system::software_reset();
-        }
-        resolvers.fill(None);
-        resolver_count = 0;
-        for (slot, resolver) in uplink.dns_servers.iter().take(resolvers.len()).enumerate() {
-            resolvers[slot] = Some(resolver.octets());
-            resolver_count += 1;
-        }
-
-        match ready {
-            Ready::Tunnel => {
-                if let Ok((len, from)) = wg_socket.recv_from(&mut scratch.datagram).await {
-                    handle_tunnel_datagram(
-                        node,
-                        &mut rng,
-                        scratch,
-                        len,
-                        from,
-                        &wg_socket,
-                        &udp_raw_socket,
-                        &mut table,
-                        &raw_socket,
-                        &mut tcp_table,
-                        &icmp_socket,
-                        &mut icmp_table,
-                        our_ip,
-                        uplink_prefix,
-                        peer_api,
-                        &resolvers,
-                        resolver_count,
-                        &mut diagnostics,
-                        &mut derp_regions,
-                    )
-                    .await;
-                }
-            }
-            Ready::Udp => {
-                handle_udp_reply(
-                    node,
-                    scratch,
-                    &udp_raw_socket,
-                    &mut table,
-                    peer_api,
-                    &resolvers,
-                    &wg_socket,
-                    our_ip,
-                    &mut diagnostics,
-                    &mut derp_regions,
+            // `wait_recv_ready` borrows immutably, so all the sockets can be waited
+            // on together and only the one that fired is then borrowed mutably.
+            let ready = if reverse_priority {
+                match select4(
+                    select(crate::control::next_notice(), crate::derp::next_notice()),
+                    raw_socket.wait_recv_ready(),
+                    wg_socket.wait_recv_ready(),
+                    Timer::after(POLL_INTERVAL),
                 )
-                .await;
-            }
-            Ready::Raw => {
-                // A receive-window burst is already ordered and bounded. Drain
-                // everything currently queued before timer bookkeeping so the
-                // raw ring reaches its wraparound slack promptly. Recheck with
-                // a one-poll future to avoid waiting for another packet here.
-                for _ in 0..TCP_RAW_PACKETS {
-                    handle_raw_reply(
-                        node,
-                        scratch,
-                        &raw_socket,
-                        &mut tcp_table,
-                        &wg_socket,
-                        our_ip,
-                        &mut derp_regions,
-                    )
-                    .await;
-                    if poll_once(raw_socket.wait_recv_ready()).is_pending() {
-                        break;
-                    }
-                }
-            }
-            Ready::Icmp => {
-                handle_icmp_reply(
-                    node,
-                    scratch,
-                    &icmp_socket,
-                    &mut icmp_table,
-                    &wg_socket,
-                    our_ip,
-                    &mut derp_regions,
-                )
-                .await;
-            }
-            Ready::Control(crate::control::Notice::Map(lease)) => {
-                let status = node
-                    .handle_control_event(tailfeather::ControlEvent::MapFinished {
-                        lease: &mut *lease,
-                        result: Ok(()),
-                    })
-                    .ok()
-                    .flatten();
-                crate::control::emit_action(status.as_ref());
-                info!(
-                    "netmap peers={} truncated={}",
-                    node.netmap().peers.len(),
-                    node.netmap().peers_truncated
-                );
-                if node.exit_control_ready() {
-                    info!("state=exit-ready");
-                }
-                node.seed_staging(&mut *lease);
-                crate::control::return_lease(lease);
-            }
-            Ready::Control(crate::control::Notice::NodeKeyExpired) => {
-                crate::control::rotate_expired_node_key(node, &mut rng).await;
-            }
-            Ready::Derp(crate::derp::Notice::Connected { slot, region }) => {
-                // The worker is the authority on what its own slot holds, so
-                // its report is adopted rather than checked against the local
-                // map. Dropping a mismatched notice left the worker connected
-                // with nobody tracking it: the node never learned the region
-                // existed, so it never asked for a disconnect, and the slot was
-                // occupied for good — half the relay capacity gone until
-                // reboot.
-                if slot < derp_regions.len() {
-                    derp_regions[slot] = Some(region);
-                }
-                let action = node
-                    .handle_derp_event(DerpEvent::Connected { region }, now_ms(), &mut rng)
-                    .ok()
-                    .flatten();
-                crate::control::emit_action(action.as_ref());
-                if let Some(action) = action {
-                    refused_derp.push(
-                        dispatch_node_action(node, &wg_socket, &mut derp_regions, action).await,
-                    );
-                }
-                if node.exit_control_ready() {
-                    info!("state=exit-ready");
-                }
-            }
-            Ready::Derp(crate::derp::Notice::PeerGone { region, peer, .. }) => {
-                // Relaying through a region the server says has no such peer
-                // only burns MTU-sized writes. Clearing it lets the node pick
-                // the peer's home region or a direct path on the next send.
-                node.forget_relay(&peer, region);
-                rate_limited(&mut diagnostics.derp_peer_gone, "derp-peer-gone");
-            }
-            Ready::Derp(crate::derp::Notice::Disconnected { slot, region }) => {
-                if derp_regions.get(slot) == Some(&Some(region)) {
-                    derp_regions[slot] = None;
-                }
-                if let Ok(Some(action)) =
-                    node.handle_derp_event(DerpEvent::Disconnected { region }, now_ms(), &mut rng)
+                .await
                 {
-                    refused_derp.push(
-                        dispatch_node_action(node, &wg_socket, &mut derp_regions, action).await,
-                    );
+                    Either4::First(Either::First(notice)) => Ready::Control(notice),
+                    Either4::First(Either::Second(notice)) => Ready::Derp(notice),
+                    Either4::Second(()) => Ready::Raw,
+                    Either4::Third(()) => Ready::Tunnel,
+                    Either4::Fourth(()) => Ready::Timers,
+                }
+            } else {
+                match select4(
+                    wg_socket.wait_recv_ready(),
+                    raw_socket.wait_recv_ready(),
+                    select(crate::control::next_notice(), crate::derp::next_notice()),
+                    Timer::after(POLL_INTERVAL),
+                )
+                .await
+                {
+                    Either4::First(()) => Ready::Tunnel,
+                    Either4::Second(()) => Ready::Raw,
+                    Either4::Third(Either::First(notice)) => Ready::Control(notice),
+                    Either4::Third(Either::Second(notice)) => Ready::Derp(notice),
+                    Either4::Fourth(()) => Ready::Timers,
+                }
+            };
+            reverse_priority = !reverse_priority;
+
+            // DHCP may replace the address while this long-lived task and its
+            // sockets remain active. Every translation must use the current lease.
+            // Keep `ready`, including an owned map lease, alive across DHCP loss.
+            // Waiting only before select would leave a deconfiguration race.
+            let uplink = wait_ipv4(stack).await;
+            if ipv6_uplink(stack).is_some()
+                != IPV6_READY.load(core::sync::atomic::Ordering::Relaxed)
+            {
+                warn!("IPv6 uplink capability changed; restarting control advertisement");
+                esp_hal::system::software_reset();
+            }
+            // A control map can reassign a tailnet address to another node key.
+            // Do not let an old peer's return traffic reach the new owner.
+            if ipv6_owners.iter().any(|(address, key)| {
+                node.netmap()
+                    .peers
+                    .by_node_key(key)
+                    .is_none_or(|peer| peer.tailscale_ipv6() != Some(*address))
+            }) {
+                ipv6_gateway.clear(now_ms());
+            }
+            ipv6_owners.clear();
+            for peer in node.netmap().peers.iter() {
+                if let Some(address) = peer.tailscale_ipv6() {
+                    let _ = ipv6_owners.push((address, peer.node_key));
                 }
             }
-            Ready::Derp(crate::derp::Notice::Packet { slot, region, peer }) => {
-                let action = crate::derp::with_packet(slot, |packet| {
-                    node.handle_derp_event(
-                        DerpEvent::Packet {
-                            region,
-                            peer,
-                            payload: packet,
-                        },
-                        now_ms(),
-                        &mut rng,
-                    )
-                });
-                match action {
-                    Some(Ok(Some(NodeAction::DeliveredIpv4 { peer, packet }))) => {
-                        handle_delivered_ipv4(
+            let our_ip = uplink.address.address().octets();
+            let uplink_prefix = uplink.address.prefix_len();
+            if uplink.address.address() != published_uplink
+                || embassy_time::Instant::now() >= endpoint_refresh_at
+            {
+                warn!("endpoint-publication stale; restarting control bootstrap");
+                esp_hal::system::software_reset();
+            }
+            resolvers.fill(None);
+            resolver_count = 0;
+            for (slot, resolver) in uplink.dns_servers.iter().take(resolvers.len()).enumerate() {
+                resolvers[slot] = Some(resolver.octets());
+                resolver_count += 1;
+            }
+
+            match ready {
+                Ready::Tunnel => {
+                    if let Ok((len, from)) = wg_socket.recv_from(&mut scratch.datagram).await {
+                        handle_tunnel_datagram(
                             node,
-                            &peer,
-                            packet.as_slice(),
+                            &mut rng,
                             scratch,
+                            len,
+                            from,
+                            &raw_socket,
+                            &mut ipv6_gateway,
+                            ipv6_uplink(stack),
                             &wg_socket,
-                            &udp_raw_socket,
+                            &raw_socket,
                             &mut table,
                             &raw_socket,
                             &mut tcp_table,
-                            &icmp_socket,
+                            &raw_socket,
                             &mut icmp_table,
                             our_ip,
                             uplink_prefix,
@@ -649,72 +539,267 @@ pub async fn tunnel(
                         )
                         .await;
                     }
-                    Some(Ok(Some(NodeAction::Derp(command)))) => {
-                        refused_derp.push(dispatch_derp(node, &mut derp_regions, command).await);
-                    }
-                    Some(Err(error)) => {
-                        diagnostics.derp_packet_errors =
-                            diagnostics.derp_packet_errors.saturating_add(1);
-                        if diagnostics.derp_packet_errors.is_power_of_two() {
-                            warn!(
-                                "metric=derp-packet-error count={} error={error}",
-                                diagnostics.derp_packet_errors
-                            );
+                }
+                Ready::Raw => {
+                    // Drain a bounded burst, then run timers and control maintenance.
+                    // Only this receive future registers the shared raw RX waker.
+                    for _ in 0..UPLINK_RAW_PACKETS {
+                        let Ok(len) = raw_socket.recv(&mut scratch.datagram).await else {
+                            break;
+                        };
+                        if len == 0 {
+                            continue;
+                        }
+                        match scratch.datagram[0] >> 4 {
+                            4 if len >= 20 => match scratch.datagram[9] {
+                                6 => {
+                                    handle_raw_reply(
+                                        node,
+                                        scratch,
+                                        len,
+                                        &mut tcp_table,
+                                        &wg_socket,
+                                        our_ip,
+                                        &mut derp_regions,
+                                    )
+                                    .await
+                                }
+                                17 => {
+                                    handle_udp_reply(
+                                        node,
+                                        scratch,
+                                        len,
+                                        &mut table,
+                                        peer_api,
+                                        &resolvers,
+                                        &wg_socket,
+                                        our_ip,
+                                        &mut diagnostics,
+                                        &mut derp_regions,
+                                    )
+                                    .await
+                                }
+                                1 => {
+                                    handle_icmp_reply(
+                                        node,
+                                        scratch,
+                                        len,
+                                        &mut icmp_table,
+                                        &wg_socket,
+                                        our_ip,
+                                        &mut derp_regions,
+                                    )
+                                    .await
+                                }
+                                _ => {}
+                            },
+                            6 => {
+                                handle_ipv6_reply(
+                                    node,
+                                    scratch,
+                                    len,
+                                    &raw_socket,
+                                    &mut ipv6_gateway,
+                                    ipv6_uplink(stack),
+                                    &wg_socket,
+                                    &mut derp_regions,
+                                )
+                                .await
+                            }
+                            _ => {}
+                        }
+                        if poll_once(raw_socket.wait_recv_ready()).is_pending() {
+                            break;
                         }
                     }
-                    _ => {}
                 }
+                Ready::Control(crate::control::Notice::Map(lease)) => {
+                    let status = node
+                        .handle_control_event(tailfeather::ControlEvent::MapFinished {
+                            lease: &mut *lease,
+                            result: Ok(()),
+                        })
+                        .ok()
+                        .flatten();
+                    crate::control::emit_action(status.as_ref());
+                    info!(
+                        "netmap peers={} truncated={}",
+                        node.netmap().peers.len(),
+                        node.netmap().peers_truncated
+                    );
+                    if node.exit_control_ready() {
+                        info!("state=exit-ready");
+                    }
+                    node.seed_staging(&mut *lease);
+                    crate::control::return_lease(lease);
+                }
+                Ready::Control(crate::control::Notice::NodeKeyExpired) => {
+                    crate::control::rotate_expired_node_key(node, &mut rng).await;
+                }
+                Ready::Derp(crate::derp::Notice::Connected { slot, region }) => {
+                    // The worker is the authority on what its own slot holds, so
+                    // its report is adopted rather than checked against the local
+                    // map. Dropping a mismatched notice left the worker connected
+                    // with nobody tracking it: the node never learned the region
+                    // existed, so it never asked for a disconnect, and the slot was
+                    // occupied for good — half the relay capacity gone until
+                    // reboot.
+                    if slot < derp_regions.len() {
+                        derp_regions[slot] = Some(region);
+                    }
+                    let action = node
+                        .handle_derp_event(DerpEvent::Connected { region }, now_ms(), &mut rng)
+                        .ok()
+                        .flatten();
+                    crate::control::emit_action(action.as_ref());
+                    if let Some(action) = action {
+                        refused_derp.push(
+                            dispatch_node_action(node, &wg_socket, &mut derp_regions, action).await,
+                        );
+                    }
+                    if node.exit_control_ready() {
+                        info!("state=exit-ready");
+                    }
+                }
+                Ready::Derp(crate::derp::Notice::PeerGone { region, peer, .. }) => {
+                    // Relaying through a region the server says has no such peer
+                    // only burns MTU-sized writes. Clearing it lets the node pick
+                    // the peer's home region or a direct path on the next send.
+                    node.forget_relay(&peer, region);
+                    rate_limited(&mut diagnostics.derp_peer_gone, "derp-peer-gone");
+                }
+                Ready::Derp(crate::derp::Notice::Disconnected { slot, region }) => {
+                    if derp_regions.get(slot) == Some(&Some(region)) {
+                        derp_regions[slot] = None;
+                    }
+                    if let Ok(Some(action)) = node.handle_derp_event(
+                        DerpEvent::Disconnected { region },
+                        now_ms(),
+                        &mut rng,
+                    ) {
+                        refused_derp.push(
+                            dispatch_node_action(node, &wg_socket, &mut derp_regions, action).await,
+                        );
+                    }
+                }
+                Ready::Derp(crate::derp::Notice::Packet { slot, region, peer }) => {
+                    let action = crate::derp::with_packet(slot, |packet| {
+                        node.handle_derp_event(
+                            DerpEvent::Packet {
+                                region,
+                                peer,
+                                payload: packet,
+                            },
+                            now_ms(),
+                            &mut rng,
+                        )
+                    });
+                    match action {
+                        Some(Ok(Some(NodeAction::DeliveredIpv6 { peer, packet }))) => {
+                            handle_delivered_ipv6(
+                                node,
+                                &peer,
+                                packet.as_slice(),
+                                scratch,
+                                &wg_socket,
+                                &raw_socket,
+                                &mut ipv6_gateway,
+                                ipv6_uplink(stack),
+                                &mut derp_regions,
+                            )
+                            .await;
+                        }
+                        Some(Ok(Some(NodeAction::DeliveredIpv4 { peer, packet }))) => {
+                            handle_delivered_ipv4(
+                                node,
+                                &peer,
+                                packet.as_slice(),
+                                scratch,
+                                &wg_socket,
+                                &raw_socket,
+                                &mut table,
+                                &raw_socket,
+                                &mut tcp_table,
+                                &raw_socket,
+                                &mut icmp_table,
+                                our_ip,
+                                uplink_prefix,
+                                peer_api,
+                                &resolvers,
+                                resolver_count,
+                                &mut diagnostics,
+                                &mut derp_regions,
+                            )
+                            .await;
+                        }
+                        Some(Ok(Some(NodeAction::Derp(command)))) => {
+                            refused_derp
+                                .push(dispatch_derp(node, &mut derp_regions, command).await);
+                        }
+                        Some(Err(error)) => {
+                            diagnostics.derp_packet_errors =
+                                diagnostics.derp_packet_errors.saturating_add(1);
+                            if diagnostics.derp_packet_errors.is_power_of_two() {
+                                warn!(
+                                    "metric=derp-packet-error count={} error={error}",
+                                    diagnostics.derp_packet_errors
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ready::Timers => {}
             }
-            Ready::Timers => {}
-        }
 
-        // Peer-API failover, timeout, close, and retransmission deadlines must
-        // advance even while another socket is continuously ready.
-        let tunnel_ip = assigned_ipv4(node).unwrap_or([0; 4]);
-        drive_peerapi_timers(
-            node,
-            scratch,
-            peer_api,
-            &udp_raw_socket,
-            &resolvers,
-            resolver_count,
-            &wg_socket,
-            our_ip,
-            tunnel_ip,
-            &mut diagnostics,
-            &mut derp_regions,
-        )
-        .await;
+            // Peer-API failover, timeout, close, and retransmission deadlines must
+            // advance even while another socket is continuously ready.
+            let tunnel_ip = assigned_ipv4(node).unwrap_or([0; 4]);
+            drive_peerapi_timers(
+                node,
+                scratch,
+                peer_api,
+                &raw_socket,
+                &resolvers,
+                resolver_count,
+                &wg_socket,
+                our_ip,
+                tunnel_ip,
+                &mut diagnostics,
+                &mut derp_regions,
+            )
+            .await;
 
-        while let Ok(Some(action)) = node.poll_tunnel_timers(now_ms()) {
-            dispatch_transmit(&wg_socket, &mut derp_regions, action).await;
-        }
-        if let Ok(Some(NodeAction::DirectTransmit {
-            endpoint, packet, ..
-        })) = node.poll_disco(now_ms(), &mut rng)
-        {
-            send_direct(&wg_socket, packet.as_slice(), endpoint).await;
-        }
-        refresh_derp_preferences(node, &derp_regions, &mut preferred_derp);
-        if let Ok(Some(NodeAction::Derp(command))) = node.poll_derp() {
-            refused_derp.push(dispatch_derp(node, &mut derp_regions, command).await);
-        }
-        // A refused connect leaves the node believing that region is still
-        // connecting, which it never retries. Replaying it as a disconnect
-        // clears that, marks the region as last-failed and rotates the relay
-        // node list, so the next `poll_derp` issues a fresh connect. Handled
-        // once per iteration so a repeated refusal cannot recurse; a refusal of
-        // the replay itself is carried into the next iteration instead.
-        if let Some(region) = refused_derp.pop()
-            && let Ok(Some(action)) =
-                node.handle_derp_event(DerpEvent::Disconnected { region }, now_ms(), &mut rng)
-        {
-            // The replayed connect can be refused again while the worker queue
-            // is still full. Carrying that refusal into the next iteration,
-            // rather than discarding it, keeps the region from being stranded
-            // in `derp_connecting` with no further retry.
-            refused_derp
-                .push(dispatch_node_action(node, &wg_socket, &mut derp_regions, action).await);
+            while let Ok(Some(action)) = node.poll_tunnel_timers(now_ms()) {
+                dispatch_transmit(&wg_socket, &mut derp_regions, action).await;
+            }
+            if let Ok(Some(NodeAction::DirectTransmit {
+                endpoint, packet, ..
+            })) = node.poll_disco(now_ms(), &mut rng)
+            {
+                send_direct(&wg_socket, packet.as_slice(), endpoint).await;
+            }
+            refresh_derp_preferences(node, &derp_regions, &mut preferred_derp);
+            if let Ok(Some(NodeAction::Derp(command))) = node.poll_derp() {
+                refused_derp.push(dispatch_derp(node, &mut derp_regions, command).await);
+            }
+            // A refused connect leaves the node believing that region is still
+            // connecting, which it never retries. Replaying it as a disconnect
+            // clears that, marks the region as last-failed and rotates the relay
+            // node list, so the next `poll_derp` issues a fresh connect. Handled
+            // once per iteration so a repeated refusal cannot recurse; a refusal of
+            // the replay itself is carried into the next iteration instead.
+            if let Some(region) = refused_derp.pop()
+                && let Ok(Some(action)) =
+                    node.handle_derp_event(DerpEvent::Disconnected { region }, now_ms(), &mut rng)
+            {
+                // The replayed connect can be refused again while the worker queue
+                // is still full. Carrying that refusal into the next iteration,
+                // rather than discarding it, keeps the region from being stranded
+                // in `derp_connecting` with no further retry.
+                refused_derp
+                    .push(dispatch_node_action(node, &wg_socket, &mut derp_regions, action).await);
+            }
         }
     }
 }
@@ -747,7 +832,9 @@ async fn bootstrap_time(stack: Stack<'static>, rng: &mut HwRng, floor: u64) -> O
     let mut consensus = tailfeather::time::Consensus::new();
     let mut response = [0; 512];
     'servers: for address in addresses {
-        let embassy_net::IpAddress::Ipv4(address) = address;
+        let embassy_net::IpAddress::Ipv4(address) = address else {
+            continue;
+        };
         let server = address.octets();
         let mut nonce = [0; 8];
         rng.0.read(&mut nonce);
@@ -799,9 +886,7 @@ async fn bootstrap_time(stack: Stack<'static>, rng: &mut HwRng, floor: u64) -> O
 )]
 enum Ready {
     Tunnel,
-    Udp,
     Raw,
-    Icmp,
     Control(crate::control::Notice),
     Derp(crate::derp::Notice),
     Timers,
@@ -815,12 +900,15 @@ async fn handle_tunnel_datagram(
     scratch: &mut Scratch,
     len: usize,
     from: udp::UdpMetadata,
+    ipv6_socket: &Uplink<'_>,
+    ipv6_gateway: &mut ipv6::Gateway,
+    ipv6_uplink: Option<core::net::Ipv6Addr>,
     wg_socket: &UdpSocket<'_>,
-    udp_raw_socket: &RawSocket<'_>,
+    udp_raw_socket: &Uplink<'_>,
     table: &mut nat::Table,
-    raw_socket: &RawSocket<'_>,
+    raw_socket: &Uplink<'_>,
     tcp_table: &mut nat::TcpTable,
-    icmp_socket: &RawSocket<'_>,
+    icmp_socket: &Uplink<'_>,
     icmp_table: &mut nat::IcmpTable,
     our_ip: [u8; 4],
     uplink_prefix: u8,
@@ -837,11 +925,26 @@ async fn handle_tunnel_datagram(
             CoreIpv4Addr::from(address.octets()),
             from.endpoint.port,
         )),
+        embassy_net::IpAddress::Ipv6(_) => return,
     };
     match node.handle_direct_from(&datagram[..len], source, now_ms(), rng) {
         Ok(Some(NodeAction::DirectTransmit {
             endpoint, packet, ..
         })) => send_direct(wg_socket, packet.as_slice(), endpoint).await,
+        Ok(Some(NodeAction::DeliveredIpv6 { peer, packet })) => {
+            handle_delivered_ipv6(
+                node,
+                &peer,
+                packet.as_slice(),
+                scratch,
+                wg_socket,
+                ipv6_socket,
+                ipv6_gateway,
+                ipv6_uplink,
+                derp_regions,
+            )
+            .await;
+        }
         Ok(Some(NodeAction::DeliveredIpv4 { peer, packet })) => {
             handle_delivered_ipv4(
                 node,
@@ -871,17 +974,123 @@ async fn handle_tunnel_datagram(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn handle_ipv6_reply(
+    node: &mut Node<PEERS>,
+    scratch: &mut Scratch,
+    len: usize,
+    socket: &Uplink<'_>,
+    gateway: &mut ipv6::Gateway,
+    uplink: Option<core::net::Ipv6Addr>,
+    wg_socket: &UdpSocket<'_>,
+    derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
+) {
+    let Some(uplink) = uplink else {
+        return;
+    };
+    match gateway.inbound(&mut scratch.datagram[..len], uplink, now_ms()) {
+        Ok(client) => {
+            if let Some(peer) = peer_for_ipv6(node, client) {
+                encapsulate_and_send(
+                    node,
+                    &peer,
+                    &scratch.datagram[..len],
+                    wg_socket,
+                    derp_regions,
+                )
+                .await;
+            }
+        }
+        Err(error) => {
+            if let Some(size) = gateway.error_response(
+                &scratch.datagram[..len],
+                uplink,
+                error,
+                now_ms(),
+                &mut scratch.inner,
+            ) {
+                let _ = socket.send(&scratch.inner[..size]).await;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_delivered_ipv6(
+    node: &mut Node<PEERS>,
+    peer: &NodePublic,
+    packet: &[u8],
+    scratch: &mut Scratch,
+    wg_socket: &UdpSocket<'_>,
+    socket: &Uplink<'_>,
+    gateway: &mut ipv6::Gateway,
+    uplink: Option<core::net::Ipv6Addr>,
+    derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
+) {
+    let Some(source) = node
+        .netmap()
+        .peers
+        .by_node_key(peer)
+        .and_then(|p| p.tailscale_ipv6())
+    else {
+        return;
+    };
+    if peer_for_ipv6(node, source) != Some(*peer) {
+        return;
+    }
+    if !node.netmap().packet_filter.allows_ipv6(packet) {
+        return;
+    }
+    if !ipv6::Packet::parse(packet).is_ok_and(|p| p.source == source) {
+        return;
+    }
+    if let Some(our_tunnel_ip) = assigned_ipv6(node)
+        && let Some(len) = ipv6::echo_reply(packet, our_tunnel_ip, &mut scratch.inner)
+    {
+        encapsulate_and_send(node, peer, &scratch.inner[..len], wg_socket, derp_regions).await;
+        return;
+    }
+    let Some(uplink) = uplink else {
+        return;
+    };
+    if !node.netmap().ipv6_default_route_approved() {
+        return;
+    }
+    let result = if let Some(out) = scratch.inner.get_mut(..packet.len()) {
+        out.copy_from_slice(packet);
+        gateway.prepare_outbound(out, source, uplink, now_ms())
+    } else {
+        Err(ipv6::Error::PacketTooBig)
+    };
+    let error = match result {
+        Ok(prepared) => {
+            if socket.send(&scratch.inner[..packet.len()]).await {
+                prepared.commit(now_ms());
+            }
+            None
+        }
+        Err(error) => Some(error),
+    };
+    if let Some(error) = error
+        && let Some(our_tunnel_ip) = assigned_ipv6(node)
+        && let Some(len) =
+            gateway.error_response(packet, our_tunnel_ip, error, now_ms(), &mut scratch.inner)
+    {
+        encapsulate_and_send(node, peer, &scratch.inner[..len], wg_socket, derp_regions).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_delivered_ipv4(
     node: &mut Node<PEERS>,
     peer: &NodePublic,
     packet: &[u8],
     scratch: &mut Scratch,
     wg_socket: &UdpSocket<'_>,
-    udp_raw_socket: &RawSocket<'_>,
+    udp_raw_socket: &Uplink<'_>,
     table: &mut nat::Table,
-    raw_socket: &RawSocket<'_>,
+    raw_socket: &Uplink<'_>,
     tcp_table: &mut nat::TcpTable,
-    icmp_socket: &RawSocket<'_>,
+    icmp_socket: &Uplink<'_>,
     icmp_table: &mut nat::IcmpTable,
     our_ip: [u8; 4],
     uplink_prefix: u8,
@@ -950,7 +1159,7 @@ async fn handle_delivered_ipv4(
         .and_then(|our_tunnel_ip| crate::inner::icmp_echo_reply(packet, our_tunnel_ip, inner))
     {
         encapsulate_and_send(node, peer, &inner[..reply_len], wg_socket, derp_regions).await;
-    } else if !node.netmap().default_routes_approved() {
+    } else if !node.netmap().ipv4_default_route_approved() {
         warn!("exit-policy drop=routes-not-approved");
     } else if !nat::ipv4_ttl_is_forwardable(packet) {
         warn!("exit-policy drop=expired-ttl");
@@ -998,7 +1207,7 @@ async fn handle_peerapi_segment(
     authorized: bool,
     scratch: &mut Scratch,
     server: &mut tailfeather_gateway::peerapi::Server,
-    udp_raw_socket: &RawSocket<'_>,
+    udp_raw_socket: &Uplink<'_>,
     resolvers: &[Option<[u8; 4]>; 3],
     resolver_count: usize,
     wg_socket: &UdpSocket<'_>,
@@ -1044,7 +1253,8 @@ async fn handle_peerapi_segment(
                 uplink_ip,
                 scratch,
                 diagnostics,
-            ))
+            )
+            .await)
     {
         server.fail_dns(slot);
         dns_failed = true;
@@ -1079,7 +1289,7 @@ async fn handle_peerapi_segment(
 /// no approved default routes is not an exit node yet, so there is nothing to
 /// resolve *through*.
 fn client_may_resolve(node: &Node<PEERS>, client_ip: [u8; 4]) -> bool {
-    node.netmap().default_routes_approved()
+    node.netmap().ipv4_default_route_approved()
         && tailfeather_gateway::peerapi::client_may_resolve(client_ip, |client| {
             node.netmap()
                 .packet_filter
@@ -1088,12 +1298,12 @@ fn client_may_resolve(node: &Node<PEERS>, client_ip: [u8; 4]) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn send_peerapi_dns_query(
+async fn send_peerapi_dns_query(
     node: &Node<PEERS>,
     server: &mut tailfeather_gateway::peerapi::Server,
     slot: usize,
     resolver: usize,
-    socket: &RawSocket<'_>,
+    socket: &Uplink<'_>,
     resolvers: &[Option<[u8; 4]>; 3],
     uplink_ip: [u8; 4],
     scratch: &mut Scratch,
@@ -1128,21 +1338,17 @@ fn send_peerapi_dns_query(
     ) else {
         return false;
     };
-    match poll_once(socket.send(&scratch.inner[..len])) {
-        Poll::Ready(()) => {
-            server.note_dns_sent(slot, resolver, now_ms());
-            rate_limited(
-                &mut diagnostics.peerapi_dns_queries,
-                "peerapi-dns-query-sent",
-            );
-            true
-        }
-        Poll::Pending => {
-            server.note_dns_unsent(slot);
-            rate_limited(&mut diagnostics.udp_queue_drops, "peerapi-dns-queue-drop");
-            true
-        }
+    if socket.send(&scratch.inner[..len]).await {
+        server.note_dns_sent(slot, resolver, now_ms());
+        rate_limited(
+            &mut diagnostics.peerapi_dns_queries,
+            "peerapi-dns-query-sent",
+        );
+    } else {
+        server.note_dns_unsent(slot);
+        rate_limited(&mut diagnostics.udp_queue_drops, "peerapi-dns-queue-drop");
     }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1150,7 +1356,7 @@ async fn drive_peerapi_timers(
     node: &mut Node<PEERS>,
     scratch: &mut Scratch,
     server: &mut tailfeather_gateway::peerapi::Server,
-    udp_raw_socket: &RawSocket<'_>,
+    udp_raw_socket: &Uplink<'_>,
     resolvers: &[Option<[u8; 4]>; 3],
     resolver_count: usize,
     wg_socket: &UdpSocket<'_>,
@@ -1171,7 +1377,8 @@ async fn drive_peerapi_timers(
                 uplink_ip,
                 scratch,
                 diagnostics,
-            ) =>
+            )
+            .await =>
         {
             rate_limited(
                 &mut diagnostics.peerapi_dns_failure,
@@ -1239,7 +1446,7 @@ async fn send_peerapi_response(
 }
 
 async fn forward_icmp_out(
-    socket: &RawSocket<'_>,
+    socket: &Uplink<'_>,
     table: &mut nat::IcmpTable,
     scratch: &mut [u8],
     packet: &[u8],
@@ -1262,44 +1469,49 @@ async fn forward_icmp_out(
     if !nat::decrement_ipv4_ttl(out) || !nat::rewrite_icmp_outbound(out, our_ip, slot) {
         return;
     }
-    match poll_once(socket.send(out)) {
-        Poll::Ready(()) => table.observe_outbound(slot, info, now),
-        Poll::Pending => rate_limited(&mut diagnostics.icmp_queue_drops, "icmp-queue-drop"),
+    if socket.send(out).await {
+        table.observe_outbound(slot, info, now);
+    } else {
+        rate_limited(&mut diagnostics.icmp_queue_drops, "icmp-queue-drop");
     }
 }
 
 async fn handle_icmp_reply(
     node: &mut Node<PEERS>,
     scratch: &mut Scratch,
-    socket: &RawSocket<'_>,
+    len: usize,
     table: &mut nat::IcmpTable,
     wg_socket: &UdpSocket<'_>,
     our_ip: [u8; 4],
     derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
 ) {
-    let Ok(len) = socket.recv(&mut scratch.inner).await else {
-        return;
-    };
-    let Some(info) = nat::parse_icmp4(&scratch.inner[..len]) else {
+    let Some(info) = nat::parse_icmp4(&scratch.datagram[..len]) else {
         return;
     };
     let Some(flow) = table.reverse(&info, our_ip, now_ms()) else {
         return;
     };
-    if !nat::rewrite_icmp_inbound(&mut scratch.inner[..len], flow)
-        || !nat::decrement_ipv4_ttl(&mut scratch.inner[..len])
+    if !nat::rewrite_icmp_inbound(&mut scratch.datagram[..len], flow)
+        || !nat::decrement_ipv4_ttl(&mut scratch.datagram[..len])
     {
         return;
     }
     let Some(peer) = peer_for_ip(node, flow.client_ip) else {
         return;
     };
-    encapsulate_and_send(node, &peer, &scratch.inner[..len], wg_socket, derp_regions).await;
+    encapsulate_and_send(
+        node,
+        &peer,
+        &scratch.datagram[..len],
+        wg_socket,
+        derp_regions,
+    )
+    .await;
 }
 
 /// Translate a tunnelled UDP datagram through the shared raw uplink socket.
 async fn forward_udp_out(
-    socket: &RawSocket<'_>,
+    socket: &Uplink<'_>,
     table: &mut nat::Table,
     scratch: &mut [u8],
     flow: &nat::Udp4<'_>,
@@ -1331,16 +1543,17 @@ async fn forward_udp_out(
     scratch[10..12].fill(0);
     let checksum = tailfeather_gateway::checksum(&scratch[..20]);
     scratch[10..12].copy_from_slice(&checksum.to_be_bytes());
-    match poll_once(socket.send(&scratch[..len])) {
-        Poll::Ready(()) => table.observe_outbound(
+    if socket.send(&scratch[..len]).await {
+        table.observe_outbound(
             slot,
             flow.src_ip,
             flow.src_port,
             flow.dst_ip,
             flow.dst_port,
             now,
-        ),
-        Poll::Pending => rate_limited(&mut diagnostics.udp_queue_drops, "udp-queue-drop"),
+        );
+    } else {
+        rate_limited(&mut diagnostics.udp_queue_drops, "udp-queue-drop");
     }
 }
 
@@ -1351,7 +1564,7 @@ async fn forward_udp_out(
 /// are rewritten. The connection is between the tunnel client and the server,
 /// with this device in the middle.
 async fn forward_tcp_out(
-    raw_socket: &RawSocket<'_>,
+    raw_socket: &Uplink<'_>,
     tcp_table: &mut nat::TcpTable,
     scratch: &mut [u8],
     packet: &[u8],
@@ -1390,25 +1603,30 @@ async fn forward_tcp_out(
         return;
     }
 
-    raw_socket.send(buffer).await;
-    tcp_table.observe_outbound(slot, info, now_ms);
+    if raw_socket.send(buffer).await {
+        tcp_table.observe_outbound(slot, info, now_ms);
+    }
 }
 
 /// Translate a TCP segment arriving from the uplink back into the tunnel.
 async fn handle_raw_reply(
     node: &mut Node<PEERS>,
     scratch: &mut Scratch,
-    raw_socket: &RawSocket<'_>,
+    len: usize,
     tcp_table: &mut nat::TcpTable,
     wg_socket: &UdpSocket<'_>,
     our_ip: [u8; 4],
     derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
 ) {
-    let Scratch { inner, .. } = scratch;
-
-    let Ok(len) = raw_socket.recv(inner).await else {
+    // Preserve the old 1280-byte receive contract before recording FIN/sequence
+    // state: an oversized segment cannot be delivered through WireGuard.
+    if len > wirefeather::budget::INNER_MTU {
         return;
-    };
+    }
+    let Scratch {
+        datagram: inner, ..
+    } = scratch;
+
     let packet = &inner[..len];
     if !nat::ipv4_ttl_is_forwardable(packet) {
         return;
@@ -1464,7 +1682,7 @@ async fn handle_raw_reply(
 async fn handle_udp_reply(
     node: &mut Node<PEERS>,
     scratch: &mut Scratch,
-    socket: &RawSocket<'_>,
+    len: usize,
     table: &mut nat::Table,
     peer_api: &mut tailfeather_gateway::peerapi::Server,
     resolvers: &[Option<[u8; 4]>; 3],
@@ -1475,9 +1693,6 @@ async fn handle_udp_reply(
 ) {
     let Scratch { datagram, inner } = scratch;
 
-    let Ok(len) = socket.recv(datagram).await else {
-        return;
-    };
     let Some(packet) = nat::parse_udp4(&datagram[..len]) else {
         return;
     };
@@ -1541,6 +1756,16 @@ async fn handle_udp_reply(
     encapsulate_and_send(node, &peer, &inner[..inner_len], wg_socket, derp_regions).await;
 }
 
+fn assigned_ipv6(node: &Node<PEERS>) -> Option<core::net::Ipv6Addr> {
+    node.netmap()
+        .addresses
+        .iter()
+        .find_map(|cidr| match cidr.address {
+            core::net::IpAddr::V6(address) => Some(address),
+            _ => None,
+        })
+}
+
 fn assigned_ipv4(node: &Node<PEERS>) -> Option<[u8; 4]> {
     node.netmap()
         .addresses
@@ -1549,6 +1774,16 @@ fn assigned_ipv4(node: &Node<PEERS>) -> Option<[u8; 4]> {
             core::net::IpAddr::V4(address) => Some(address.octets()),
             core::net::IpAddr::V6(_) => None,
         })
+}
+
+fn peer_for_ipv6(node: &Node<PEERS>, address: core::net::Ipv6Addr) -> Option<NodePublic> {
+    let mut owners = node
+        .netmap()
+        .peers
+        .iter()
+        .filter(|peer| peer.tailscale_ipv6() == Some(address));
+    let first = owners.next()?.node_key;
+    owners.next().is_none().then_some(first)
 }
 
 fn peer_for_ip(node: &Node<PEERS>, address: [u8; 4]) -> Option<NodePublic> {
@@ -1565,7 +1800,11 @@ async fn encapsulate_and_send(
     socket: &UdpSocket<'_>,
     derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
 ) {
-    match node.encapsulate_ipv4(peer, packet, now_ms()) {
+    match if packet.first().is_some_and(|byte| byte >> 4 == 6) {
+        node.encapsulate_ipv6(peer, packet, now_ms())
+    } else {
+        node.encapsulate_ipv4(peer, packet, now_ms())
+    } {
         Ok(Some(action)) => dispatch_transmit(socket, derp_regions, action).await,
         Ok(None) => {}
         Err(e) => warn!("encapsulate: {e}"),

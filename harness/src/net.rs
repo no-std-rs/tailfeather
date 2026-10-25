@@ -129,6 +129,77 @@ impl<'r> RawIpv4Socket<'r> {
     }
 }
 
+/// Packet sockets preserve the complete IPv6 header (including hop limit).
+/// A separate raw IPv6 transmitter lets the kernel resolve the next-hop MAC
+/// using normal IPv6 routing and neighbor discovery. No kernel forwarding or
+/// NAT is involved; the shared gateway core owns those decisions.
+pub struct RawIpv6Socket<'r> {
+    receiver: OwnedFd,
+    sender: OwnedFd,
+    reactor: &'r Reactor,
+}
+
+impl<'r> RawIpv6Socket<'r> {
+    pub fn bind(reactor: &'r Reactor, address: core::net::Ipv6Addr) -> Result<Self, NetError> {
+        let flags = SocketFlags::NONBLOCK | SocketFlags::CLOEXEC;
+        let receiver = socket_with(
+            AddressFamily::PACKET,
+            SocketType::DGRAM,
+            flags,
+            Some(rustix::net::eth::IPV6),
+        )
+        .map_err(NetError::Errno)?;
+        let sender = socket_with(
+            AddressFamily::INET6,
+            SocketType::RAW,
+            flags,
+            Some(ipproto::RAW),
+        )
+        .map_err(NetError::Errno)?;
+        crate::rt::configure_raw_ipv6(sender.as_raw_fd()).map_err(NetError::Errno)?;
+        bind(&sender, &core::net::SocketAddrV6::new(address, 0, 0, 0)).map_err(NetError::Errno)?;
+        Ok(Self {
+            receiver,
+            sender,
+            reactor,
+        })
+    }
+
+    pub async fn recv(&self, packet: &mut [u8]) -> Result<usize, NetError> {
+        loop {
+            match recvfrom(&self.receiver, &mut *packet, RecvFlags::TRUNC) {
+                Ok((len, original_len, _)) if len == original_len => return Ok(len),
+                Ok(_) => continue,
+                Err(error) if would_block(error) => {
+                    self.reactor
+                        .ready(self.receiver.as_raw_fd(), PollFlags::IN)
+                        .await;
+                }
+                Err(error) => return Err(NetError::Errno(error)),
+            }
+        }
+    }
+
+    pub async fn send(
+        &self,
+        packet: &[u8],
+        destination: core::net::Ipv6Addr,
+    ) -> Result<usize, NetError> {
+        let destination = core::net::SocketAddrV6::new(destination, 0, 0, 0);
+        loop {
+            match sendto(&self.sender, packet, SendFlags::empty(), &destination) {
+                Ok(len) => return Ok(len),
+                Err(error) if would_block(error) => {
+                    self.reactor
+                        .ready(self.sender.as_raw_fd(), PollFlags::OUT)
+                        .await;
+                }
+                Err(error) => return Err(NetError::Errno(error)),
+            }
+        }
+    }
+}
+
 fn local_v4(fd: &OwnedFd) -> Result<SocketAddrV4, NetError> {
     getsockname(fd)
         .map_err(NetError::Errno)?

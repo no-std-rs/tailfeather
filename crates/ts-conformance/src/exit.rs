@@ -12,7 +12,7 @@ use crate::harness::NOT_BUILT;
 use crate::{Env, Status, Target, headscale};
 
 /// Both routes are required for client-side exit-node discovery. The current
-/// data plane forwards IPv4 and intentionally blackholes IPv6 until implemented.
+/// data plane forwards both families in the allocation-free namespace topology.
 const DEFAULT_ROUTES: [&str; 2] = ["0.0.0.0/0", "::/0"];
 
 struct Session {
@@ -121,8 +121,8 @@ pub fn advertise(env: &Env) -> Status {
         "the no_std harness advertised {} in Hostinfo.RoutableIPs and the server listed \
          both as available on node {} while approving neither — a node cannot make \
          itself an exit. After `headscale nodes approve-routes` it serves both. The \
-         IPv4 data plane is verified in this report by exit.forward.udp and \
-         exit.forward.tcp in the allocation-free namespace topology.",
+         IPv4 data plane is verified by exit.forward.udp and exit.forward.tcp; \
+         the same namespace suite exercises IPv6 UDP, TCP, ICMP and hop limits.",
         DEFAULT_ROUTES.join(" and "),
         session.node_id
     ))

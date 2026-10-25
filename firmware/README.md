@@ -26,3 +26,17 @@ as the optional pinned root used by firmware TLS verification.
 The first-party Cargo build script and directory-local toolchain configuration
 have been replaced by Bazel linker flags, action environment, and the hermetic
 Rust toolchain. Third-party generated build scripts remain in the Bazel graph.
+
+
+The Wi-Fi uplink uses DHCPv4 and IPv6 SLAAC. IPv6 exit forwarding requires a
+SLAAC address and IPv6 default gateway; `ipv6-exit-capable=true` and the selected
+uplink configuration appear in the serial log. Only that capability advertises
+`::/0`. A capability change restarts control bootstrap to refresh the advertised
+routes. IPv4-only networks advertise only `0.0.0.0/0`; Tailscale clients that
+require both default routes may therefore not offer this node as an exit.
+
+IPv6 forwarding uses the shared bounded gateway core for UDP, TCP and ICMPv6
+echo, with exact peer address ownership and control-plane ACL checks. See the
+[gateway limits](../crates/tailfeather-gateway/README.md) for unsupported packet
+forms. An IPv4 underlay can carry IPv6 inner packets; direct IPv6 underlay
+endpoint discovery is separate from this feature.
