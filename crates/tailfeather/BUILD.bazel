@@ -82,7 +82,10 @@ rust_test(
     name = "unit_test",
     aliases = aliases(),
     crate = ":tailfeather",
-    compile_data = ["//tests/vectors:vectors"],
+    compile_data = [
+        "src/unicode_normalization/CaseFolding-17.0.0.txt",
+        "//tests/vectors:vectors",
+    ],
     deps = all_crate_deps(normal_dev = True),
     # The RSA differential corpus intentionally uses the host OpenSSL binary
     # as an independent oracle. The pinned RBE image does not contain it.
