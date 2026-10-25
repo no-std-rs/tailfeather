@@ -316,6 +316,11 @@ fn validate_ca(
     Ok(())
 }
 
+pub(super) fn validate_trust_anchor(der: &[u8]) -> Result<(), TlsError> {
+    let certificate = parse_certificate(der)?;
+    validate_ca(&certificate, 0)
+}
+
 fn subordinate_ca_count(
     chain: &[CertificateEntryRef<'_>],
     issuer_position: usize,

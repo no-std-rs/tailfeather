@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "tailfeather-reactor-no-std-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[features]
+accelerated-crypto = ["tailfeather-reactor/accelerated-crypto"]
+
+[dependencies]
+tailfeather-reactor = { path = "..", default-features = false, features = ["embassy"] }
+tailfeather = { path = "../../tailfeather", default-features = false }
+embassy-executor = { version = "0.10", features = ["platform-riscv32", "executor-thread"] }
+embassy-net = { version = "0.9.1", default-features = false, features = ["medium-ip", "dns", "tcp", "udp", "proto-ipv4"] }
+embedded-tls = { version = "0.19", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+static_cell = "2"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = "fat"

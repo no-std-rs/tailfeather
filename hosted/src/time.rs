@@ -25,16 +25,23 @@ impl Timestamp {
             store: Some(store),
         })
     }
-    pub fn next(&mut self) -> Result<wirefeather::Tai64n, &'static str> {
+    pub fn candidate(&self) -> Result<wirefeather::Tai64n, &'static str> {
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .map_err(|_| "wall clock unavailable")?
             .as_millis()
             .min(u64::MAX as u128) as u64;
-        self.next_at(millis)
+        let mut last = self.last;
+        Ok(crate::logic::next_tai64n(&mut last, millis))
     }
+    #[cfg(test)]
     fn next_at(&mut self, millis: u64) -> Result<wirefeather::Tai64n, &'static str> {
-        let next = crate::logic::next_tai64n(&mut self.last, millis);
+        let mut last = self.last;
+        let next = crate::logic::next_tai64n(&mut last, millis);
+        self.commit(next)?;
+        Ok(next)
+    }
+    pub fn commit(&mut self, next: wirefeather::Tai64n) -> Result<(), &'static str> {
         if let Some(store) = &self.store
             && next > self.reserved
         {
@@ -49,7 +56,8 @@ impl Timestamp {
             store.save(&reserved).map_err(|_| "timestamp state write")?;
             self.reserved = reserved;
         }
-        Ok(next)
+        self.last = next;
+        Ok(())
     }
 }
 #[cfg(test)]

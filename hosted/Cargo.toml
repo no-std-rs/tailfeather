@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+tailfeather-reactor = { path = "../crates/tailfeather-reactor", features = ["std", "accelerated-crypto"] }
 tailfeather = { path = "../crates/tailfeather", features = ["peer-names", "hosted-policy"] }
 wirefeather = { path = "../crates/wirefeather" }
 critical-section = { version = "1.2", features = ["std"] }
@@ -21,6 +22,9 @@ webpki-roots = "1"
 smoltcp = { version = "0.13", default-features = false, features = ["alloc", "async", "medium-ip", "proto-ipv4", "socket-tcp"] }
 tempfile = "3"
 tracing = "0.1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["fs"] }
 
 [profile.release]
 lto = true

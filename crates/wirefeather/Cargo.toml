@@ -14,6 +14,8 @@ categories  = ["network-programming", "no-std", "cryptography"]
 [features]
 default = ["fast-curve25519"]
 fast-curve25519 = ["x25519-dalek/precomputed-tables"]
+# Fused CPU-dispatched AEAD on native x86_64/AArch64; portable elsewhere.
+accelerated-crypto = ["dep:ring"]
 
 [dependencies]
 blake2            = { version = "0.10", default-features = false }
@@ -23,6 +25,9 @@ hmac              = { version = "0.12", default-features = false }
 subtle            = { version = "2.6", default-features = false }
 x25519-dalek      = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 zeroize           = { version = "1.8", default-features = false }
+
+[target.'cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_endian = "little", any(target_family = "unix", target_family = "windows")))'.dependencies]
+ring = { version = "0.17.14", default-features = false, optional = true }
 
 [dev-dependencies]
 hex = "0.4"

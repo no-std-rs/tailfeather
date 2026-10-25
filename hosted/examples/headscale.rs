@@ -1,10 +1,14 @@
 //! Fixture-only test runner. Arguments name local fixture directories, not keys.
 use std::{path::PathBuf, time::Duration};
 use tailfeather_hosted::{Client, Config};
+fn control_url() -> String {
+    std::env::var("TAILFEATHER_FIXTURE_CONTROL_URL")
+        .unwrap_or_else(|_| "https://localhost:18443".into())
+}
 fn config(root: &std::path::Path, name: &str, auth: String) -> Config {
     Config {
         directory: root.join(name),
-        control_url: "https://localhost:18443".into(),
+        control_url: control_url(),
         hostname: name.into(),
         auth_key: auth,
         control_ca_der: std::fs::read(root.join("ca.der")).unwrap(),
@@ -30,7 +34,7 @@ fn main() {
             use std::io::Write;std::io::stdout().flush().unwrap();
             tokio::time::timeout(Duration::from_secs(60),async { while !root.join("continue").exists(){tokio::time::sleep(Duration::from_millis(20)).await;} }).await.unwrap();
         }
-        assert!(tailfeather_hosted::is_enrolled(&root.join("hosted-server"),"https://localhost:18443").unwrap());
+        assert!(tailfeather_hosted::is_enrolled(&root.join("hosted-server"),&control_url()).unwrap());
         assert!(tailfeather_hosted::is_enrolled(&root.join("hosted-server"),"https://other.invalid").is_err());
         let mut listener=server.listen(2222).await.unwrap();
         assert_eq!(server.drain().await.unwrap_err().kind(),std::io::ErrorKind::InvalidInput);

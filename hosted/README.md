@@ -1,7 +1,7 @@
 # Tailfeather hosted runtime
 
 `tailfeather-hosted` embeds the portable Tailfeather node in native Windows,
-macOS and Linux applications. Tokio sockets carry control TLS/Noise, DERP and
+macOS, Linux and Android applications. Tokio sockets carry control TLS/Noise, DERP and
 UDP; smoltcp provides userspace IPv4 TCP inside authenticated WireGuard tunnels.
 It requires no TUN device, driver, administrator rights or installed VPN client.
 The no-std core remains independent of this adapter.
@@ -35,6 +35,9 @@ all client clones and streams have been dropped. Persistent consumers can set
 `ephemeral: false` and reuse their private directory without a new auth key.
 State is bound to the HTTPS control origin, replaced atomically, and protected by
 an exclusive directory lock. Corrupt or mismatched state fails closed.
+Android uses rustix file locking because the standard library's file locking
+methods are unsupported there. Build Android applications against Android libc
+when they need the platform DNS resolver.
 WireGuard timestamp ranges are reserved ahead in a private atomic sidecar, so
 reusing an identity after a clock rollback cannot repeat earlier initiations.
 The reservation avoids writing on every packet-driver iteration.
@@ -42,6 +45,10 @@ The reservation avoids writing on every packet-driver iteration.
 `listen(port)` accepts tunnel-only streams after control ACL and cryptographic
 source checks. The runtime bounds TCP sockets to 16, listeners to 4, pending
 commands to 16 and packet queues to 128. TCP buffers are 64 KiB per direction.
+Each listener reserves up to four sockets before polling packets so simultaneous
+SYNs can complete without waiting for the application to accept the first stream.
+Established connections retain their sockets when the total capacity is reached.
+`TAILFEATHER_NET_TRACE=1` prints TCP states and queue sizes without packet contents.
 Dropping the last client shuts down the node. Dropping a listener stops new
 acceptance. This adapter exposes IPv4 TCP, not system-wide networking or UDP
 application sockets. Hosted peer capacity is 128; the core's embedded default remains 32. Hosted
@@ -99,7 +106,16 @@ the last received frame, including when outbound notifications continue.
 
 `python3 hosted/tools/test-headscale.py` runs both production-path scenarios
 against a digest-pinned disposable Headscale container with a generated CA.
-It needs Docker (or `CONTAINER_ENGINE=podman`), OpenSSL and free loopback ports
-18443/13478. Linux CI runs it after the native tests; fixture keys never leave
+It needs Docker (or `CONTAINER_ENGINE=podman`) and OpenSSL; the runner selects
+free loopback ports automatically. Linux CI runs it after the native tests; fixture keys never leave
 its private temporary directory. This includes the 1 MiB transfer regression
 and immediate no-key reconnect without a restart sleep.
+
+
+The userspace TCP stack, routing/source checks, bounded action mailbox, clocks,
+outer sockets, TLS and file storage are shared with `tailfeather-reactor`.
+That companion crate also exposes an allocation-free Embassy runtime with
+caller-owned arenas and the same control/DERP/WireGuard/TCP behavior. Native
+hosted applications enable its CPU-dispatched fused AEAD provider. See
+[`tailfeather-reactor`](../crates/tailfeather-reactor/README.md) for the feature
+matrix, CPU capability diagnostics, and local packet-engine benchmarks.

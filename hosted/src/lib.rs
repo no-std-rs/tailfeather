@@ -95,8 +95,13 @@ impl Client {
             .read(true)
             .write(true)
             .open(config.directory.join("lock"))?;
+        #[cfg(not(target_os = "android"))]
         lock.try_lock()
             .map_err(|_| io::Error::other("network identity already in use"))?;
+        #[cfg(target_os = "android")]
+        {
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        }
         let (commands, receiver) = mpsc::channel(16);
         let (status_tx, status) = watch::channel(Status::default());
         let (shutdown, stopped) = oneshot::channel();
@@ -256,20 +261,7 @@ pub fn is_enrolled(directory: &std::path::Path, control_url: &str) -> io::Result
     }
     Ok(state.enrolled())
 }
-struct OsRng;
-macro_rules! rng {
-    ($trait:path) => {
-        impl $trait for OsRng {
-            fn fill_bytes(&mut self, out: &mut [u8]) {
-                getrandom::fill(out).expect("operating system randomness unavailable");
-            }
-        }
-    };
-}
-rng!(tailfeather::keys::Rng);
-rng!(tailfeather::tunnel::Rng);
-rng!(tailfeather::disco::packet::Rng);
-rng!(tailfeather::derp::client::Rng);
+use tailfeather_reactor::native::OsRng;
 
 // Netmaps and their staging copies remain fixed-size, including in debug builds.
 const WORKER_STACK: usize = 64 * 1024 * 1024;

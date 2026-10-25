@@ -88,3 +88,14 @@ consumer, and a hardware RNG has nothing else in common with a test generator.
 ## License
 
 MIT OR Apache-2.0, at your option.
+
+
+The optional `accelerated-crypto` feature selects ring's fused, CPU-dispatched
+ChaCha20-Poly1305 implementation on native little-endian x86_64/AArch64 systems.
+Other targets retain the portable RustCrypto provider. Both providers preserve
+ciphertext/tag formats and replay behavior; authentication failure clears the
+output buffer. `crypto::aead_backend()` reports the configured provider. The
+portable provider already uses runtime SIMD detection on x86. The feature is
+forwarded by `tailfeather` and `tailfeather-reactor` and is enabled by the hosted
+adapter. Differential tests cover both nonce conventions, packet/block boundaries,
+AAD, and corrupted tags alongside the protocol conformance tests.

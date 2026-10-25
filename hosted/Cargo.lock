@@ -338,6 +338,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "embassy-futures"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc2d050bdc5c21e0862a89256ed8029ae6c290a93aecefc73084b3002cdebb01"
+
+[[package]]
+name = "embassy-sync"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bbd85cf5a5ae56bdf26f618364af642d1d0a4e245cdd75cd9aabda382f65a81"
+dependencies = [
+ "cfg-if",
+ "critical-section",
+ "embedded-io-async",
+ "futures-core",
+ "futures-sink",
+ "heapless",
+]
+
+[[package]]
 name = "embedded-io"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -412,6 +432,18 @@ name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+[[package]]
+name = "futures-core"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
+
+[[package]]
+name = "futures-sink"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
 
 [[package]]
 name = "generic-array"
@@ -991,9 +1023,11 @@ dependencies = [
  "embedded-io-async",
  "getrandom 0.3.4",
  "heapless",
+ "rustix",
  "serde_json",
  "smoltcp",
  "tailfeather",
+ "tailfeather-reactor",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -1001,6 +1035,27 @@ dependencies = [
  "tracing-subscriber",
  "webpki-roots",
  "wirefeather",
+]
+
+[[package]]
+name = "tailfeather-reactor"
+version = "0.0.1"
+dependencies = [
+ "critical-section",
+ "embassy-futures",
+ "embassy-sync",
+ "embedded-io-async",
+ "getrandom 0.3.4",
+ "heapless",
+ "pin-project-lite",
+ "rustix",
+ "smoltcp",
+ "tailfeather",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]
@@ -1298,6 +1353,7 @@ dependencies = [
  "chacha20poly1305",
  "heapless",
  "hmac",
+ "ring",
  "subtle",
  "x25519-dalek",
  "zeroize",

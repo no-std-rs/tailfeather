@@ -13,8 +13,9 @@ Try the [browser SSH client](https://no-std-rs.github.io/tailfeather/), or see
 
 Bazel 9.2.0 is selected by `.bazelversion`; Bzlmod pins Rust 1.95.0, LLVM
 0.8.16, `rules_python` 2.2.0, and `rules_rs` 0.0.102. Cargo manifests and
-lockfiles describe dependency closures only. Builds and tests never launch
-Cargo.
+lockfiles describe Bazel's dependency closures. Portable libraries, firmware,
+and the no-libc harness build and test with Bazel. The hosted and shared async
+adapters have independent Cargo workspaces and CI.
 
 ```sh
 bb login
@@ -65,6 +66,9 @@ before credentials enter the Rust action environment. See
 - `tailfeather-ssh`: small allocation-free SSH console with bounded Tailscale
   accept-policy enforcement; see [`crates/tailfeather-ssh/README.md`](crates/tailfeather-ssh/README.md).
 - `wirefeather`: allocation-free WireGuard-compatible handshake and transport.
+- `tailfeather-reactor`: shared asynchronous native/Embassy mesh runtime with
+  caller-owned buffers, CPU-dispatched crypto, and local packet-engine benchmarks;
+  see [`crates/tailfeather-reactor/README.md`](crates/tailfeather-reactor/README.md).
 - `tailfeather-testkit`: std-only offline fixture and baseline checks.
 - `ts-conformance`: offline and live compatibility measurement.
 - `harness`: static `_start` executable using Linux syscalls without libc.

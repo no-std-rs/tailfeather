@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -11,6 +12,7 @@ import uuid
 
 IMAGE = 'docker.io/headscale/headscale@sha256:895742a51a0661d60855359f01b2e3218afb4cca86987890dbd4fe11a4b7feeb'
 ENGINE = os.environ.get('CONTAINER_ENGINE', 'docker')
+RUNTIME = os.environ.get('TAILFEATHER_FIXTURE_RUNTIME', 'hosted')
 REPO = Path(__file__).resolve().parents[2]
 
 
@@ -36,6 +38,15 @@ def wait_for(predicate, process=None):
 
 
 def main():
+    # Independent worktrees may run fixtures concurrently. Never reuse or stop
+    # an unrelated service listening on a historical fixed fixture port.
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        control_port = listener.getsockname()[1]
+    with socket.socket(type=socket.SOCK_DGRAM) as listener:
+        listener.bind(('127.0.0.1', 0))
+        stun_port = listener.getsockname()[1]
+    control_url = f'https://localhost:{control_port}'
     name = 'tailfeather-hosted-' + uuid.uuid4().hex[:12]
     with tempfile.TemporaryDirectory(prefix='tailfeather-headscale-') as directory:
         root = Path(directory)
@@ -51,12 +62,12 @@ def main():
             '-extfile', str(root / 'leaf.ext'), '-out', str(root / 'cert.pem'))
         run('openssl', 'x509', '-in', str(root / 'ca.pem'), '-outform', 'DER', '-out', str(root / 'ca.der'))
         config = {
-            'server_url': 'https://localhost:18443', 'listen_addr': '127.0.0.1:18443',
+            'server_url': control_url, 'listen_addr': f'127.0.0.1:{control_port}',
             'metrics_listen_addr': '127.0.0.1:0', 'grpc_listen_addr': '127.0.0.1:0',
             'noise': {'private_key_path': '/fixture/data/noise.key'},
             'prefixes': {'v4': '100.64.0.0/10', 'v6': 'fd7a:115c:a1e0::/48'},
             'derp': {'server': {'enabled': True, 'region_id': 999, 'region_code': 'fixture',
-                'verify_clients': False, 'stun_listen_addr': '127.0.0.1:13478',
+                'verify_clients': False, 'stun_listen_addr': f'127.0.0.1:{stun_port}',
                 'private_key_path': '/fixture/data/derp.key', 'automatically_add_embedded_derp_region': True},
                 'urls': [], 'auto_update_enabled': False},
             'database': {'type': 'sqlite', 'sqlite': {'path': '/fixture/data/db.sqlite'}},
@@ -90,12 +101,22 @@ def main():
                     '--expiration', '10m', '--output', 'json').stdout)['key'] for _ in range(2)]
                 private(case / 'keys.json', keys)
                 log = case / 'run.log'
-                args = ['cargo', 'run', '--manifest-path', 'hosted/Cargo.toml', '--locked',
-                    '--example', 'headscale', '--', str(case), '--ephemeral']
+                if RUNTIME == 'hosted':
+                    args = ['cargo', 'run', '--manifest-path', 'hosted/Cargo.toml', '--locked',
+                        '--example', 'headscale', '--', str(case), '--ephemeral']
+                elif RUNTIME in ('reactor-fixed', 'reactor-owned'):
+                    features = 'std,accelerated-crypto' if RUNTIME == 'reactor-owned' else 'std'
+                    args = ['cargo', 'run', '--manifest-path', 'crates/tailfeather-reactor/Cargo.toml',
+                        '--locked', '--features', features, '--example', 'headscale', '--', str(case)]
+                    if RUNTIME == 'reactor-owned':
+                        args += ['--owned']
+                else:
+                    raise ValueError('unknown fixture runtime')
                 if mode == 'direct':
                     args += ['--direct', '--offline-direct']
                 with log.open('w') as output:
-                    process = subprocess.Popen(args, cwd=REPO, stdout=output, stderr=subprocess.STDOUT)
+                    process = subprocess.Popen(args, cwd=REPO, stdout=output, stderr=subprocess.STDOUT,
+                        env={**os.environ, 'TAILFEATHER_FIXTURE_CONTROL_URL': control_url})
                     try:
                         if mode == 'direct':
                             wait_for(lambda: 'READY: stop the fixture' in log.read_text(), process)
