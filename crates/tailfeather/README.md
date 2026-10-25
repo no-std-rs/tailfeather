@@ -23,3 +23,15 @@ assert!(node.requires_persistence());
 ```
 
 This crate is experimental protocol software, not an audited VPN product.
+
+X.509 distinguished-name comparison streams UTF8String, BMPString,
+UniversalString and the basic T.61 graphic repertoire through bounded Unicode
+normalization and Unicode 17 default full case folding. Locale-specific Turkic
+folding is excluded. T.61 prefix accents, spacing accents, supplementary Latin
+characters and nonspacing underline are supported; malformed sequences,
+presentation controls and optional national/escape repertoires fail closed.
+Normalization keeps at most 64 combining scalars per sequence and rejects
+overflow. Unicode data and its license are bundled in `src/unicode_normalization`;
+regenerate the pinned folding tables with `python3 scripts/generate-case-folding.py`
+from the repository checkout. The mapping sources are [Unicode CaseFolding.txt](https://www.unicode.org/Public/17.0.0/ucd/CaseFolding.txt)
+and [ITU-T T.61 (1988)](https://www.itu.int/rec/T-REC-T.61-198811-S/en).
