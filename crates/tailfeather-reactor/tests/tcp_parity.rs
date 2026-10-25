@@ -49,23 +49,30 @@ async fn exchange<'a, C: Clock, B: PacketQueue<8>>(
     let transfer = async {
         let mut listener = remote.listen(2222).unwrap();
         let client = async {
-            let mut stream = local
+            let stream = local
                 .connect(&clock, "100.64.0.2".parse().unwrap(), 2222, 49152)
                 .await
                 .unwrap();
-            stream.write_all(&[42; 8192]).await.unwrap();
-            stream.shutdown().unwrap();
-            let mut count = 0;
-            let mut buffer = [0; 333];
-            loop {
-                let len = stream.read(&mut buffer).await.unwrap();
-                if len == 0 {
-                    break;
+            let send = async {
+                let mut writer = &stream;
+                writer.write_all(&[42; 8192]).await.unwrap();
+                stream.shutdown().unwrap();
+            };
+            let receive = async {
+                let mut reader = &stream;
+                let mut count = 0;
+                let mut buffer = [0; 333];
+                loop {
+                    let len = reader.read(&mut buffer).await.unwrap();
+                    if len == 0 {
+                        break;
+                    }
+                    assert!(buffer[..len].iter().all(|byte| *byte == 21));
+                    count += len;
                 }
-                assert!(buffer[..len].iter().all(|byte| *byte == 21));
-                count += len;
-            }
-            assert_eq!(count, 8192);
+                assert_eq!(count, 8192);
+            };
+            tokio::join!(send, receive);
         };
         let server = async {
             let mut stream = listener.accept().await.unwrap();

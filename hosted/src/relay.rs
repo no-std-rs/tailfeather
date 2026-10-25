@@ -31,6 +31,12 @@ impl Slot {
             stopped: tokio::sync::Notify::new(),
         }
     }
+    pub fn revoke(&self) {
+        self.queue.borrow_mut().clear();
+        self.stop.set(true);
+        self.stopped.notify_waiters();
+        self.ready.notify_one();
+    }
 }
 pub fn dispatch(
     slots: &[Slot; 2],
@@ -82,6 +88,22 @@ pub async fn worker(
     ca: &[u8],
 ) -> Result<(), Error> {
     loop {
+        if slot.stop.replace(false) {
+            slot.queue.borrow_mut().clear();
+            if let Some(region) = slot.region.replace(None) {
+                enqueue(
+                    actions,
+                    node.borrow_mut()
+                        .handle_derp_event(
+                            DerpEvent::Disconnected { region },
+                            reactor.clock_millis(),
+                            &mut OsRng,
+                        )
+                        .ok()
+                        .flatten(),
+                );
+            }
+        }
         let next = slot.queue.borrow_mut().pop_front();
         let Some(DerpCommand::Connect { region, endpoint }) = next else {
             slot.ready.notified().await;
@@ -99,8 +121,9 @@ pub async fn worker(
             Ok(())
         } else {
             tokio::select! {
-                result=connection(reactor,node,actions,slot,region,&endpoint,ca)=>result,
+                biased;
                 _=stopped=>Ok(()),
+                result=connection(reactor,node,actions,slot,region,&endpoint,ca)=>result,
             }
         };
         if result.is_err() {
@@ -329,6 +352,9 @@ async fn connection(
             // Drain a bounded batch immediately, then service reads or a queue
             // notification. No per-packet polling delay throttles relay traffic.
             for _ in 0..16 {
+                if slot.stop.get() {
+                    return Ok(());
+                }
                 let next = slot.queue.borrow_mut().pop_front();
                 let Some(DerpCommand::Send { peer, packet, .. }) = next else {
                     break;

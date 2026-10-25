@@ -28,7 +28,7 @@ tailfeather = { path = "../crates/tailfeather" }
 tailfeather-gateway = { path = "../crates/tailfeather-gateway" }
 # TLS 1.3; tailfeather supplies the bounded ECDSA/RSA path verifier. The
 # upstream `rsa` feature remains disabled because it enables `alloc`.
-embedded-tls       = { version = "0.19", default-features = false }
+embedded-tls       = { git = "https://github.com/pawelchcki/embedded-tls", rev = "48fef49e6e7cbdaa44e9003a45078656f8955d3d", default-features = false }
 embedded-io-async  = "0.7"
 p256               = { version = "0.13", default-features = false, features = ["ecdsa"] }
 rand_core          = { version = "0.6.3", default-features = false }

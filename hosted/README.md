@@ -33,6 +33,14 @@ the coordinator controls offline node removal timing. The same identity is kept
 across reconnects during that session. Keep the temporary directory alive until
 all client clones and streams have been dropped. Persistent consumers can set
 `ephemeral: false` and reuse their private directory without a new auth key.
+Dropping the final client for an enrolled ephemeral session sends an
+authenticated logout request, matching upstream Tailscale's immediate removal
+behavior. Shutdown waits at most five seconds for this best-effort operation.
+Discard an ephemeral session's directory afterward; its logged-out identity and
+consumed enrollment key are not a persistent reconnect profile. Persistent
+clients do not log out on drop. Crashes and unavailable coordinators still
+depend on provider inactivity cleanup; an auth key's expiry does not set the
+lifetime of a node that has already enrolled.
 State is bound to the HTTPS control origin, replaced atomically, and protected by
 an exclusive directory lock. Corrupt or mismatched state fails closed.
 Android uses rustix file locking because the standard library's file locking
@@ -51,9 +59,9 @@ Established connections retain their sockets when the total capacity is reached.
 `TAILFEATHER_NET_TRACE=1` prints TCP states and queue sizes without packet contents.
 Dropping the last client shuts down the node. Dropping a listener stops new
 acceptance. This adapter exposes IPv4 TCP, not system-wide networking or UDP
-application sockets. Hosted peer capacity is 128; the core's embedded default remains 32. Hosted
+application sockets. Hosted peer capacity is 256; the core's embedded default remains 32. Hosted
 clients enable the `hosted-policy` feature: each of the 32 ACL rules can retain
-256 source and 256 destination networks, so provider-expanded device tags do
+512 source and 512 destination networks, so 256 dual-stack devices and provider-expanded device tags do
 not overflow the firmware's eight-address budget. Oversized policies still
 fail closed; no ACL entries are truncated. Embedded builds retain their small
 defaults. The hosted worker reserves a 64 MiB stack for the larger bounded map
@@ -75,9 +83,16 @@ TLS, real DERP TCP exchange and reconnects against a local Headscale fixture at
 `keys.json` array of two fixture-only preauth keys; `--ephemeral` exercises
 ephemeral registration on both ends. It never accepts keys as command arguments.
 
-Direct mode advertises the bound UDP port on the control connection's local
-interface and validates STUN replies received on that same data socket before
-publishing reflexive candidates. `relay_only` omits these candidates. TCP races
+Direct mode advertises the bound UDP port on usable local IPv4 interfaces,
+including LANs that do not carry the control connection. It keeps up to four
+local candidates and reserves the remaining four endpoint slots for validated
+STUN replies received on that same data socket. Other LAN interfaces precede
+the control connection's interface, so a reachable NAT path does not prevent
+discovery of a private link. Loopback is used only when no other local address
+is available; overlay, multicast and unspecified addresses are excluded.
+Application sockets drive DISCO probes for their active peers, so unrelated
+unreachable peers cannot delay their discovery. `relay_only` omits these
+candidates and probes. TCP races
 up to 16 distinct IPv4 DNS answers within a 15-second total connection deadline.
 Custom CA DER is validated before the runtime starts. DERP protocol handshakes
 have a 20-second deadline and disconnect commands cancel pending handshakes;
@@ -104,7 +119,7 @@ OS DNS lookups. The Headscale fixture restarts the same identity immediately,
 without a timing sleep. Silent established DERP sessions expire 90 seconds after
 the last received frame, including when outbound notifications continue.
 
-`python3 hosted/tools/test-headscale.py` runs both production-path scenarios
+`python3 hosted/tools/test-headscale.py` runs the production-path scenarios
 against a digest-pinned disposable Headscale container with a generated CA.
 It needs Docker (or `CONTAINER_ENGINE=podman`) and OpenSSL; the runner selects
 free loopback ports automatically. Linux CI runs it after the native tests; fixture keys never leave
@@ -119,3 +134,13 @@ caller-owned arenas and the same control/DERP/WireGuard/TCP behavior. Native
 hosted applications enable its CPU-dispatched fused AEAD provider. See
 [`tailfeather-reactor`](../crates/tailfeather-reactor/README.md) for the feature
 matrix, CPU capability diagnostics, and local packet-engine benchmarks.
+
+Resident supervisors can use `Client::start_resident` and retain that client
+across readiness timeouts. Rejected control maps withdraw data-plane access and close existing TCP streams,
+then retry with the same
+identity and persisted enrollment, with delays capped at one minute. A fresh
+accepted map restores readiness; rejection never resets state or enrolls a
+replacement node. Dropping the final client still logs out an ephemeral node.
+Initial registration rejection is terminal in either mode.
+The ordinary `Client::start` also reports map rejection as a
+terminal error. Corrupt state and authority mismatches remain errors in both.

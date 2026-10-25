@@ -4,6 +4,7 @@
 //! userspace TCP implementation. No OS VPN service or virtual adapter is used.
 #![forbid(unsafe_code)]
 mod bridge;
+mod discovery;
 mod exec;
 mod logic;
 mod net;
@@ -26,7 +27,8 @@ pub struct Config {
     pub auth_key: String,
     pub control_ca_der: Vec<u8>,
     pub relay_only: bool,
-    /// Register a disposable node; the control server removes it after disconnect.
+    /// Register a disposable node and log it out on final drop. Discard this
+    /// session's state directory afterward. Offline shutdown uses provider GC.
     pub ephemeral: bool,
 }
 #[derive(Clone, Debug, Default)]
@@ -78,6 +80,15 @@ impl Client {
     /// State is authority-bound; corrupt or mismatched state is never reset.
     /// Each directory permits one running client, including across processes.
     pub fn start(config: Config) -> io::Result<Self> {
+        Self::start_with_retries(config, false)
+    }
+    /// Keep the same enrollment through rejected control maps and transient
+    /// outages. The owner must retain this handle between readiness attempts;
+    /// final drop still logs out an ephemeral node. Retries back off to a minute.
+    pub fn start_resident(config: Config) -> io::Result<Self> {
+        Self::start_with_retries(config, true)
+    }
+    fn start_with_retries(config: Config, resident: bool) -> io::Result<Self> {
         if config.hostname.is_empty()
             || config.hostname.len() > 63
             || config.auth_key.len() > 1024
@@ -116,12 +127,10 @@ impl Client {
                 {
                     Ok(runtime) => {
                         let local = tokio::task::LocalSet::new();
-                        let result = local.block_on(&runtime, async {
-                            tokio::select! {
-                                result=node::run(config,receiver,status_tx.clone())=>result,
-                                _=stopped=>Ok(()),
-                            }
-                        });
+                        let result = local.block_on(
+                            &runtime,
+                            node::run(config, receiver, status_tx.clone(), stopped, resident),
+                        );
                         drop(local);
                         // OS DNS lookups may outlive cancellation, but cannot
                         // keep this node's state lock or worker alive.
