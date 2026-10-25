@@ -348,7 +348,7 @@ pub struct Stream<'r, 'a, const N: usize, const Q: usize, B: PacketQueue<Q>> {
 
 impl<const N: usize, const Q: usize, B: PacketQueue<Q>> Stream<'_, '_, N, Q, B> {
     /// Close only the write direction, preserving responses from the peer.
-    pub fn shutdown(&mut self) -> Result<(), Error> {
+    pub fn shutdown(&self) -> Result<(), Error> {
         self.tcp
             .stack
             .borrow_mut()
@@ -361,13 +361,13 @@ impl<const N: usize, const Q: usize, B: PacketQueue<Q>> Stream<'_, '_, N, Q, B> 
 }
 
 impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::ErrorType
-    for Stream<'_, '_, N, Q, B>
+    for &Stream<'_, '_, N, Q, B>
 {
     type Error = Error;
 }
 
 impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Read
-    for Stream<'_, '_, N, Q, B>
+    for &Stream<'_, '_, N, Q, B>
 {
     async fn read(&mut self, output: &mut [u8]) -> Result<usize, Error> {
         if output.is_empty() {
@@ -398,7 +398,7 @@ impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Read
 }
 
 impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Write
-    for Stream<'_, '_, N, Q, B>
+    for &Stream<'_, '_, N, Q, B>
 {
     async fn write(&mut self, input: &[u8]) -> Result<usize, Error> {
         if input.is_empty() {
@@ -439,6 +439,31 @@ impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Write
             Poll::Pending
         })
         .await
+    }
+}
+
+// Shared references allow independent read/write futures without an allocator
+// or a mutex held across an await. All stack borrows end before yielding.
+impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::ErrorType
+    for Stream<'_, '_, N, Q, B>
+{
+    type Error = Error;
+}
+impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Read
+    for Stream<'_, '_, N, Q, B>
+{
+    async fn read(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        embedded_io_async::Read::read(&mut &*self, output).await
+    }
+}
+impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Write
+    for Stream<'_, '_, N, Q, B>
+{
+    async fn write(&mut self, input: &[u8]) -> Result<usize, Error> {
+        embedded_io_async::Write::write(&mut &*self, input).await
+    }
+    async fn flush(&mut self) -> Result<(), Error> {
+        embedded_io_async::Write::flush(&mut &*self).await
     }
 }
 
