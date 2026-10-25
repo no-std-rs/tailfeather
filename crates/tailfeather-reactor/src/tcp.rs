@@ -394,6 +394,17 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
         self.address = Some(address);
     }
 
+    /// Remove the local address, sockets and packets after revocation or shutdown.
+    pub fn clear_address(&mut self) {
+        self.abort_all();
+        self.fins.clear();
+        self.received_fins.clear();
+        self.device.rx.clear();
+        self.device.tx.clear();
+        self.iface = None;
+        self.address = None;
+    }
+
     /// Queue a decrypted packet for smoltcp.
     pub fn deliver(&mut self, packet: &[u8]) {
         if self.device.rx.len() >= Q || packet.len() > MTU {

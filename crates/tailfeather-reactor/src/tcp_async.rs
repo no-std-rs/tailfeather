@@ -102,6 +102,13 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> Tcp<'a, N, Q, B> {
         self.stack.borrow().remote_addresses()
     }
 
+    /// Revoke the local address and reset all sockets and queued packets.
+    pub fn clear_address(&self) {
+        self.stack.borrow_mut().clear_address();
+        self.changed.signal(());
+        self.capacity_waiters.borrow_mut().wake();
+    }
+
     /// A single live driver is required. Cancellation aborts sockets and wakes
     /// stream waiters; subsequent I/O reports a reset.
     pub async fn run<C: Clock, I: PacketIo>(
