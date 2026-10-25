@@ -102,6 +102,13 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> Tcp<'a, N, Q, B> {
         self.stack.borrow().remote_addresses()
     }
 
+    /// Revoke the local address and reset all sockets and queued packets.
+    pub fn clear_address(&self) {
+        self.stack.borrow_mut().clear_address();
+        self.changed.signal(());
+        self.capacity_waiters.borrow_mut().wake();
+    }
+
     /// A single live driver is required. Cancellation aborts sockets and wakes
     /// stream waiters; subsequent I/O reports a reset.
     pub async fn run<C: Clock, I: PacketIo>(
@@ -249,13 +256,22 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> Tcp<'a, N, Q, B> {
     }
 
     pub fn listen(&self, port: u16) -> Result<Listener<'_, 'a, N, Q, B>, Error> {
+        self.listen_with_backlog(port, 4.min(N))
+    }
+
+    /// Keep a product-sized backlog while sharing the caller's bounded arena.
+    pub fn listen_with_backlog(
+        &self,
+        port: u16,
+        backlog: usize,
+    ) -> Result<Listener<'_, 'a, N, Q, B>, Error> {
         if self.listeners.get() >= 4 || self.ports.borrow().contains(&port) {
             return Err(Error::Unavailable);
         }
         let listener = self
             .stack
             .borrow_mut()
-            .listen_backlog(port)
+            .listen_with_backlog(port, backlog)
             .map_err(|_| Error::Unavailable)?;
         self.changed.signal(());
         self.listeners.set(self.listeners.get() + 1);
@@ -341,7 +357,7 @@ pub struct Stream<'r, 'a, const N: usize, const Q: usize, B: PacketQueue<Q>> {
 
 impl<const N: usize, const Q: usize, B: PacketQueue<Q>> Stream<'_, '_, N, Q, B> {
     /// Close only the write direction, preserving responses from the peer.
-    pub fn shutdown(&mut self) -> Result<(), Error> {
+    pub fn shutdown(&self) -> Result<(), Error> {
         self.tcp
             .stack
             .borrow_mut()
@@ -354,13 +370,13 @@ impl<const N: usize, const Q: usize, B: PacketQueue<Q>> Stream<'_, '_, N, Q, B> 
 }
 
 impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::ErrorType
-    for Stream<'_, '_, N, Q, B>
+    for &Stream<'_, '_, N, Q, B>
 {
     type Error = Error;
 }
 
 impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Read
-    for Stream<'_, '_, N, Q, B>
+    for &Stream<'_, '_, N, Q, B>
 {
     async fn read(&mut self, output: &mut [u8]) -> Result<usize, Error> {
         if output.is_empty() {
@@ -391,7 +407,7 @@ impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Read
 }
 
 impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Write
-    for Stream<'_, '_, N, Q, B>
+    for &Stream<'_, '_, N, Q, B>
 {
     async fn write(&mut self, input: &[u8]) -> Result<usize, Error> {
         if input.is_empty() {
@@ -432,6 +448,31 @@ impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Write
             Poll::Pending
         })
         .await
+    }
+}
+
+// Shared references allow independent read/write futures without an allocator
+// or a mutex held across an await. All stack borrows end before yielding.
+impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::ErrorType
+    for Stream<'_, '_, N, Q, B>
+{
+    type Error = Error;
+}
+impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Read
+    for Stream<'_, '_, N, Q, B>
+{
+    async fn read(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        embedded_io_async::Read::read(&mut &*self, output).await
+    }
+}
+impl<const N: usize, const Q: usize, B: PacketQueue<Q>> embedded_io_async::Write
+    for Stream<'_, '_, N, Q, B>
+{
+    async fn write(&mut self, input: &[u8]) -> Result<usize, Error> {
+        embedded_io_async::Write::write(&mut &*self, input).await
+    }
+    async fn flush(&mut self) -> Result<(), Error> {
+        embedded_io_async::Write::flush(&mut &*self).await
     }
 }
 

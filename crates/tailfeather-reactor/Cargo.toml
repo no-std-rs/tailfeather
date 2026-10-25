@@ -18,7 +18,8 @@ peer-names = ["tailfeather/peer-names"]
 hosted-policy = ["tailfeather/hosted-policy"]
 accelerated-crypto = ["tailfeather/accelerated-crypto"]
 std = ["alloc", "dep:tokio", "dep:tokio-rustls", "dep:webpki-roots", "dep:getrandom", "dep:tempfile", "critical-section/std", "embedded-io-async/std", "dep:rustix"]
-embassy = ["dep:embassy-time", "dep:embassy-net", "dep:embedded-tls", "dep:rand_core"]
+tls = ["dep:embedded-tls"]
+embassy = ["dep:embassy-time", "dep:embassy-net", "tls", "dep:rand_core"]
 
 [dependencies]
 tailfeather = { path = "../tailfeather", default-features = false }
@@ -28,7 +29,7 @@ embedded-io-async = { version = "0.7", default-features = false }
 embassy-sync = { version = "0.8", default-features = false }
 embassy-time = { version = "0.5", default-features = false, optional = true }
 embassy-net = { version = "0.9.1", default-features = false, features = ["dns", "tcp", "udp", "proto-ipv4", "medium-ip"], optional = true }
-embedded-tls = { version = "0.19", default-features = false, optional = true }
+embedded-tls = { git = "https://github.com/pawelchcki/embedded-tls", rev = "48fef49e6e7cbdaa44e9003a45078656f8955d3d", default-features = false, optional = true }
 rand_core = { version = "0.6", default-features = false, optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "net", "io-util", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }

@@ -155,9 +155,15 @@ static ISRG_ROOT_YR_BYTES: [u8; 1_325] = decode_base64(ROOT_YR_B64);
 /// SHA-256: `e57b7e6f150c419102e8d5c055729ff967b9d1a829bf00cec89ca604ebf4a86f`.
 pub const ISRG_ROOT_YR_DER: &[u8] = &ISRG_ROOT_YR_BYTES;
 
-/// A bounded verifier with two built-in public roots and one optional private root.
+#[derive(Clone, Copy)]
+enum TrustRoots<'a> {
+    Builtin(Option<&'a [u8]>),
+    Explicit(&'a [&'a [u8]]),
+}
+
+/// A bounded verifier with built-in or application-selected trust anchors.
 pub struct TrustVerifier<'a, Clock: TlsClock> {
-    private_root: Option<&'a [u8]>,
+    roots: TrustRoots<'a>,
     rsa: &'a mut RsaWorkspace,
     hostname: String<HOST_CAPACITY>,
     certificate_verified: bool,
@@ -167,10 +173,12 @@ pub struct TrustVerifier<'a, Clock: TlsClock> {
 }
 
 impl<'a, Clock: TlsClock> TrustVerifier<'a, Clock> {
+    /// Keep the built-in public roots and optionally add one private anchor.
+    /// Use [`Self::with_roots`] to replace that trust set instead.
     #[must_use]
     pub fn new(private_root: Option<&'a [u8]>, rsa: &'a mut RsaWorkspace) -> Self {
         Self {
-            private_root,
+            roots: TrustRoots::Builtin(private_root),
             rsa,
             hostname: String::new(),
             certificate_verified: false,
@@ -178,6 +186,16 @@ impl<'a, Clock: TlsClock> TrustVerifier<'a, Clock> {
             leaf_key: LeafPublicKey::empty(),
             _clock: PhantomData,
         }
+    }
+
+    /// Trust exactly these DER anchors, without the built-in public roots.
+    /// An empty set rejects every peer. Chain, hostname, time, constraints and
+    /// CertificateVerify checks use the same verifier as the default policy.
+    #[must_use]
+    pub fn with_roots(roots: &'a [&'a [u8]], rsa: &'a mut RsaWorkspace) -> Self {
+        let mut verifier = Self::new(None, rsa);
+        verifier.roots = TrustRoots::Explicit(roots);
+        verifier
     }
 
     fn clear_certificate_state(&mut self) {
@@ -201,12 +219,21 @@ impl<Clock: TlsClock> TlsVerifier<Suite> for TrustVerifier<'_, Clock> {
         cert: CertificateRef<'_>,
     ) -> Result<(), TlsError> {
         self.clear_certificate_state();
-        let leaf_key = match x509::verify_chain_with_workspace::<Clock>(
-            cert,
-            &self.hostname,
-            self.private_root,
-            self.rsa,
-        ) {
+        let verified = match self.roots {
+            TrustRoots::Builtin(private_root) => x509::verify_chain_with_workspace::<Clock>(
+                cert,
+                &self.hostname,
+                private_root,
+                self.rsa,
+            ),
+            TrustRoots::Explicit(roots) => x509::verify_chain_with_roots::<Clock>(
+                cert,
+                &self.hostname,
+                roots.iter().copied(),
+                self.rsa,
+            ),
+        };
+        let leaf_key = match verified {
             Ok(key) => key,
             Err(error) => {
                 self.clear_certificate_state();
@@ -287,6 +314,15 @@ pub struct VerifyingProvider<'a, Rng, Clock: TlsClock> {
 }
 
 impl<'a, Rng, Clock: TlsClock> VerifyingProvider<'a, Rng, Clock> {
+    /// Use only the application's DER anchors, without public-root fallback.
+    #[must_use]
+    pub fn with_roots(rng: Rng, roots: &'a [&'a [u8]], rsa: &'a mut RsaWorkspace) -> Self {
+        Self {
+            rng,
+            verifier: TrustVerifier::with_roots(roots, rsa),
+        }
+    }
+
     #[must_use]
     pub fn new(rng: Rng, private_root: Option<&'a [u8]>, rsa: &'a mut RsaWorkspace) -> Self {
         Self {
