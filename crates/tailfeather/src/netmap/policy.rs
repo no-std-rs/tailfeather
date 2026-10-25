@@ -22,34 +22,31 @@ pub const MAX_FILTER_DESTINATIONS: usize = 256;
 pub const MAX_FILTER_PROTOCOLS: usize = 8;
 pub const MAX_FILTER_SET_NAME: usize = 32;
 
-/// An inclusive IPv4 range. IPv6 entries use the empty `1..=0` sentinel: they
-/// are valid tailcfg but never match this IPv4-only forwarding milestone.
-/// Keeping this at eight bytes matters because a bounded policy contains up to
-/// 512 source/destination networks.
+/// An inclusive address range. Wildcards match both address families; an
+/// IPv4 default route never implicitly grants access to IPv6 destinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Network {
-    first: u32,
-    last: u32,
+pub enum Network {
+    Any,
+    V4 { first: u32, last: u32 },
+    V6 { first: [u8; 16], last: [u8; 16] },
 }
 
 impl Network {
-    pub const ANY: Self = Self {
-        first: 0,
-        last: u32::MAX,
-    };
-    const V6: Self = Self { first: 1, last: 0 };
-
+    pub const ANY: Self = Self::Any;
     pub fn parse(text: &str) -> Result<Self, Error> {
         if text == "*" {
-            return Ok(Self::ANY);
+            return Ok(Self::Any);
         }
         if let Some((first, last)) = text.split_once('-') {
             return match (IpAddr::from_str(first), IpAddr::from_str(last)) {
-                (Ok(IpAddr::V4(first)), Ok(IpAddr::V4(last))) if first <= last => Ok(Self {
+                (Ok(IpAddr::V4(first)), Ok(IpAddr::V4(last))) if first <= last => Ok(Self::V4 {
                     first: u32::from(first),
                     last: u32::from(last),
                 }),
-                (Ok(IpAddr::V6(first)), Ok(IpAddr::V6(last))) if first <= last => Ok(Self::V6),
+                (Ok(IpAddr::V6(first)), Ok(IpAddr::V6(last))) if first <= last => Ok(Self::V6 {
+                    first: first.octets(),
+                    last: last.octets(),
+                }),
                 _ => Err(Error::Malformed),
             };
         }
@@ -58,33 +55,75 @@ impl Network {
             (cidr.address, cidr.prefix)
         } else {
             let address = IpAddr::from_str(text).map_err(|_| Error::Malformed)?;
-            let prefix = if address.is_ipv4() { 32 } else { 128 };
-            (address, prefix)
+            (address, if address.is_ipv4() { 32 } else { 128 })
         };
         match address {
             IpAddr::V4(address) => {
-                let mask = prefix_mask(prefix);
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
                 let first = u32::from(address) & mask;
-                Ok(Self {
+                Ok(Self::V4 {
                     first,
                     last: first | !mask,
                 })
             }
-            IpAddr::V6(_) => Ok(Self::V6),
+            IpAddr::V6(address) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                let first = u128::from(address) & mask;
+                Ok(Self::V6 {
+                    first: first.to_be_bytes(),
+                    last: (first | !mask).to_be_bytes(),
+                })
+            }
         }
     }
-
+    fn contains(self, address: IpAddr) -> bool {
+        match (self, address) {
+            (Self::Any, _) => true,
+            (Self::V4 { first, last }, IpAddr::V4(address)) => {
+                (first..=last).contains(&u32::from(address))
+            }
+            (Self::V6 { first, last }, IpAddr::V6(address)) => {
+                (first..=last).contains(&address.octets())
+            }
+            _ => false,
+        }
+    }
     fn contains_v4(self, address: Ipv4Addr) -> bool {
-        (self.first..=self.last).contains(&u32::from(address))
+        self.contains(IpAddr::V4(address))
     }
 }
 
-const fn prefix_mask(prefix: u8) -> u32 {
-    if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    }
+// Existing IPv4 policies keep their eight-byte network storage. At most 32
+// distinct IPv6 ranges are interned separately; overflow rejects the map,
+// never broadens an ACL. Deleting a named set reclaims unreferenced ranges.
+#[cfg(not(feature = "hosted-policy"))]
+const MAX_V6_NETWORKS: usize = 32;
+#[cfg(feature = "hosted-policy")]
+const MAX_V6_NETWORKS: usize = 256;
+#[derive(Debug, Clone, Copy)]
+struct StoredNetwork {
+    first: u32,
+    last: u32,
+}
+#[derive(Debug, Clone)]
+struct StoredDestination {
+    network: StoredNetwork,
+    first_port: u16,
+    last_port: u16,
+}
+#[derive(Debug, Clone)]
+struct StoredFilterRule {
+    sources: Vec<StoredNetwork, MAX_FILTER_SOURCES>,
+    destinations: Vec<StoredDestination, MAX_FILTER_DESTINATIONS>,
+    protocols: Vec<u8, MAX_FILTER_PROTOCOLS>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,12 +131,6 @@ pub struct Destination {
     pub network: Network,
     pub first_port: u16,
     pub last_port: u16,
-}
-
-impl Destination {
-    fn matches(self, address: Ipv4Addr, port: u16) -> bool {
-        self.network.contains_v4(address) && (self.first_port..=self.last_port).contains(&port)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,18 +158,6 @@ impl FilterRule {
                 .iter()
                 .all(|destination| destination.first_port <= destination.last_port)
     }
-
-    fn matches(&self, source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, port: u16) -> bool {
-        (self.protocols.is_empty() || self.protocols.contains(&protocol))
-            && self
-                .sources
-                .iter()
-                .any(|network| network.contains_v4(source))
-            && self
-                .destinations
-                .iter()
-                .any(|rule| rule.matches(destination, port))
-    }
 }
 
 impl Default for FilterRule {
@@ -148,7 +169,7 @@ impl Default for FilterRule {
 #[derive(Debug, Clone)]
 struct StoredRule {
     set: u8,
-    rule: FilterRule,
+    rule: StoredFilterRule,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +184,7 @@ pub struct PacketPolicy {
     sets: Vec<FilterSet, MAX_FILTER_SETS>,
     rules: Vec<StoredRule, MAX_FILTER_RULES>,
     valid: bool,
+    v6_networks: [Option<Network>; MAX_V6_NETWORKS],
 }
 
 impl PacketPolicy {
@@ -171,6 +193,7 @@ impl PacketPolicy {
             sets: Vec::new(),
             rules: Vec::new(),
             valid: false,
+            v6_networks: [None; MAX_V6_NETWORKS],
         }
     }
 
@@ -200,6 +223,7 @@ impl PacketPolicy {
                 .expect("equal packet-filter rule capacities");
         }
         self.valid = source.valid;
+        self.v6_networks = source.v6_networks;
     }
 
     pub fn mark_present(&mut self) {
@@ -233,12 +257,14 @@ impl PacketPolicy {
             self.rules.retain(|rule| rule.set != id);
         }
         self.sets.retain(|set| set.name.as_str() != name);
+        self.collect_networks();
         self.valid = true;
     }
 
     pub fn clear(&mut self) {
         self.sets.clear();
         self.rules.clear();
+        self.v6_networks.fill(None);
         self.valid = true;
     }
 
@@ -252,11 +278,109 @@ impl PacketPolicy {
             .find(|entry| entry.name.as_str() == set)
             .map(|entry| entry.id)
             .ok_or(Error::Malformed)?;
-        self.rules
-            .push(StoredRule { set, rule })
-            .map_err(|_| Error::Full(CapacityError::PacketPolicy))
+        let result = (|| {
+            let mut compact = StoredFilterRule {
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                protocols: rule.protocols,
+            };
+            for network in rule.sources {
+                let network = self.store_network(network)?;
+                compact
+                    .sources
+                    .push(network)
+                    .map_err(|_| Error::Full(CapacityError::PacketPolicy))?;
+            }
+            for destination in rule.destinations {
+                let network = self.store_network(destination.network)?;
+                compact
+                    .destinations
+                    .push(StoredDestination {
+                        network,
+                        first_port: destination.first_port,
+                        last_port: destination.last_port,
+                    })
+                    .map_err(|_| Error::Full(CapacityError::PacketPolicy))?;
+            }
+            self.rules
+                .push(StoredRule { set, rule: compact })
+                .map_err(|_| Error::Full(CapacityError::PacketPolicy))
+        })();
+        if result.is_err() {
+            self.collect_networks();
+        }
+        result
     }
 
+    fn store_network(&mut self, network: Network) -> Result<StoredNetwork, Error> {
+        match network {
+            Network::Any => Ok(StoredNetwork {
+                first: u32::MAX,
+                last: 0,
+            }),
+            Network::V4 { first, last } if first <= last => Ok(StoredNetwork { first, last }),
+            Network::V6 { first, last } if first <= last => {
+                let index = self
+                    .v6_networks
+                    .iter()
+                    .position(|entry| *entry == Some(network))
+                    .or_else(|| self.v6_networks.iter().position(Option::is_none))
+                    .ok_or(Error::Full(CapacityError::PacketPolicy))?;
+                self.v6_networks[index] = Some(network);
+                Ok(StoredNetwork {
+                    first: index as u32 + 1,
+                    last: 0,
+                })
+            }
+            _ => Err(Error::Malformed),
+        }
+    }
+    fn network(&self, stored: StoredNetwork) -> Option<Network> {
+        if stored.first <= stored.last {
+            Some(Network::V4 {
+                first: stored.first,
+                last: stored.last,
+            })
+        } else if stored.first == u32::MAX {
+            Some(Network::Any)
+        } else {
+            self.v6_networks
+                .get(stored.first as usize - 1)
+                .copied()
+                .flatten()
+        }
+    }
+    fn collect_networks(&mut self) {
+        for index in 0..MAX_V6_NETWORKS {
+            let used = self.rules.iter().any(|stored| {
+                stored
+                    .rule
+                    .sources
+                    .iter()
+                    .chain(stored.rule.destinations.iter().map(|d| &d.network))
+                    .any(|network| network.first == index as u32 + 1 && network.last == 0)
+            });
+            if !used {
+                self.v6_networks[index] = None;
+            }
+        }
+    }
+    fn allows_ip(&self, source: IpAddr, destination: IpAddr, protocol: u8, port: u16) -> bool {
+        self.valid
+            && self.rules.iter().any(|stored| {
+                let rule = &stored.rule;
+                (rule.protocols.is_empty() || rule.protocols.contains(&protocol))
+                    && rule
+                        .sources
+                        .iter()
+                        .any(|network| self.network(*network).is_some_and(|n| n.contains(source)))
+                    && rule.destinations.iter().any(|d| {
+                        self.network(d.network)
+                            .is_some_and(|n| n.contains(destination))
+                            && (d.first_port..=d.last_port).contains(&port)
+                    })
+            })
+    }
     pub fn allows(
         &self,
         source: Ipv4Addr,
@@ -264,12 +388,33 @@ impl PacketPolicy {
         protocol: u8,
         destination_port: u16,
     ) -> bool {
-        self.valid
-            && self.rules.iter().any(|stored| {
-                stored
-                    .rule
-                    .matches(source, destination, protocol, destination_port)
-            })
+        self.allows_ip(
+            IpAddr::V4(source),
+            IpAddr::V4(destination),
+            protocol,
+            destination_port,
+        )
+    }
+
+    /// Match fixed-header IPv6 UDP/TCP/ICMPv6 packets. Extension/fragment
+    /// headers are unsupported and fail closed, matching the gateway parser.
+    pub fn allows_ipv6(&self, packet: &[u8]) -> bool {
+        if packet.len() < 40
+            || packet[0] >> 4 != 6
+            || 40 + usize::from(u16::from_be_bytes([packet[4], packet[5]])) != packet.len()
+        {
+            return false;
+        }
+        let protocol = packet[6];
+        let port = match protocol {
+            6 if packet.len() >= 60 => u16::from_be_bytes([packet[42], packet[43]]),
+            17 if packet.len() >= 48 => u16::from_be_bytes([packet[42], packet[43]]),
+            58 if packet.len() >= 48 => 0,
+            _ => return false,
+        };
+        let source = core::net::Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap());
+        let destination = core::net::Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap());
+        self.allows_ip(source.into(), destination.into(), protocol, port)
     }
 
     /// Whether `source` holds a UDP DNS grant for the exit-node proxy.
@@ -283,13 +428,14 @@ impl PacketPolicy {
             && self.rules.iter().any(|stored| {
                 let rule = &stored.rule;
                 (rule.protocols.is_empty() || rule.protocols.contains(&17))
-                    && rule
-                        .sources
-                        .iter()
-                        .any(|network| network.contains_v4(source))
+                    && rule.sources.iter().any(|network| {
+                        self.network(*network)
+                            .is_some_and(|n| n.contains_v4(source))
+                    })
                     && rule.destinations.iter().any(|destination| {
-                        destination.network.first <= destination.network.last
-                            && (destination.first_port..=destination.last_port).contains(&53)
+                        self.network(destination.network).is_some_and(|network| {
+                            matches!(network, Network::Any | Network::V4 { .. })
+                        }) && (destination.first_port..=destination.last_port).contains(&53)
                     })
             })
     }
@@ -340,6 +486,136 @@ impl Default for PacketPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_grants_preserve_prefix_ranges_protocols_and_family_boundaries() {
+        let mut policy = PacketPolicy::new();
+        policy.replace_set("v6").unwrap();
+        let mut rule = FilterRule::new();
+        rule.sources
+            .push(Network::parse("fd7a:115c:a1e0::1-fd7a:115c:a1e0::3").unwrap())
+            .unwrap();
+        rule.destinations
+            .push(Destination {
+                network: Network::parse("2001:db8::/64").unwrap(),
+                first_port: 443,
+                last_port: 443,
+            })
+            .unwrap();
+        rule.protocols.push(6).unwrap();
+        policy.push_rule("v6", rule).unwrap();
+        let mut packet = [0u8; 60];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&20u16.to_be_bytes());
+        packet[6] = 6;
+        packet[8..24].copy_from_slice(
+            &"fd7a:115c:a1e0::2"
+                .parse::<core::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        packet[24..40].copy_from_slice(
+            &"2001:db8::5"
+                .parse::<core::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        packet[42..44].copy_from_slice(&443u16.to_be_bytes());
+        assert!(policy.allows_ipv6(&packet));
+        packet[43] = 80;
+        assert!(!policy.allows_ipv6(&packet));
+        packet[43] = 187;
+        packet[23] = 4;
+        assert!(!policy.allows_ipv6(&packet));
+        assert!(!policy.allows(
+            "100.64.0.2".parse().unwrap(),
+            "192.0.2.2".parse().unwrap(),
+            6,
+            443
+        ));
+        assert!(
+            !Network::parse("0.0.0.0/0")
+                .unwrap()
+                .contains("2001:db8::1".parse().unwrap())
+        );
+        assert!(
+            !Network::parse("::/0")
+                .unwrap()
+                .contains("192.0.2.1".parse().unwrap())
+        );
+        assert!(Network::ANY.contains("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn replacing_named_sets_reclaims_interned_ipv6_networks() {
+        let mut policy = PacketPolicy::new();
+        for index in 0..MAX_V6_NETWORKS * 2 {
+            policy.replace_set("rotating").unwrap();
+            let mut rule = any_rule();
+            rule.sources.clear();
+            let mut text = String::<48>::new();
+            use core::fmt::Write as _;
+            write!(&mut text, "2001:db8::{index:x}").unwrap();
+            rule.sources.push(Network::parse(&text).unwrap()).unwrap();
+            policy.push_rule("rotating", rule).unwrap();
+            assert_eq!(policy.v6_networks.iter().flatten().count(), 1);
+        }
+    }
+
+    #[test]
+    fn ipv6_pool_overflow_preserves_existing_grants_and_rejects_new_ones() {
+        let mut policy = PacketPolicy::new();
+        policy.replace_set("v6").unwrap();
+        let mut index = 0;
+        while index < MAX_V6_NETWORKS {
+            let mut rule = any_rule();
+            rule.sources.clear();
+            for _ in 0..MAX_FILTER_SOURCES.min(MAX_V6_NETWORKS - index) {
+                let mut text = String::<48>::new();
+                use core::fmt::Write as _;
+                write!(&mut text, "2001:db8::{index:x}").unwrap();
+                rule.sources.push(Network::parse(&text).unwrap()).unwrap();
+                index += 1;
+            }
+            policy.push_rule("v6", rule).unwrap();
+        }
+        let count = policy.rule_count();
+        let mut rule = any_rule();
+        rule.sources.clear();
+        rule.sources
+            .push(Network::parse("2001:db9::1").unwrap())
+            .unwrap();
+        assert_eq!(
+            policy.push_rule("v6", rule),
+            Err(Error::Full(CapacityError::PacketPolicy))
+        );
+        assert_eq!(policy.rule_count(), count);
+        assert!(policy.allows_ip(
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::ffff".parse().unwrap(),
+            6,
+            443
+        ));
+        assert!(!policy.allows_ip(
+            "2001:db9::1".parse().unwrap(),
+            "2001:db8::ffff".parse().unwrap(),
+            6,
+            443
+        ));
+    }
+
+    #[test]
+    fn invalid_ranges_cannot_alias_wildcard_or_interned_handles() {
+        let mut policy = PacketPolicy::new();
+        policy.replace_set("invalid").unwrap();
+        let mut rule = any_rule();
+        rule.sources[0] = Network::V4 {
+            first: u32::MAX,
+            last: 0,
+        };
+        assert_eq!(policy.push_rule("invalid", rule), Err(Error::Malformed));
+        assert_eq!(policy.rule_count(), 0);
+    }
 
     fn any_rule() -> FilterRule {
         let mut rule = FilterRule::new();

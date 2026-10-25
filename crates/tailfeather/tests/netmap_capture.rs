@@ -77,9 +77,9 @@ fn parses_the_full_map_a_real_server_sent() {
     assert!(peer.online());
     assert_eq!(peer.home_derp, 999);
     assert_eq!(peer.tailscale_ipv4().unwrap().to_string(), "100.64.0.1");
-    // One, not two: the capture's peer advertises an IPv4 /32 and an IPv6
-    // /128, and peer subnets are retained IPv4-only. The device cannot route
-    // IPv6, so holding it would spend the RTC-fast bank on an unusable route.
+    // IPv4 route lists remain compact; the IPv6 host address is retained
+    // separately for cryptokey ownership checks on IPv6 exit traffic.
+    assert!(peer.tailscale_ipv6().is_some());
     assert_eq!(peer.allowed_ips.len(), 1);
     assert_eq!(
         peer.allowed_ips[0].address,
@@ -685,10 +685,8 @@ fn peers_changed_does_not_evict_a_retained_peer_when_full() {
 
 /// A peer's IPv6 subnets are parsed and then dropped, while the self record
 /// keeps both families. The device routes IPv4 only, and peer storage is the
-/// part of the staged map that scales with the tailnet: every IPv6 subnet
-/// retained there is 8 bytes of the un-growable RTC-fast bank spent on a route
-/// the data plane would refuse anyway. The self record is one instance, and
-/// `default_routes_approved` has to see the `::/0` the server sends.
+/// part of the staged map that scales with the tailnet. IPv6 host ownership
+/// has a separate field; subnet vectors remain compact IPv4-only storage.
 #[test]
 fn peer_subnets_are_retained_ipv4_only_while_self_routes_keep_both_families() {
     let mut netmap = Netmap::<32>::new();
@@ -699,6 +697,10 @@ fn peer_subnets_are_retained_ipv4_only_while_self_routes_keep_both_families() {
     );
 
     let peer = netmap.peers.get(7).expect("the peer is retained");
+    assert_eq!(
+        peer.tailscale_ipv6(),
+        Some("fd7a:115c:a1e0::9".parse().unwrap())
+    );
     assert_eq!(peer.addresses.len(), 1);
     assert_eq!(peer.allowed_ips.len(), 2, "100.64.0.9/32 and 0.0.0.0/0");
     // The type itself now rules IPv6 out, so what is worth pinning is which

@@ -445,8 +445,21 @@ pub enum NodeAction {
         peer: NodePublic,
         packet: SecretBuffer<MAX_ACTION_PACKET>,
     },
+    DeliveredIpv6 {
+        peer: NodePublic,
+        packet: SecretBuffer<MAX_ACTION_PACKET>,
+    },
     PersistState(PersistState),
     StatusChanged(NodeStatus),
+}
+
+fn delivered_packet(peer: NodePublic, bytes: &[u8]) -> Result<NodeAction, NodeError> {
+    let packet = SecretBuffer::try_from_slice(bytes)?;
+    Ok(if bytes.first().is_some_and(|byte| byte >> 4 == 6) {
+        NodeAction::DeliveredIpv6 { peer, packet }
+    } else {
+        NodeAction::DeliveredIpv4 { peer, packet }
+    })
 }
 
 /// Control events contain decoded protocol-level data, never stream handles.
@@ -1541,10 +1554,9 @@ impl<const PEERS: usize> Node<PEERS> {
                             packet: SecretBuffer::try_from_slice(data)?,
                         })))
                     }
-                    TunnelAction::Receive { packet, .. } => Ok(Some(NodeAction::DeliveredIpv4 {
-                        peer,
-                        packet: SecretBuffer::try_from_slice(packet)?,
-                    })),
+                    TunnelAction::Receive { packet, .. } => {
+                        delivered_packet(peer, packet).map(Some)
+                    }
                 }
             }
         }
@@ -1657,10 +1669,7 @@ impl<const PEERS: usize> Node<PEERS> {
                         .peer_public_key(peer)
                         .ok_or(NodeError::InvalidState)?,
                 );
-                Ok(Some(NodeAction::DeliveredIpv4 {
-                    peer: key,
-                    packet: SecretBuffer::try_from_slice(packet)?,
-                }))
+                delivered_packet(key, packet).map(Some)
             }
         }
     }
@@ -1701,10 +1710,7 @@ impl<const PEERS: usize> Node<PEERS> {
                         .peer_public_key(peer)
                         .ok_or(NodeError::InvalidState)?,
                 );
-                Ok(Some(NodeAction::DeliveredIpv4 {
-                    peer: key,
-                    packet: SecretBuffer::try_from_slice(packet)?,
-                }))
+                delivered_packet(key, packet).map(Some)
             }
         }
     }
@@ -1783,6 +1789,17 @@ impl<const PEERS: usize> Node<PEERS> {
             .map(|(index, _)| index);
         let index = matches.next()?;
         matches.next().is_none().then_some(index)
+    }
+
+    /// Encrypt an inner IPv6 packet for a configured peer. As for IPv4, the
+    /// caller must apply source ownership and packet policy before forwarding.
+    pub fn encapsulate_ipv6(
+        &mut self,
+        peer: &NodePublic,
+        packet: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<NodeAction>, NodeError> {
+        self.encapsulate_ipv4(peer, packet, now_ms)
     }
 
     /// Encrypt an inner IPv4 packet for a configured peer.

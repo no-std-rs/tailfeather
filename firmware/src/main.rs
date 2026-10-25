@@ -72,7 +72,7 @@ const fn decimal_u64(text: &str) -> u64 {
 /// TCP and ICMP raw forwarding (peer-API DNS shares raw UDP), control, two DERP
 /// connections, and transient bootstrap DNS/STUN/NTP use. NAT table capacity
 /// no longer consumes socket handles.
-static STACK_RESOURCES: StaticCell<StackResources<12>> = StaticCell::new();
+static STACK_RESOURCES: StaticCell<StackResources<13>> = StaticCell::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -111,15 +111,18 @@ async fn main(spawner: Spawner) -> ! {
     let mut seed = [0u8; 8];
     rng.read(&mut seed);
 
+    let mut network_config = embassy_net::Config::dhcpv4(Default::default());
+    network_config.ipv6 = embassy_net::ConfigV6::Slaac;
     let (stack, runner) = embassy_net::new(
         interfaces.station,
-        embassy_net::Config::dhcpv4(Default::default()),
+        network_config,
         STACK_RESOURCES.init(StackResources::new()),
         u64::from_le_bytes(seed),
     );
 
     spawner.spawn(wifi::connection(wifi_controller).expect("each task is spawned once"));
     spawner.spawn(net_task(runner).expect("each task is spawned once"));
+    spawner.spawn(ipv6_status(stack).expect("each task is spawned once"));
 
     stack.wait_config_up().await;
     let address = stack
@@ -138,4 +141,24 @@ async fn main(spawner: Spawner) -> ! {
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, Interface<'static>>) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn ipv6_status(stack: embassy_net::Stack<'static>) {
+    let mut previous = None;
+    loop {
+        let current = stack.config_v6();
+        if current != previous {
+            if let Some(config) = &current {
+                info!(
+                    "IPv6 uplink: {} gateway={:?}",
+                    config.address, config.gateway
+                );
+            } else {
+                info!("IPv6 uplink unavailable");
+            }
+            previous = current;
+        }
+        embassy_time::Timer::after_secs(1).await;
+    }
 }

@@ -263,7 +263,7 @@ fn exit_node_routes_parse_as_an_array_of_prefixes() {
             hostname: "gw",
             version: "1.94.2",
             os: "linux",
-            routable_ips: &tailfeather::control::hostinfo::EXIT_NODE_ROUTES,
+            routable_ips: &tailfeather::control::hostinfo::DUAL_STACK_EXIT_NODE_ROUTES,
             preferred_derp: 0,
             report_no_derp: false,
             peer_api_port: Some(5254),

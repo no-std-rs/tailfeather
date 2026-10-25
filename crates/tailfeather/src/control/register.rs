@@ -273,10 +273,7 @@ mod tests {
                 ephemeral: false,
             },
         );
-        assert!(
-            text.contains(r#""RoutableIPs":["0.0.0.0/0","::/0"]"#),
-            "{text}"
-        );
+        assert!(text.contains(r#""RoutableIPs":["0.0.0.0/0"]"#), "{text}");
     }
 
     #[test]

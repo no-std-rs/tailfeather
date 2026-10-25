@@ -27,6 +27,25 @@ use tailfeather::{DerpCommand, DerpEvent, Node, NodeAction};
 use wirefeather::Rng;
 
 use crate::nat;
+use tailfeather_gateway::ipv6;
+
+static IPV6_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) fn exit_routes() -> &'static [&'static str] {
+    tailfeather::control::hostinfo::exit_node_routes(
+        IPV6_READY.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+fn ipv6_uplink(stack: Stack<'_>) -> Option<core::net::Ipv6Addr> {
+    let config = stack.config_v6()?;
+    config.gateway?;
+    let address = core::net::Ipv6Addr::from(config.address.address().octets());
+    ipv6::routable(address).then_some(address)
+}
+
+static V6_RX_META: StaticCell<[raw::PacketMetadata; 4]> = StaticCell::new();
+static V6_TX_META: StaticCell<[raw::PacketMetadata; 4]> = StaticCell::new();
+static V6_RX_BUFFER: StaticCell<[u8; ipv6::MTU * 2]> = StaticCell::new();
+static V6_TX_BUFFER: StaticCell<[u8; ipv6::MTU]> = StaticCell::new();
 
 /// The port we listen on, and the one the peer's `Endpoint` must point at.
 pub(crate) const LISTEN_PORT: u16 = 51820;
@@ -121,8 +140,10 @@ static PEER_API: StaticCell<tailfeather_gateway::peerapi::Server> = StaticCell::
 /// The working buffers stay out of the task's future. They use main SRAM so
 /// RTC-fast can hold the complete bounded staged map for the live tailnet.
 struct Scratch {
-    /// A received outer datagram, or a received NAT reply payload.
-    datagram: [u8; wirefeather::MAX_DATAGRAM_LEN],
+    /// Include the full 1500-byte uplink IP packet even when it exceeds the
+    /// 1280-byte tunnel MTU, so IPv6 can send Packet Too Big instead of losing
+    /// it in RawSocket::recv as a truncated packet.
+    datagram: [u8; 2048],
     /// An inner packet we have built and are about to encapsulate.
     inner: [u8; wirefeather::budget::INNER_MTU],
 }
@@ -317,6 +338,15 @@ pub async fn tunnel(
     } else {
         clock_floor
     };
+    let ipv6_capable = ipv6_uplink(stack).is_some();
+    IPV6_READY.store(ipv6_capable, core::sync::atomic::Ordering::Relaxed);
+    info!("ipv6-exit-capable={ipv6_capable}");
+    if let Some(config) = stack.config_v6() {
+        info!(
+            "IPv6 uplink: {} gateway={:?}",
+            config.address, config.gateway
+        );
+    }
     spawner.spawn(
         crate::control::run(stack, node, authority, state_store, provisional_time)
             .expect("the control task is spawned once"),
@@ -329,7 +359,7 @@ pub async fn tunnel(
         .address();
     let endpoint_refresh_at = embassy_time::Instant::now() + Duration::from_secs(30 * 60);
     let scratch = SCRATCH.init(Scratch {
-        datagram: [0; wirefeather::MAX_DATAGRAM_LEN],
+        datagram: [0; 2048],
         inner: [0; wirefeather::budget::INNER_MTU],
     });
     crate::derp::start(spawner, stack);
@@ -379,6 +409,18 @@ pub async fn tunnel(
         ICMP_TX_BUFFER.init([0; ICMP_RAW_BUFFER_LEN]),
     );
     let mut icmp_table = nat::IcmpTable::new();
+    let ipv6_socket = RawSocket::new(
+        stack,
+        Some(IpVersion::Ipv6),
+        None,
+        V6_RX_META.init([raw::PacketMetadata::EMPTY; 4]),
+        V6_RX_BUFFER.init([0; ipv6::MTU * 2]),
+        V6_TX_META.init([raw::PacketMetadata::EMPTY; 4]),
+        V6_TX_BUFFER.init([0; ipv6::MTU]),
+    );
+    let mut ipv6_gateway = ipv6::Gateway::new();
+    let mut ipv6_owners: heapless::Vec<(core::net::Ipv6Addr, NodePublic), PEERS> =
+        heapless::Vec::new();
 
     // Translated packets must carry this device's own address as their source.
     let uplink = stack
@@ -416,7 +458,7 @@ pub async fn tunnel(
                 raw_socket.wait_recv_ready(),
                 udp_raw_socket.wait_recv_ready(),
                 wg_socket.wait_recv_ready(),
-                Timer::after(POLL_INTERVAL),
+                select(ipv6_socket.wait_recv_ready(), Timer::after(POLL_INTERVAL)),
             )
             .await
             {
@@ -426,7 +468,8 @@ pub async fn tunnel(
                 Either6::Third(()) => Ready::Raw,
                 Either6::Fourth(()) => Ready::Udp,
                 Either6::Fifth(()) => Ready::Tunnel,
-                Either6::Sixth(()) => Ready::Timers,
+                Either6::Sixth(Either::First(())) => Ready::Ipv6,
+                Either6::Sixth(Either::Second(())) => Ready::Timers,
             }
         } else {
             match select6(
@@ -435,7 +478,7 @@ pub async fn tunnel(
                 raw_socket.wait_recv_ready(),
                 icmp_socket.wait_recv_ready(),
                 select(crate::control::next_notice(), crate::derp::next_notice()),
-                Timer::after(POLL_INTERVAL),
+                select(ipv6_socket.wait_recv_ready(), Timer::after(POLL_INTERVAL)),
             )
             .await
             {
@@ -445,7 +488,8 @@ pub async fn tunnel(
                 Either6::Fourth(()) => Ready::Icmp,
                 Either6::Fifth(Either::First(notice)) => Ready::Control(notice),
                 Either6::Fifth(Either::Second(notice)) => Ready::Derp(notice),
-                Either6::Sixth(()) => Ready::Timers,
+                Either6::Sixth(Either::First(())) => Ready::Ipv6,
+                Either6::Sixth(Either::Second(())) => Ready::Timers,
             }
         };
         reverse_priority = !reverse_priority;
@@ -456,6 +500,26 @@ pub async fn tunnel(
             stack.wait_config_up().await;
             continue;
         };
+        if ipv6_uplink(stack).is_some() != IPV6_READY.load(core::sync::atomic::Ordering::Relaxed) {
+            warn!("IPv6 uplink capability changed; restarting control advertisement");
+            esp_hal::system::software_reset();
+        }
+        // A control map can reassign a tailnet address to another node key.
+        // Do not let an old peer's return traffic reach the new owner.
+        if ipv6_owners.iter().any(|(address, key)| {
+            node.netmap()
+                .peers
+                .by_node_key(key)
+                .is_none_or(|peer| peer.tailscale_ipv6() != Some(*address))
+        }) {
+            ipv6_gateway.clear();
+        }
+        ipv6_owners.clear();
+        for peer in node.netmap().peers.iter() {
+            if let Some(address) = peer.tailscale_ipv6() {
+                let _ = ipv6_owners.push((address, peer.node_key));
+            }
+        }
         let our_ip = uplink.address.address().octets();
         let uplink_prefix = uplink.address.prefix_len();
         if uplink.address.address() != published_uplink
@@ -480,6 +544,9 @@ pub async fn tunnel(
                         scratch,
                         len,
                         from,
+                        &ipv6_socket,
+                        &mut ipv6_gateway,
+                        ipv6_uplink(stack),
                         &wg_socket,
                         &udp_raw_socket,
                         &mut table,
@@ -626,6 +693,20 @@ pub async fn tunnel(
                     )
                 });
                 match action {
+                    Some(Ok(Some(NodeAction::DeliveredIpv6 { peer, packet }))) => {
+                        handle_delivered_ipv6(
+                            node,
+                            &peer,
+                            packet.as_slice(),
+                            scratch,
+                            &wg_socket,
+                            &ipv6_socket,
+                            &mut ipv6_gateway,
+                            ipv6_uplink(stack),
+                            &mut derp_regions,
+                        )
+                        .await;
+                    }
                     Some(Ok(Some(NodeAction::DeliveredIpv4 { peer, packet }))) => {
                         handle_delivered_ipv4(
                             node,
@@ -663,6 +744,38 @@ pub async fn tunnel(
                         }
                     }
                     _ => {}
+                }
+            }
+            Ready::Ipv6 => {
+                if let Ok(len) = ipv6_socket.recv(&mut scratch.datagram).await
+                    && let Some(uplink) = ipv6_uplink(stack)
+                {
+                    match ipv6_gateway.inbound(&mut scratch.datagram[..len], uplink, now_ms()) {
+                        Ok(client) => {
+                            let peer = peer_for_ipv6(node, client);
+                            if let Some(peer) = peer {
+                                encapsulate_and_send(
+                                    node,
+                                    &peer,
+                                    &scratch.datagram[..len],
+                                    &wg_socket,
+                                    &mut derp_regions,
+                                )
+                                .await;
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(size) = ipv6_gateway.error_response(
+                                &scratch.datagram[..len],
+                                uplink,
+                                error,
+                                now_ms(),
+                                &mut scratch.inner,
+                            ) {
+                                let _ = ipv6_socket.send(&scratch.inner[..size]).await;
+                            }
+                        }
+                    }
                 }
             }
             Ready::Timers => {}
@@ -747,7 +860,9 @@ async fn bootstrap_time(stack: Stack<'static>, rng: &mut HwRng, floor: u64) -> O
     let mut consensus = tailfeather::time::Consensus::new();
     let mut response = [0; 512];
     'servers: for address in addresses {
-        let embassy_net::IpAddress::Ipv4(address) = address;
+        let embassy_net::IpAddress::Ipv4(address) = address else {
+            continue;
+        };
         let server = address.octets();
         let mut nonce = [0; 8];
         rng.0.read(&mut nonce);
@@ -802,6 +917,7 @@ enum Ready {
     Udp,
     Raw,
     Icmp,
+    Ipv6,
     Control(crate::control::Notice),
     Derp(crate::derp::Notice),
     Timers,
@@ -815,6 +931,9 @@ async fn handle_tunnel_datagram(
     scratch: &mut Scratch,
     len: usize,
     from: udp::UdpMetadata,
+    ipv6_socket: &RawSocket<'_>,
+    ipv6_gateway: &mut ipv6::Gateway,
+    ipv6_uplink: Option<core::net::Ipv6Addr>,
     wg_socket: &UdpSocket<'_>,
     udp_raw_socket: &RawSocket<'_>,
     table: &mut nat::Table,
@@ -837,11 +956,26 @@ async fn handle_tunnel_datagram(
             CoreIpv4Addr::from(address.octets()),
             from.endpoint.port,
         )),
+        embassy_net::IpAddress::Ipv6(_) => return,
     };
     match node.handle_direct_from(&datagram[..len], source, now_ms(), rng) {
         Ok(Some(NodeAction::DirectTransmit {
             endpoint, packet, ..
         })) => send_direct(wg_socket, packet.as_slice(), endpoint).await,
+        Ok(Some(NodeAction::DeliveredIpv6 { peer, packet })) => {
+            handle_delivered_ipv6(
+                node,
+                &peer,
+                packet.as_slice(),
+                scratch,
+                wg_socket,
+                ipv6_socket,
+                ipv6_gateway,
+                ipv6_uplink,
+                derp_regions,
+            )
+            .await;
+        }
         Ok(Some(NodeAction::DeliveredIpv4 { peer, packet })) => {
             handle_delivered_ipv4(
                 node,
@@ -867,6 +1001,74 @@ async fn handle_tunnel_datagram(
         }
         Ok(_) => {}
         Err(e) => warn!("rx: {e}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_delivered_ipv6(
+    node: &mut Node<PEERS>,
+    peer: &NodePublic,
+    packet: &[u8],
+    scratch: &mut Scratch,
+    wg_socket: &UdpSocket<'_>,
+    socket: &RawSocket<'_>,
+    gateway: &mut ipv6::Gateway,
+    uplink: Option<core::net::Ipv6Addr>,
+    derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
+) {
+    let Some(uplink) = uplink else {
+        return;
+    };
+    let Some(source) = node
+        .netmap()
+        .peers
+        .by_node_key(peer)
+        .and_then(|p| p.tailscale_ipv6())
+    else {
+        return;
+    };
+    if peer_for_ipv6(node, source) != Some(*peer) {
+        return;
+    }
+    if !node.netmap().default_routes_approved() || !node.netmap().packet_filter.allows_ipv6(packet)
+    {
+        return;
+    }
+    if !ipv6::Packet::parse(packet).is_ok_and(|p| p.source == source) {
+        return;
+    }
+    let result = if let Some(out) = scratch.inner.get_mut(..packet.len()) {
+        out.copy_from_slice(packet);
+        gateway.outbound(out, source, uplink, now_ms())
+    } else {
+        Err(ipv6::Error::PacketTooBig)
+    };
+    match result {
+        Ok(_) => {
+            let _ = socket.send(&scratch.inner[..packet.len()]).await;
+        }
+        Err(error) => {
+            let our_tunnel_ip =
+                node.netmap()
+                    .addresses
+                    .iter()
+                    .find_map(|cidr| match cidr.address {
+                        core::net::IpAddr::V6(address) => Some(address),
+                        _ => None,
+                    });
+            if let Some(our_tunnel_ip) = our_tunnel_ip
+                && let Some(len) = gateway.error_response(
+                    packet,
+                    our_tunnel_ip,
+                    error,
+                    now_ms(),
+                    &mut scratch.inner,
+                )
+            {
+                encapsulate_and_send(node, peer, &scratch.inner[..len], wg_socket, derp_regions)
+                    .await;
+            }
+        }
     }
 }
 
@@ -1551,6 +1753,16 @@ fn assigned_ipv4(node: &Node<PEERS>) -> Option<[u8; 4]> {
         })
 }
 
+fn peer_for_ipv6(node: &Node<PEERS>, address: core::net::Ipv6Addr) -> Option<NodePublic> {
+    let mut owners = node
+        .netmap()
+        .peers
+        .iter()
+        .filter(|peer| peer.tailscale_ipv6() == Some(address));
+    let first = owners.next()?.node_key;
+    owners.next().is_none().then_some(first)
+}
+
 fn peer_for_ip(node: &Node<PEERS>, address: [u8; 4]) -> Option<NodePublic> {
     node.netmap()
         .peers
@@ -1565,7 +1777,11 @@ async fn encapsulate_and_send(
     socket: &UdpSocket<'_>,
     derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
 ) {
-    match node.encapsulate_ipv4(peer, packet, now_ms()) {
+    match if packet.first().is_some_and(|byte| byte >> 4 == 6) {
+        node.encapsulate_ipv6(peer, packet, now_ms())
+    } else {
+        node.encapsulate_ipv4(peer, packet, now_ms())
+    } {
         Ok(Some(action)) => dispatch_transmit(socket, derp_regions, action).await,
         Ok(None) => {}
         Err(e) => warn!("encapsulate: {e}"),

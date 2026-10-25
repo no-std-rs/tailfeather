@@ -32,6 +32,12 @@ DOH_ANSWER=203.0.113.7
 RAW_MARK=0x7466
 
 cleanup() {
+    local result=$?
+    if [[ $result -ne 0 ]]; then
+        for log in "$WORK"/*6*.log "$WORK"/udp6-response; do
+            [[ -f $log ]] && cat "$log" >&2
+        done
+    fi
     for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
     ip netns delete "$CLIENT_NS" 2>/dev/null || true
     ip netns delete "$GATEWAY_NS" 2>/dev/null || true
@@ -46,7 +52,7 @@ trap cleanup EXIT INT TERM
 
 [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 2; }
 [[ -x "$HARNESS" ]] || { echo "bare harness not executable: $HARNESS" >&2; exit 2; }
-for command in ethtool ip wg ping iptables openssl ss; do
+for command in ethtool ip wg ping iptables ip6tables openssl ss socat; do
     command -v "$command" >/dev/null || { echo "missing dependency: $command" >&2; exit 2; }
 done
 
@@ -225,6 +231,85 @@ run_tls_probe 42003
 echo "PASS: exit.forward.tcp"
 cat "$GATEWAY_LOG"
 
+kill "$GATEWAY_PID"
+wait "$GATEWAY_PID" 2>/dev/null || true
+
+echo "== IPv6 UDP, TCP, ICMP and hop-limit forwarding"
+V6_CLIENT=fd7a:115c:a1e0::2
+V6_GATEWAY=fd7a:115c:a1e0::1
+V6_UPLINK=2001:db8:211::1
+V6_SERVER=2001:db8:211::2
+ip -n "$CLIENT_NS" -6 addr add "$V6_CLIENT/128" dev wg0 nodad
+ip -n "$GATEWAY_NS" -6 addr add "$V6_UPLINK/64" dev "$GATEWAY_UPLINK" nodad
+ip -n "$SERVER_NS" -6 addr add "$V6_SERVER/64" dev "$SERVER_LINK" nodad
+ip netns exec "$CLIENT_NS" wg set wg0 peer "$(cat "$WORK/gateway.pub")" remove
+ip netns exec "$CLIENT_NS" wg set wg0 peer "$(cat "$WORK/gateway.pub")" \
+    endpoint "$UNDERLAY_GATEWAY:$WG_PORT" \
+    allowed-ips "$SERVER/32,$TUNNEL_GATEWAY/32,$V6_SERVER/128,$V6_GATEWAY/128"
+ip -n "$CLIENT_NS" -6 route add "$V6_SERVER/128" dev wg0
+ip -n "$CLIENT_NS" -6 route add "$V6_GATEWAY/128" dev wg0
+ip netns exec "$GATEWAY_NS" ip6tables -A OUTPUT -m mark --mark "$RAW_MARK" -j ACCEPT
+ip netns exec "$GATEWAY_NS" ip6tables -A OUTPUT -p tcp --tcp-flags RST RST \
+    --sport 45000:65000 -m mark ! --mark "$RAW_MARK" -j DROP
+ip netns exec "$GATEWAY_NS" ip6tables -A OUTPUT -p ipv6-icmp --icmpv6-type destination-unreachable \
+    -m mark ! --mark "$RAW_MARK" -j DROP
+V6_LOG="$WORK/gateway-v6.log"
+ip netns exec "$GATEWAY_NS" "$HARNESS" gateway6 \
+    "$UNDERLAY_GATEWAY" "$WG_PORT" "$GATEWAY_PRIV_HEX" "$CLIENT_PUB_HEX" \
+    "$TUNNEL_GATEWAY" "$V6_UPLINK" "$V6_CLIENT" "$V6_GATEWAY" >"$V6_LOG" 2>&1 &
+GATEWAY_PID=$!
+PIDS+=("$GATEWAY_PID")
+wait_ready "$GATEWAY_PID" "$V6_LOG"
+ip netns exec "$CLIENT_NS" ping -6 -c 2 -W 3 "$V6_SERVER"
+echo "PASS: exit.forward.ipv6.icmp"
+# No kernel IPv6 forwarding is enabled: replies must pass the shared no_std
+# translator. The observed server-side source is the uplink, not the tailnet.
+timeout 20 ip netns exec "$SERVER_NS" socat -d -d \
+    "UDP6-RECVFROM:42011,bind=[$V6_SERVER],fork" EXEC:/bin/cat >"$WORK/udp6-server.log" 2>&1 &
+PIDS+=("$!")
+sleep 0.2
+printf 'ipv6-udp-roundtrip' | timeout 8 ip netns exec "$CLIENT_NS" socat -T 2 - \
+    "UDP6:[$V6_SERVER]:42011" >"$WORK/udp6-response"
+[[ $(cat "$WORK/udp6-response") == ipv6-udp-roundtrip ]]
+grep -Eq 'receiving packet from.*(2001:db8:211::1|2001:0db8:0211:0000:0000:0000:0000:0001)' "$WORK/udp6-server.log"
+echo "PASS: exit.forward.ipv6.udp"
+# A large reply fits the 1500-byte uplink but exceeds the tunnel's 1280-byte
+# MTU. The upstream kernel must receive our ICMPv6 Packet Too Big and install
+# the smaller PMTU; losing the packet in a 1312-byte WireGuard RX arena would
+# leave this route at 1500 and fail the check.
+timeout 20 ip netns exec "$SERVER_NS" socat \
+    "UDP6-RECVFROM:42013,bind=[$V6_SERVER],fork" \
+    'SYSTEM:head -c 1400 /dev/zero' >"$WORK/udp6-pmtu.log" 2>&1 &
+PIDS+=("$!")
+sleep 0.2
+printf 'ipv6-pmtu' | timeout 8 ip netns exec "$CLIENT_NS" socat -T 1 - \
+    "UDP6:[$V6_SERVER]:42013" >"$WORK/udp6-pmtu-response"
+ip -n "$SERVER_NS" -6 route get "$V6_UPLINK" | grep -q 'mtu 1280'
+echo "PASS: exit.forward.ipv6.packet-too-big"
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
+    -subj '/CN=nostd-ipv6-interop' -addext "subjectAltName=IP:$V6_SERVER" \
+    -keyout "$WORK/tls6.key" -out "$WORK/tls6.crt" >/dev/null 2>&1
+timeout 20 ip netns exec "$SERVER_NS" openssl s_server -6 \
+    -accept "[$V6_SERVER]:42012" -cert "$WORK/tls6.crt" -key "$WORK/tls6.key" \
+    -tls1_3 -quiet -www -naccept 1 >"$WORK/tcp6-server.log" 2>&1 &
+V6_TLS_PID=$!
+PIDS+=("$V6_TLS_PID")
+sleep 0.2
+printf 'GET / HTTP/1.0\r\nHost: nostd-ipv6-interop\r\n\r\n' | \
+    timeout 15 ip netns exec "$CLIENT_NS" openssl s_client -6 \
+    -connect "[$V6_SERVER]:42012" -CAfile "$WORK/tls6.crt" -verify_return_error \
+    -verify_ip "$V6_SERVER" -tls1_3 -quiet >"$WORK/tcp6-response" 2>"$WORK/tcp6-client.log"
+wait "$V6_TLS_PID"
+grep -q '^HTTP/1.0 200 ok' "$WORK/tcp6-response"
+[[ $(wc -c <"$WORK/tcp6-response") -gt 2048 ]]
+echo "PASS: exit.forward.ipv6.tcp"
+# A hop limit of one must produce Time Exceeded, never reach the server.
+if ip netns exec "$CLIENT_NS" ping -6 -t 1 -c 1 -W 3 "$V6_SERVER" >"$WORK/v6-hop.log" 2>&1; then
+    echo "expired IPv6 hop limit unexpectedly reached the server" >&2
+    exit 1
+fi
+grep -qi 'time exceeded\|hop limit' "$WORK/v6-hop.log"
+echo "PASS: exit.forward.ipv6.hop-limit"
 kill "$GATEWAY_PID"
 wait "$GATEWAY_PID" 2>/dev/null || true
 

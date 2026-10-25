@@ -175,7 +175,8 @@ impl Side {
             NodeAction::Derp(DerpCommand::Disconnect { .. })
             | NodeAction::Control(_)
             | NodeAction::PersistState(_)
-            | NodeAction::StatusChanged(_) => {}
+            | NodeAction::StatusChanged(_)
+            | NodeAction::DeliveredIpv6 { .. } => {}
         }
     }
 

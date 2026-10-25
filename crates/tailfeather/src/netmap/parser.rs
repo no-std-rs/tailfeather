@@ -213,6 +213,7 @@ struct Pending {
     #[cfg(feature = "ssh-policy")]
     key_expiry_restricted: Option<bool>,
     home_derp: Option<u16>,
+    ipv6_address: Option<core::net::Ipv6Addr>,
     addresses: heapless::Vec<Cidr4, { crate::netmap::MAX_ADDRESSES }>,
     allowed_ips: heapless::Vec<Cidr4, { crate::netmap::MAX_ALLOWED_IPS }>,
     approved_ipv4_default: bool,
@@ -239,6 +240,7 @@ impl Pending {
             #[cfg(feature = "ssh-policy")]
             key_expiry_restricted: None,
             home_derp: None,
+            ipv6_address: None,
             addresses: heapless::Vec::new(),
             allowed_ips: heapless::Vec::new(),
             approved_ipv4_default: false,
@@ -645,6 +647,7 @@ impl State {
         peer.set_approved_ipv4_default(self.pending.approved_ipv4_default);
         peer.approved_ipv6_default = self.pending.approved_ipv6_default;
         peer.home_derp = self.pending.home_derp.unwrap_or(0);
+        peer.ipv6_address = self.pending.ipv6_address;
         peer.addresses = self.pending.addresses.clone();
         peer.allowed_ips = self.pending.allowed_ips.clone();
         peer.endpoints = self.pending.endpoints.clone();
@@ -842,12 +845,22 @@ impl State {
             Context::PeerHostinfo if key == "Hostname" => {
                 self.pending.hostname = display_name(value);
             }
-            // A peer's IPv6 subnets are dropped rather than stored: this node
-            // routes IPv4 only, so they are bytes the RTC-fast bank spends on
-            // something the data plane will never act on. Malformed input is
-            // still a malformed netmap.
+            // Retain the exact IPv6 host assignment separately from compact
+            // IPv4 route lists, so exit forwarding can bind it to the node key.
             Context::PeerAddresses => match Cidr::parse(value) {
                 Ok(cidr) => {
+                    if let core::net::IpAddr::V6(address) = cidr.address {
+                        if cidr.prefix != 128
+                            || self
+                                .pending
+                                .ipv6_address
+                                .is_some_and(|previous| previous != address)
+                        {
+                            self.fail(Error::MalformedField(MalformedField::Address));
+                        } else {
+                            self.pending.ipv6_address = Some(address);
+                        }
+                    }
                     if let Some(cidr) = Cidr4::from_cidr(cidr)
                         && self.pending.addresses.push(cidr).is_err()
                     {
