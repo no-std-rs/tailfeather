@@ -24,11 +24,29 @@ fn main() {
     let keys: Vec<String> =
         serde_json::from_slice(&std::fs::read(root.join("keys.json")).unwrap()).unwrap();
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let server=Client::start(config(&root,"hosted-server",keys[0].clone())).unwrap();
-        let client=Client::start(config(&root,"hosted-client",keys[1].clone())).unwrap();
+        let resident=std::env::args().any(|arg|arg=="--resident-retry");
+        let server_config=config(&root,"hosted-server",keys[0].clone());
+        let server=if resident {Client::start_resident(server_config)} else {Client::start(server_config)}.unwrap();
+        let client_config=config(&root,"hosted-client",keys[1].clone());
+        let client=if resident {Client::start_resident(client_config)} else {Client::start(client_config)}.unwrap();
         let server_ip=tokio::time::timeout(Duration::from_secs(60),server.ready()).await.unwrap().unwrap();
         let client_ip=tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap();
         println!("PASS: real Headscale registration/map with private CA; server={server_ip}, client={client_ip}");
+        if resident {
+            println!("READY: reject map for resident retry");
+            use std::io::Write;std::io::stdout().flush().unwrap();
+            tokio::time::timeout(Duration::from_secs(60),async {
+                while !root.join("rejected").exists(){tokio::time::sleep(Duration::from_millis(20)).await;}
+                while server.status().address.is_some(){tokio::time::sleep(Duration::from_millis(20)).await;}
+            }).await.unwrap();
+            println!("READY: restore resident map");
+            std::io::stdout().flush().unwrap();
+            tokio::time::timeout(Duration::from_secs(60),async {
+                while !root.join("continue").exists(){tokio::time::sleep(Duration::from_millis(20)).await;}
+            }).await.unwrap();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(60),server.ready()).await.unwrap().unwrap(),server_ip);
+            println!("PASS: rejected oversized map recovers on the retained ephemeral client and address");
+        }
         if std::env::args().any(|arg|arg=="--offline-direct") {
             println!("READY: stop the fixture, then create continue in its directory");
             use std::io::Write;std::io::stdout().flush().unwrap();

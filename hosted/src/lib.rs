@@ -80,6 +80,15 @@ impl Client {
     /// State is authority-bound; corrupt or mismatched state is never reset.
     /// Each directory permits one running client, including across processes.
     pub fn start(config: Config) -> io::Result<Self> {
+        Self::start_with_retries(config, false)
+    }
+    /// Keep the same enrollment through rejected control maps and transient
+    /// outages. The owner must retain this handle between readiness attempts;
+    /// final drop still logs out an ephemeral node. Retries back off to a minute.
+    pub fn start_resident(config: Config) -> io::Result<Self> {
+        Self::start_with_retries(config, true)
+    }
+    fn start_with_retries(config: Config, resident: bool) -> io::Result<Self> {
         if config.hostname.is_empty()
             || config.hostname.len() > 63
             || config.auth_key.len() > 1024
@@ -120,7 +129,7 @@ impl Client {
                         let local = tokio::task::LocalSet::new();
                         let result = local.block_on(
                             &runtime,
-                            node::run(config, receiver, status_tx.clone(), stopped),
+                            node::run(config, receiver, status_tx.clone(), stopped, resident),
                         );
                         drop(local);
                         // OS DNS lookups may outlive cancellation, but cannot

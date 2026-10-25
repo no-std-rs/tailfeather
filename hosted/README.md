@@ -119,7 +119,7 @@ OS DNS lookups. The Headscale fixture restarts the same identity immediately,
 without a timing sleep. Silent established DERP sessions expire 90 seconds after
 the last received frame, including when outbound notifications continue.
 
-`python3 hosted/tools/test-headscale.py` runs both production-path scenarios
+`python3 hosted/tools/test-headscale.py` runs the production-path scenarios
 against a digest-pinned disposable Headscale container with a generated CA.
 It needs Docker (or `CONTAINER_ENGINE=podman`) and OpenSSL; the runner selects
 free loopback ports automatically. Linux CI runs it after the native tests; fixture keys never leave
@@ -134,3 +134,11 @@ caller-owned arenas and the same control/DERP/WireGuard/TCP behavior. Native
 hosted applications enable its CPU-dispatched fused AEAD provider. See
 [`tailfeather-reactor`](../crates/tailfeather-reactor/README.md) for the feature
 matrix, CPU capability diagnostics, and local packet-engine benchmarks.
+
+Resident supervisors can use `Client::start_resident` and retain that client
+across readiness timeouts. Rejected control maps then retry with the same
+identity and persisted enrollment, with delays capped at one minute. A fresh
+accepted map restores readiness; rejection never resets state or enrolls a
+replacement node. Dropping the final client still logs out an ephemeral node.
+The ordinary `Client::start` keeps reporting registration/map rejection as a
+terminal error. Corrupt state and authority mismatches remain errors in both.

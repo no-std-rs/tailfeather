@@ -93,7 +93,7 @@ def main():
 
             wait_for(ready)
             user = json.loads(cli('users', 'create', 'fixture', '--output', 'json').stdout)['id']
-            modes = ('relay', 'relay-persistent', 'direct') if RUNTIME == 'hosted' else ('relay', 'direct')
+            modes = ('relay', 'relay-resident', 'relay-persistent', 'direct') if RUNTIME == 'hosted' else ('relay', 'direct')
             for mode in modes:
                 case = root / mode
                 case.mkdir(mode=0o700)
@@ -117,12 +117,35 @@ def main():
                         args += ['--owned']
                 else:
                     raise ValueError('unknown fixture runtime')
+                if mode == 'relay-resident':
+                    args += ['--resident-retry']
                 if mode == 'direct':
                     args += ['--direct', '--offline-direct']
                 with log.open('w') as output:
                     process = subprocess.Popen(args, cwd=REPO, stdout=output, stderr=subprocess.STDOUT,
                         env={**os.environ, 'TAILFEATHER_FIXTURE_CONTROL_URL': control_url})
                     try:
+                        if mode == 'relay-resident':
+                            wait_for(lambda: 'READY: reject map for resident retry' in log.read_text(), process)
+                            before = json.loads(cli('nodes', 'list', '--output', 'json').stdout)
+                            server_before = next(node for node in before if node['given_name'] == 'hosted-server')
+                            # Disjoint /32s cannot collapse to a smaller prefix set.
+                            sources = [f'10.{i // 128}.{(i % 128) * 2}.1/32' for i in range(513)]
+                            rejected_policy = case / 'oversized-policy.json'
+                            rejected_policy.write_text(json.dumps({'acls': [{'action': 'accept', 'src': sources, 'dst': ['*:*']}]}))
+                            cli('policy', 'set', '--file', '/fixture/' + mode + '/oversized-policy.json')
+                            (case / 'rejected').touch()
+                            wait_for(lambda: 'READY: restore resident map' in log.read_text(), process)
+                            # Leave rejection active through at least two retries.
+                            time.sleep(4)
+                            during = json.loads(cli('nodes', 'list', '--output', 'json').stdout)
+                            server_during = next(node for node in during if node['given_name'] == 'hosted-server')
+                            assert server_before['id'] == server_during['id'], 'resident enrolled a replacement node'
+                            assert {node['id'] for node in during} == {node['id'] for node in before}, 'map rejection changed the node inventory'
+                            accepted_policy = case / 'accepted-policy.json'
+                            accepted_policy.write_text(json.dumps({'acls': [{'action': 'accept', 'src': ['*'], 'dst': ['*:*']}]}))
+                            cli('policy', 'set', '--file', '/fixture/' + mode + '/accepted-policy.json')
+                            (case / 'continue').touch()
                         if mode == 'direct':
                             wait_for(lambda: 'READY: stop the fixture' in log.read_text(), process)
                             # Give the earlier node its peer-add map update before
@@ -140,7 +163,7 @@ def main():
                             # addresses only, never the captured preauth keys.
                             print(text[-4000:], flush=True)
                             raise RuntimeError('real Headscale ' + mode + ' fixture failed')
-                        if RUNTIME == 'hosted' and mode == 'relay':
+                        if RUNTIME == 'hosted' and mode in ('relay', 'relay-resident'):
                             wait_for(lambda: not json.loads(cli('nodes', 'list', '--output', 'json').stdout))
                             print('PASS: Headscale removed ephemeral nodes immediately on logout', flush=True)
                     finally:

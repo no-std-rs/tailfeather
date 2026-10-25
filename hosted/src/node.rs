@@ -27,6 +27,7 @@ pub struct Shared {
     candidate_generation: Cell<u64>,
     local_candidate: Cell<Option<core::net::SocketAddrV4>>,
     direct: bool,
+    resident: bool,
 }
 struct Probe {
     transaction: [u8; 12],
@@ -123,6 +124,7 @@ pub async fn run(
     mut commands: tokio::sync::mpsc::Receiver<crate::Command>,
     status: tokio::sync::watch::Sender<crate::Status>,
     stopped: tokio::sync::oneshot::Receiver<()>,
+    resident: bool,
 ) -> Result<(), Error> {
     let reactor = Reactor::new();
     let authority = Authority::parse(&config.control_url, false).map_err(|_| "HTTPS authority")?;
@@ -158,6 +160,7 @@ pub async fn run(
         candidate_generation: Cell::new(0),
         local_candidate: Cell::new(None),
         direct: !config.relay_only,
+        resident,
     };
     let actions = Actions::default();
     let slots = [crate::relay::Slot::new(), crate::relay::Slot::new()];
@@ -286,6 +289,7 @@ async fn control_loop(
     status: &tokio::sync::watch::Sender<crate::Status>,
     config: &crate::Config,
 ) -> Result<(), Error> {
+    let mut retry_delay = 1000u64;
     loop {
         if node.borrow().requires_persistence() {
             persist(node, store, reactor.clock_millis())?;
@@ -301,14 +305,27 @@ async fn control_loop(
             reactor.sleep(100).await;
             continue;
         }
+        let started = reactor.clock_millis();
         let session = control_session(reactor, node, actions, authority, status, config);
         if let Err(stage) = session.await {
-            if matches!(stage, "registration rejected" | "netmap rejected") {
+            let rejected = matches!(stage, "registration rejected" | "netmap rejected");
+            if rejected && !node.resident {
                 return Err(stage);
+            }
+            if rejected {
+                // A retained owner waits for a fresh accepted map. Never reset
+                // persisted enrollment or substitute a new node on rejection.
+                status.send_replace(crate::Status::default());
+            }
+            if reactor.clock_millis().saturating_sub(started) >= 60_000 {
+                retry_delay = 1000;
             }
             tracing::debug!("POCKETBOOT TAILNET_CONTROL_RETRY stage={stage}");
             node.borrow_mut().control_failed(reactor.clock_millis(), 0);
-            reactor.sleep(1000).await;
+            reactor.sleep(retry_delay).await;
+            if node.resident {
+                retry_delay = (retry_delay * 2).min(60_000);
+            }
         }
     }
 }
@@ -956,6 +973,7 @@ mod tests {
             candidate_generation: Cell::new(0),
             local_candidate: Cell::new(None),
             direct: true,
+            resident: false,
         }
     }
     #[test]
