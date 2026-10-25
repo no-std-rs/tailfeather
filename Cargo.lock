@@ -378,7 +378,7 @@ dependencies = [
 [[package]]
 name = "embedded-tls"
 version = "0.19.0"
-source = "git+https://github.com/pawelchcki/embedded-tls?rev=f1fdbf1e49a3c109063384d5ee669e190f08ff58#f1fdbf1e49a3c109063384d5ee669e190f08ff58"
+source = "git+https://github.com/pawelchcki/embedded-tls?rev=48fef49e6e7cbdaa44e9003a45078656f8955d3d#48fef49e6e7cbdaa44e9003a45078656f8955d3d"
 dependencies = [
  "aes-gcm",
  "digest",
