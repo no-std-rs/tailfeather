@@ -305,12 +305,18 @@ wait "$V6_TLS_PID"
 grep -q '^HTTP/1.0 200 ok' "$WORK/tcp6-response"
 [[ $(wc -c <"$WORK/tcp6-response") -gt 2048 ]]
 echo "PASS: exit.forward.ipv6.tcp"
-# A hop limit of one must produce Time Exceeded, never reach the server.
-if ip netns exec "$CLIENT_NS" ping -6 -t 1 -c 1 -W 3 "$V6_SERVER" >"$WORK/v6-hop.log" 2>&1; then
+# BusyBox ping's -t does not set the IPv6 unicast hop limit, and its IPv6
+# mode omits received ICMP error text. Set the actual IPv6 route metric and observe the kernel's
+# validated Time Exceeded counter rather than depending on ping's CLI/output.
+V6_EXPIRED_BEFORE=$(ip netns exec "$CLIENT_NS" awk '$1 == "Icmp6InTimeExcds" { print $2 }' /proc/net/snmp6)
+[[ -n $V6_EXPIRED_BEFORE ]]
+ip -n "$CLIENT_NS" -6 route replace "$V6_SERVER/128" dev wg0 hoplimit 1
+if ip netns exec "$CLIENT_NS" ping -6 -c 1 -W 3 "$V6_SERVER" >"$WORK/v6-hop.log" 2>&1; then
     echo "expired IPv6 hop limit unexpectedly reached the server" >&2
     exit 1
 fi
-grep -qi 'time exceeded\|hop limit' "$WORK/v6-hop.log"
+V6_EXPIRED_AFTER=$(ip netns exec "$CLIENT_NS" awk '$1 == "Icmp6InTimeExcds" { print $2 }' /proc/net/snmp6)
+[[ $V6_EXPIRED_AFTER -gt $V6_EXPIRED_BEFORE ]]
 echo "PASS: exit.forward.ipv6.hop-limit"
 kill "$GATEWAY_PID"
 wait "$GATEWAY_PID" 2>/dev/null || true
