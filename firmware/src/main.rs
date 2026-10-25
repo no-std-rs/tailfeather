@@ -131,9 +131,8 @@ async fn main(spawner: Spawner) -> ! {
         .address;
     info!("DHCP lease: {address}");
 
-    spawner.spawn(
-        tunnel::tunnel(stack, peripherals.FLASH, spawner).expect("each task is spawned once"),
-    );
+    let bootstrap = tunnel::provision(peripherals.FLASH);
+    spawner.spawn(tunnel::tunnel(stack, bootstrap, spawner).expect("each task is spawned once"));
 
     core::future::pending().await
 }

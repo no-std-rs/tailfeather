@@ -52,7 +52,11 @@ pub fn run(config: wg::Config, uplink: Ipv6Addr, client: Ipv6Addr, tunnel_ip: Ip
                             packet,
                         }) if authenticated == peer => {
                             endpoint = Some(from);
-                            if packet.len() <= inner.len() {
+                            if ipv6::Packet::parse(packet).is_ok_and(|p| p.source == client)
+                                && let Some(len) = ipv6::echo_reply(packet, tunnel_ip, &mut inner)
+                            {
+                                reply_len = Some(len);
+                            } else if packet.len() <= inner.len() {
                                 inner[..packet.len()].copy_from_slice(packet);
                                 match gateway.outbound(
                                     &mut inner[..packet.len()],

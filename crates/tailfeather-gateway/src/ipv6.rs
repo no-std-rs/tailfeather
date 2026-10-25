@@ -532,6 +532,28 @@ pub fn error_reply(
     Some(len)
 }
 
+/// Answer Echo Requests addressed to the gateway's own tailnet address.
+/// Local delivery does not require an upstream route or exit-route approval.
+pub fn echo_reply(original: &[u8], gateway: Ipv6Addr, out: &mut [u8]) -> Option<usize> {
+    let parsed = Packet::parse(original).ok()?;
+    if parsed.destination != gateway
+        || parsed.protocol != 58
+        || original[HEADER] != 128
+        || !routable(parsed.source)
+        || original.len() > MTU
+    {
+        return None;
+    }
+    let reply = out.get_mut(..original.len())?;
+    reply.copy_from_slice(original);
+    reply[8..24].copy_from_slice(&gateway.octets());
+    reply[24..40].copy_from_slice(&parsed.source.octets());
+    reply[7] = 64;
+    reply[HEADER] = 129;
+    update_checksum(reply);
+    Some(reply.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -260,6 +260,8 @@ ip netns exec "$GATEWAY_NS" "$HARNESS" gateway6 \
 GATEWAY_PID=$!
 PIDS+=("$GATEWAY_PID")
 wait_ready "$GATEWAY_PID" "$V6_LOG"
+ip netns exec "$CLIENT_NS" ping -6 -c 1 -W 3 "$V6_GATEWAY"
+echo "PASS: exit.forward.ipv6.local-echo"
 ip netns exec "$CLIENT_NS" ping -6 -c 2 -W 3 "$V6_SERVER"
 echo "PASS: exit.forward.ipv6.icmp"
 # No kernel IPv6 forwarding is enabled: replies must pass the shared no_std

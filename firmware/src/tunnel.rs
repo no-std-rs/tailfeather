@@ -257,12 +257,18 @@ pub(crate) fn now_ms() -> u64 {
     embassy_time::Instant::now().as_millis()
 }
 
-#[embassy_executor::task]
-pub async fn tunnel(
-    stack: Stack<'static>,
-    flash: esp_hal::peripherals::FLASH<'static>,
-    spawner: Spawner,
-) -> ! {
+/// Provision before the large data-plane future is polled. Returning a
+/// reference keeps by-value Node restoration temporaries off that future's
+/// already-large stack frame; its nested frames otherwise overwrite Wi-Fi BSS.
+pub(crate) struct Bootstrap {
+    node: &'static mut Node<PEERS>,
+    authority: Authority,
+    state_store: TwoSlot<crate::flash::FlashSlots<'static>>,
+    rng: HwRng,
+}
+
+#[inline(never)]
+pub(crate) fn provision(flash: esp_hal::peripherals::FLASH<'static>) -> Bootstrap {
     let authority = Authority::parse(
         crate::TS_CONTROL_URL,
         cfg!(feature = "test-insecure-control"),
@@ -277,7 +283,7 @@ pub async fn tunnel(
     let replacement_generation = loaded
         .replacement_generation()
         .expect("persistent state generation is not exhausted");
-    let node = match loaded.into_state() {
+    let node = NODE.init_with(|| match loaded.into_state() {
         Some(state) => match Node::restore_for_authority(&state, authority.digest()) {
             Ok(node) => {
                 if needs_repair && !node.requires_persistence() {
@@ -305,8 +311,7 @@ pub async fn tunnel(
                 authority.digest(),
             )
         }
-    };
-    let node = NODE.init(node);
+    });
     if node.requires_persistence() {
         let state = match node.poll(0) {
             Ok(Some(NodeAction::PersistState(state))) => state,
@@ -327,6 +332,22 @@ pub async fn tunnel(
             panic!("could not verify both identity state slots");
         }
     }
+    Bootstrap {
+        node,
+        authority,
+        state_store,
+        rng,
+    }
+}
+
+#[embassy_executor::task]
+pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner: Spawner) -> ! {
+    let Bootstrap {
+        node,
+        authority,
+        state_store,
+        mut rng,
+    } = bootstrap;
     let clock_floor = node.trusted_time_floor().max(crate::BUILD_TIME_FLOOR);
     let provisional_time = if authority.is_secure() {
         let Some(provisional_time) = bootstrap_time(stack, &mut rng, clock_floor).await else {
@@ -1016,9 +1037,6 @@ async fn handle_delivered_ipv6(
     uplink: Option<core::net::Ipv6Addr>,
     derp_regions: &mut [Option<u16>; crate::derp::SLOTS],
 ) {
-    let Some(uplink) = uplink else {
-        return;
-    };
     let Some(source) = node
         .netmap()
         .peers
@@ -1030,11 +1048,22 @@ async fn handle_delivered_ipv6(
     if peer_for_ipv6(node, source) != Some(*peer) {
         return;
     }
-    if !node.netmap().default_routes_approved() || !node.netmap().packet_filter.allows_ipv6(packet)
-    {
+    if !node.netmap().packet_filter.allows_ipv6(packet) {
         return;
     }
     if !ipv6::Packet::parse(packet).is_ok_and(|p| p.source == source) {
+        return;
+    }
+    if let Some(our_tunnel_ip) = assigned_ipv6(node)
+        && let Some(len) = ipv6::echo_reply(packet, our_tunnel_ip, &mut scratch.inner)
+    {
+        encapsulate_and_send(node, peer, &scratch.inner[..len], wg_socket, derp_regions).await;
+        return;
+    }
+    let Some(uplink) = uplink else {
+        return;
+    };
+    if !node.netmap().default_routes_approved() {
         return;
     }
     let result = if let Some(out) = scratch.inner.get_mut(..packet.len()) {
@@ -1048,15 +1077,7 @@ async fn handle_delivered_ipv6(
             let _ = socket.send(&scratch.inner[..packet.len()]).await;
         }
         Err(error) => {
-            let our_tunnel_ip =
-                node.netmap()
-                    .addresses
-                    .iter()
-                    .find_map(|cidr| match cidr.address {
-                        core::net::IpAddr::V6(address) => Some(address),
-                        _ => None,
-                    });
-            if let Some(our_tunnel_ip) = our_tunnel_ip
+            if let Some(our_tunnel_ip) = assigned_ipv6(node)
                 && let Some(len) = gateway.error_response(
                     packet,
                     our_tunnel_ip,
@@ -1741,6 +1762,16 @@ async fn handle_udp_reply(
         return;
     };
     encapsulate_and_send(node, &peer, &inner[..inner_len], wg_socket, derp_regions).await;
+}
+
+fn assigned_ipv6(node: &Node<PEERS>) -> Option<core::net::Ipv6Addr> {
+    node.netmap()
+        .addresses
+        .iter()
+        .find_map(|cidr| match cidr.address {
+            core::net::IpAddr::V6(address) => Some(address),
+            _ => None,
+        })
 }
 
 fn assigned_ipv4(node: &Node<PEERS>) -> Option<[u8; 4]> {
