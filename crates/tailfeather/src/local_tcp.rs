@@ -40,9 +40,7 @@ impl core::fmt::Display for Error {
             Self::AlreadyListening => f.write_str("local TCP stack is already listening"),
             Self::NotListening => f.write_str("local TCP stack is not listening"),
             Self::InvalidPacket => f.write_str("packet is not a valid IPv4 packet for this node"),
-            Self::Ipv6Unsupported => {
-                f.write_str("IPv6 local TCP and exit forwarding are not supported")
-            }
+            Self::Ipv6Unsupported => f.write_str("IPv6 local TCP is not supported"),
             Self::OutputTooSmall => f.write_str("IPv4 transmit buffer is smaller than the MTU"),
             Self::InvalidStream => f.write_str("local TCP stream is not active"),
             Self::WouldBlock => f.write_str("local TCP stream would block"),
@@ -165,8 +163,8 @@ impl<'a, const N: usize> Stack<'a, N> {
     }
 
     /// Feed one decrypted IPv4 packet and optionally emit one response packet.
-    /// IPv6 is rejected distinctly so a runtime can account and log the
-    /// intentional firmware-parity blackhole rather than calling it malformed.
+    /// IPv6 local TCP is rejected distinctly so a runtime can distinguish
+    /// this adapter's unsupported family from malformed input.
     pub fn ingest_ip(
         &mut self,
         packet: &[u8],
@@ -269,12 +267,16 @@ impl<'a, const N: usize> Stack<'a, N> {
     /// The Tailnet IPv4 address at the other end of a claimed stream.
     pub fn remote_ipv4(&self, id: StreamId) -> Option<[u8; 4]> {
         let handle = self.handle(id)?;
-        let IpAddress::Ipv4(address) = self
+        #[allow(unreachable_patterns)]
+        match self
             .sockets
             .get::<tcp::Socket>(handle)
             .remote_endpoint()?
-            .addr;
-        Some(address.octets())
+            .addr
+        {
+            IpAddress::Ipv4(address) => Some(address.octets()),
+            _ => None,
+        }
     }
 
     /// Nonblocking stream receive.

@@ -317,7 +317,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             reserved_timestamp: Cell::new(floor),
             running: Cell::new(false),
         };
-        result.status.sender().send(Status::default());
+        result.publish_status(Status::default());
         if let Some(address) = result
             .node
             .borrow()
@@ -329,13 +329,18 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                 _ => None,
             })
         {
-            result.status.sender().send(Status {
+            result.publish_status(Status {
                 address: Some(address),
                 error: None,
             });
         }
         result.space.sender().send(0);
         Ok(result)
+    }
+
+    fn publish_status(&self, status: Status) {
+        self.status.sender().send(status);
+        self.ready.signal(());
     }
 
     pub fn status(&self) -> Status {
@@ -440,7 +445,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             fn drop(&mut self) {
                 let _ = self.1.set_address(None, self.0.network.now_millis(), 0);
                 if self.0.status().error.is_none() {
-                    self.0.status.sender().send(Status {
+                    self.0.publish_status(Status {
                         address: None,
                         error: Some("client stopped"),
                     });
@@ -467,7 +472,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             | Either5::Fourth(result)
             | Either5::Fifth(result) => result,
         };
-        self.status.sender().send(Status {
+        self.publish_status(Status {
             address: None,
             error: Some(result.as_ref().err().copied().unwrap_or("client stopped")),
         });
@@ -537,7 +542,6 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
         let mut generation = self.candidate_generation.get();
         let mut seed = [0; 8];
         self.network.rng().fill_bytes(&mut seed);
-        let mut status = self.status.receiver().ok_or("status waiter capacity")?;
         let mut address = None;
         let mut next_maintenance = 0;
         let mut budget = 0;
@@ -545,7 +549,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             if self.overflow.get() {
                 return Err("node action capacity exceeded");
             }
-            let current_address = status.try_get().unwrap_or_default().address;
+            let current_address = self.status().address;
             if current_address != address {
                 device.set_address(
                     current_address,
@@ -592,6 +596,8 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                             self.delivered.send(packet).await;
                         }
                     }
+                    // This adapter exposes an IPv4 local device only.
+                    NodeAction::DeliveredIpv6 { .. } => {}
                     NodeAction::Derp(command) => {
                         if let Some(command) = derp::dispatch(self, command) {
                             let _ = self.actions.borrow_mut().push(NodeAction::Derp(command));
@@ -689,10 +695,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             }
             let received = select(
                 self.network.receive(&mut datagram),
-                select(
-                    status.changed(),
-                    select(self.ready.wait(), reactor.sleep_until(next_maintenance)),
-                ),
+                select(self.ready.wait(), reactor.sleep_until(next_maintenance)),
             )
             .await;
             if let Either::First(received) = received {
@@ -955,12 +958,7 @@ mod tests {
             .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 use core::future::Future;
-                struct Wake;
-                impl std::task::Wake for Wake {
-                    fn wake(self: std::sync::Arc<Self>) {}
-                }
-                let waker = core::task::Waker::from(std::sync::Arc::new(Wake));
-                let mut cx = core::task::Context::from_waker(&waker);
+                let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
                 for failure in [None, Some("TUN interface closed")] {
                     let network = Offline(Cell::new(0));
                     let state = MemoryState::default();
@@ -968,8 +966,16 @@ mod tests {
                     let mut node = restore::<_, _, 1>(&config, &network, &state).unwrap();
                     let runtime =
                         Runtime::<_, _, 1, 4>::new(config, &mut node, &network, &state).unwrap();
+                    let mut subscribers = heapless::Vec::<_, 16>::new();
+                    for _ in 0..16 {
+                        subscribers
+                            .push(runtime.subscribe_status().unwrap())
+                            .ok()
+                            .unwrap();
+                    }
+                    assert!(runtime.subscribe_status().is_err());
                     let address = Ipv4Addr::new(100, 64, 0, 1);
-                    runtime.status.sender().send(Status {
+                    runtime.publish_status(Status {
                         address: Some(address),
                         error: None,
                     });
@@ -987,7 +993,7 @@ mod tests {
                     } else {
                         assert!(result.is_pending());
                         assert_eq!(device.addresses.borrow().as_slice(), &[Some(address)]);
-                        runtime.status.sender().send(Status {
+                        runtime.publish_status(Status {
                             address: None,
                             error: None,
                         });

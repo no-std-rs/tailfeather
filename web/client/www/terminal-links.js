@@ -1,10 +1,6 @@
 import { WebLinksAddon } from "./vendor/addon-web-links.mjs";
-import { TerminalUrlScanner, safeWebUrl, isTailscaleAuthUrl } from "./terminal-url-scanner.js";
-
-function openLink(_event, text) {
-  const url = safeWebUrl(text);
-  if (url) window.open(url, "_blank", "noopener,noreferrer");
-}
+import { TerminalUrlScanner, safeWebUrl, isTailscaleAuthUrl, loopbackDestination } from "./terminal-url-scanner.js";
+import { LoopbackForwarding } from "./loopback-forwarding.js";
 
 function anchor(url, label = url) {
   const link = document.createElement("a");
@@ -15,7 +11,44 @@ function anchor(url, label = url) {
   return link;
 }
 
-export function installTerminalLinks({ terminal, container, onAuthUrl = () => {} }) {
+export function installTerminalLinks({ terminal, container, onAuthUrl = () => {}, getSession = () => null }) {
+  let ended = false;
+  const forwardingStatus = document.createElement("div");
+  forwardingStatus.className = "ssh-forwarding-status";
+  forwardingStatus.setAttribute("role", "status");
+  const forwarding = new LoopbackForwarding(getSession, { onError: (message) => { forwardingStatus.textContent = message; } });
+  async function openLink(event, text) {
+    const url = safeWebUrl(text);
+    if (!url) return;
+    if (!loopbackDestination(url)) { window.open(url, "_blank", "noopener,noreferrer"); return; }
+    event?.preventDefault();
+    if (ended || !getSession()) { forwardingStatus.textContent = "This SSH connection has closed."; return; }
+    // Reserve a user-initiated browser tab before asynchronous native setup.
+    const popup = window.open("about:blank", "_blank");
+    if (!popup) { forwardingStatus.textContent = "Allow a popup to open the remote loopback service."; return; }
+    popup.opener = null;
+    try {
+      const original = await forwarding.listen(url);
+      if (ended) { popup.close(); return; }
+      popup.location.replace(original);
+      forwardingStatus.textContent = "Remote loopback forwarding is active. Keep this SSH terminal open until authorization finishes.";
+    } catch (error) {
+      popup.close();
+      forwardingStatus.textContent = error.message;
+      if (!ended) forwardingStatus.append(" ", anchor(
+        "https://github.com/no-std-rs/tailfeather/blob/main/web/loopback/README.md", "Setup instructions"));
+    }
+  }
+  function terminalLink(url) {
+    const destination = loopbackDestination(url);
+    if (!destination) return anchor(url);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ssh-loopback-link";
+    button.textContent = `Open remote ${destination.host}:${destination.port}`;
+    button.addEventListener("click", (event) => { void openLink(event, url); });
+    return button;
+  }
   const addon = new WebLinksAddon(openLink);
   terminal.loadAddon(addon);
   // OSC 8 hyperlinks are part of xterm itself, rather than the web-links
@@ -32,7 +65,7 @@ export function installTerminalLinks({ terminal, container, onAuthUrl = () => {}
   const summary = document.createElement("summary");
   const list = document.createElement("ul");
   details.append(summary, list);
-  container.replaceChildren(banner, details);
+  container.replaceChildren(banner, forwardingStatus, details);
   const urls = [];
   let authUrl = "";
   let disposed = false;
@@ -61,7 +94,7 @@ export function installTerminalLinks({ terminal, container, onAuthUrl = () => {}
     summary.textContent = `Links in this terminal (${urls.length})`;
     list.replaceChildren(...urls.map((value) => {
       const item = document.createElement("li");
-      item.append(anchor(value));
+      item.append(terminalLink(value));
       return item;
     }));
     details.hidden = false;
@@ -72,10 +105,15 @@ export function installTerminalLinks({ terminal, container, onAuthUrl = () => {}
     finish() {
       if (disposed) return;
       scanner.finish();
+      ended = true;
+      forwarding.dispose();
+      forwardingStatus.textContent = "";
       banner.hidden = true;
     },
     dispose() {
       disposed = true;
+      ended = true;
+      forwarding.dispose();
       addon.dispose();
       container.replaceChildren();
     },

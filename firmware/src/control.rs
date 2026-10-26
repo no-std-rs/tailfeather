@@ -736,7 +736,7 @@ fn write_recovery_map_body(
         disco_key: &disco_key,
         hostinfo: Hostinfo {
             hostname: crate::TS_HOSTNAME,
-            routable_ips: &tailfeather::control::EXIT_NODE_ROUTES,
+            routable_ips: crate::tunnel::exit_routes(),
             preferred_derp,
             peer_api_port: Some(tailfeather_gateway::peerapi::PORT),
             ..Default::default()
@@ -772,7 +772,7 @@ fn write_recovery_registration_body(
         auth_key: "",
         hostinfo: Hostinfo {
             hostname: crate::TS_HOSTNAME,
-            routable_ips: &tailfeather::control::EXIT_NODE_ROUTES,
+            routable_ips: crate::tunnel::exit_routes(),
             peer_api_port: Some(tailfeather_gateway::peerapi::PORT),
             ..Default::default()
         },
@@ -905,7 +905,9 @@ async fn probe_stun(
             let Some(address) = addresses.into_iter().next() else {
                 continue;
             };
-            let embassy_net::IpAddress::Ipv4(address) = address;
+            let embassy_net::IpAddress::Ipv4(address) = address else {
+                continue;
+            };
             let endpoint = IpEndpoint::new(address.into(), relay.stun_port);
             let mut transaction = [0; tailfeather::stun::TRANSACTION_ID_LEN];
             rng.0.read(&mut transaction);
@@ -990,7 +992,7 @@ async fn publish_endpoints(
         disco_key: &disco_key,
         hostinfo: Hostinfo {
             hostname: crate::TS_HOSTNAME,
-            routable_ips: &tailfeather::control::EXIT_NODE_ROUTES,
+            routable_ips: crate::tunnel::exit_routes(),
             preferred_derp: publication.preferred_derp,
             peer_api_port: Some(tailfeather_gateway::peerapi::PORT),
             ..Default::default()
@@ -1032,7 +1034,7 @@ async fn register(
         auth_key: node.registration_auth_key(crate::TS_AUTH_KEY),
         hostinfo: Hostinfo {
             hostname: crate::TS_HOSTNAME,
-            routable_ips: &tailfeather::control::EXIT_NODE_ROUTES,
+            routable_ips: crate::tunnel::exit_routes(),
             peer_api_port: Some(tailfeather_gateway::peerapi::PORT),
             ..Default::default()
         },
@@ -1152,7 +1154,9 @@ async fn resolve(
         })?;
     let mut endpoints = heapless::Vec::new();
     for address in addresses {
-        let embassy_net::IpAddress::Ipv4(address) = address;
+        let embassy_net::IpAddress::Ipv4(address) = address else {
+            continue;
+        };
         endpoints
             .push(IpEndpoint::new(address.into(), control.port()))
             .map_err(|_| Failure::protocol(ControlStage::Resolve))?;

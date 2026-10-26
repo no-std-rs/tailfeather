@@ -49,6 +49,13 @@ pub fn configure_raw_ipv4(fd: RawFd) -> Result<(), Errno> {
     setsockopt_int(fd, SOL_SOCKET, SO_MARK, GATEWAY_MARK as i32)
 }
 
+pub fn configure_raw_ipv6(fd: RawFd) -> Result<(), Errno> {
+    const SOL_IPV6: i32 = 41;
+    const IPV6_HDRINCL: i32 = 36;
+    setsockopt_int(fd, SOL_IPV6, IPV6_HDRINCL, 1)?;
+    setsockopt_int(fd, 1, 36, GATEWAY_MARK as i32)
+}
+
 fn setsockopt_int(fd: RawFd, level: i32, option: i32, value: i32) -> Result<(), Errno> {
     const SYS_SETSOCKOPT: usize = 54;
     let mut result = SYS_SETSOCKOPT as isize;

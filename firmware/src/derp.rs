@@ -700,7 +700,9 @@ async fn connect<'a>(
     let mut socket = TcpSocket::new(stack, tcp_rx, tcp_tx);
     let mut connected = false;
     for address in addresses {
-        let embassy_net::IpAddress::Ipv4(address) = address;
+        let embassy_net::IpAddress::Ipv4(address) = address else {
+            continue;
+        };
         match select(
             socket.connect(IpEndpoint::new(address.into(), endpoint.port)),
             Timer::after(ADDRESS_CONNECT_TIMEOUT),

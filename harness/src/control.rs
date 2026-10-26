@@ -550,7 +550,7 @@ async fn register(
             // plain product name on a real device.
             hostname,
             routable_ips: if exit_node {
-                &tailfeather::control::EXIT_NODE_ROUTES
+                &tailfeather::control::hostinfo::DUAL_STACK_EXIT_NODE_ROUTES
             } else {
                 &[]
             },

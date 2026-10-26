@@ -78,6 +78,7 @@ fn droppable(action: &NodeAction) -> bool {
         action,
         NodeAction::DirectTransmit { .. }
             | NodeAction::DeliveredIpv4 { .. }
+            | NodeAction::DeliveredIpv6 { .. }
             | NodeAction::Derp(tailfeather::DerpCommand::Send { .. })
     )
 }

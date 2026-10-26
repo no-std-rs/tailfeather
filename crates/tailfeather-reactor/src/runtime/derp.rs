@@ -365,9 +365,7 @@ async fn connection<P: Network, S: State, const PEERS: usize, const A: usize>(
     let transfer = transfer(
         reactor,
         slot,
-        &mut frames,
-        &mut reader,
-        &mut writer,
+        (&mut frames, &mut reader, &mut writer),
         || runtime.wait_for_space(),
         || runtime.ready.signal(()),
         encode,
@@ -399,14 +397,13 @@ async fn transfer<
 >(
     reactor: &Reactor<C>,
     slot: &Slot<A>,
-    frames: &mut Frames<'_>,
-    reader: &mut R,
-    writer: &mut W,
+    io: (&mut Frames<'_>, &mut R, &mut W),
     mut wait_space: impl FnMut() -> F,
     mut notify_space: impl FnMut(),
     mut encode: impl FnMut(DerpCommand, &mut [u8]) -> Result<usize, Error>,
     mut receive: impl FnMut(Frame, &[u8]) -> Result<bool, Error>,
 ) -> Result<(), Error> {
+    let (frames, reader, writer) = io;
     const PONG: usize = frame::HEADER_LEN + frame::PING_LEN;
     let pongs = RefCell::new(Deque::<[u8; PONG], 8>::new());
     let pong_space = Signal::<NoopRawMutex, ()>::new();
@@ -556,9 +553,7 @@ mod tests {
         let io = transfer(
             &reactor,
             &slot,
-            &mut frames,
-            &mut input,
-            &mut output,
+            (&mut frames, &mut input, &mut output),
             || core::future::ready(()),
             || {},
             encode,

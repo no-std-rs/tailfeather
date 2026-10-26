@@ -22,10 +22,11 @@ mod inner;
 mod nat;
 mod stack;
 mod tunnel;
+mod uplink;
 mod wifi;
 
 use embassy_executor::Spawner;
-use embassy_net::{Runner, StackResources};
+use embassy_net::{Runner, StackResources, driver::Driver as _};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::rng::Rng;
@@ -68,11 +69,11 @@ const fn decimal_u64(text: &str) -> u64 {
     value
 }
 
-/// Backs the smoltcp sockets owned by the stack: DHCP, WireGuard, shared UDP,
-/// TCP and ICMP raw forwarding (peer-API DNS shares raw UDP), control, two DERP
+/// Backs the smoltcp sockets owned by the stack: DHCP, WireGuard, shared raw
+/// IPv4/IPv6 forwarding (including peer-API DNS), control, two DERP
 /// connections, and transient bootstrap DNS/STUN/NTP use. NAT table capacity
 /// no longer consumes socket handles.
-static STACK_RESOURCES: StaticCell<StackResources<12>> = StaticCell::new();
+static STACK_RESOURCES: StaticCell<StackResources<10>> = StaticCell::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -106,31 +107,36 @@ async fn main(spawner: Spawner) -> ! {
     let (wifi_controller, interfaces) = esp_radio::wifi::new(peripherals.WIFI, radio_config)
         .expect("Failed to initialize Wi-Fi controller");
 
+    // Embassy's Ethernet driver MTU includes the 14-byte Ethernet header.
+    // Check configuration changes against the complete-IP receive arena.
+    assert!(
+        interfaces.station.capabilities().max_transmission_unit <= tunnel::UPLINK_IP_MTU + 14,
+        "Wi-Fi IP MTU exceeds forwarding receive buffer"
+    );
+
     let rng = Rng::new();
     // smoltcp randomizes ephemeral ports and the DHCP transaction ID from this.
     let mut seed = [0u8; 8];
     rng.read(&mut seed);
 
+    let mut network_config = embassy_net::Config::dhcpv4(Default::default());
+    network_config.ipv6 = embassy_net::ConfigV6::Slaac;
     let (stack, runner) = embassy_net::new(
         interfaces.station,
-        embassy_net::Config::dhcpv4(Default::default()),
+        network_config,
         STACK_RESOURCES.init(StackResources::new()),
         u64::from_le_bytes(seed),
     );
 
     spawner.spawn(wifi::connection(wifi_controller).expect("each task is spawned once"));
     spawner.spawn(net_task(runner).expect("each task is spawned once"));
+    spawner.spawn(ipv6_status(stack).expect("each task is spawned once"));
 
-    stack.wait_config_up().await;
-    let address = stack
-        .config_v4()
-        .expect("the stack reports a v4 config once it is up")
-        .address;
+    let address = uplink::wait_ipv4(stack).await.address;
     info!("DHCP lease: {address}");
 
-    spawner.spawn(
-        tunnel::tunnel(stack, peripherals.FLASH, spawner).expect("each task is spawned once"),
-    );
+    let bootstrap = tunnel::provision(peripherals.FLASH);
+    spawner.spawn(tunnel::tunnel(stack, bootstrap, spawner).expect("each task is spawned once"));
 
     core::future::pending().await
 }
@@ -138,4 +144,24 @@ async fn main(spawner: Spawner) -> ! {
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, Interface<'static>>) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn ipv6_status(stack: embassy_net::Stack<'static>) {
+    let mut previous = None;
+    loop {
+        let current = stack.config_v6();
+        if current != previous {
+            if let Some(config) = &current {
+                info!(
+                    "IPv6 uplink: {} gateway={:?}",
+                    config.address, config.gateway
+                );
+            } else {
+                info!("IPv6 uplink unavailable");
+            }
+            previous = current;
+        }
+        embassy_time::Timer::after_secs(1).await;
+    }
 }

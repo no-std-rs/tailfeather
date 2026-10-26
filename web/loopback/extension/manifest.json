@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+  "name": "Tailfeather Loopback",
+  "version": "0.1.0",
+  "description": "Forward explicitly opened loopback links through a Tailfeather SSH connection.",
+  "browser_specific_settings": { "gecko": { "id": "loopback@tailfeather.no-std-rs", "strict_min_version": "115.0" } },
+  "permissions": ["nativeMessaging"],
+  "background": { "scripts": ["background.js"] },
+  "content_scripts": [{
+    "matches": ["https://no-std-rs.github.io/tailfeather/*", "https://tailfeather-web.pawelchcki.workers.dev/*"],
+    "js": ["content.js"],
+    "run_at": "document_start"
+  }]
+}

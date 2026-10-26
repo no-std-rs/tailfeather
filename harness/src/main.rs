@@ -39,6 +39,7 @@ mod dns;
 mod doh;
 mod exec;
 mod gateway;
+mod gateway6;
 mod h2;
 mod inner;
 mod net;
@@ -179,6 +180,25 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
         Some("selftest") => selftest::run(args.get(2).unwrap_or("/tmp/harness-selftest")),
         Some("wg-selftest") => selftest::wg(),
         Some("gateway-selftest") => selftest::gateway(),
+        Some("gateway6") => {
+            let config = tunnel_config(&args);
+            let uplink = args
+                .get(7)
+                .expect("gateway6 requires an IPv6 uplink")
+                .parse()
+                .expect("IPv6 uplink");
+            let client = args
+                .get(8)
+                .expect("gateway6 requires the authenticated peer IPv6 address")
+                .parse()
+                .expect("IPv6 client");
+            let tunnel = args
+                .get(9)
+                .expect("gateway6 requires the gateway tunnel IPv6 address")
+                .parse()
+                .expect("IPv6 tunnel");
+            gateway6::run(config, uplink, client, tunnel)
+        }
         Some("gateway") => {
             let config = tunnel_config(&args);
             let Some(uplink) = args.get(7) else {

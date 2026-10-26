@@ -20,11 +20,17 @@
 
 use crate::control::json::Writer;
 
-/// The default routes required for Tailscale clients to recognize an exit node.
-///
-/// IPv6 forwarding is not implemented yet, so `::/0` is intentionally
-/// blackholed by the IPv4-only data plane until that support lands.
-pub const EXIT_NODE_ROUTES: [&str; 2] = ["0.0.0.0/0", "::/0"];
+/// IPv4-only exit capability. IPv6 is advertised only by runtimes with a
+/// configured forwarding path and usable upstream IPv6 default route.
+pub const EXIT_NODE_ROUTES: [&str; 1] = ["0.0.0.0/0"];
+pub const DUAL_STACK_EXIT_NODE_ROUTES: [&str; 2] = ["0.0.0.0/0", "::/0"];
+pub fn exit_node_routes(ipv6_ready: bool) -> &'static [&'static str] {
+    if ipv6_ready {
+        &DUAL_STACK_EXIT_NODE_ROUTES
+    } else {
+        &EXIT_NODE_ROUTES
+    }
+}
 
 /// What this node reports about itself.
 #[derive(Clone, Copy)]
@@ -152,17 +158,20 @@ mod tests {
     }
 
     #[test]
-    fn an_exit_node_advertises_both_default_routes() {
+    fn an_ipv4_exit_node_does_not_advertise_ipv6() {
         let mut buffer = [0u8; 256];
         let hostinfo = Hostinfo {
             routable_ips: &EXIT_NODE_ROUTES,
             ..Default::default()
         };
         let text = rendered(&mut buffer, &hostinfo);
-        assert!(
-            text.contains(r#""RoutableIPs":["0.0.0.0/0","::/0"]"#),
-            "{text}"
-        );
+        assert!(text.contains(r#""RoutableIPs":["0.0.0.0/0"]"#), "{text}");
+    }
+
+    #[test]
+    fn ipv6_default_route_requires_explicit_runtime_capability() {
+        assert_eq!(exit_node_routes(false), &["0.0.0.0/0"]);
+        assert_eq!(exit_node_routes(true), &["0.0.0.0/0", "::/0"]);
     }
 
     #[test]
