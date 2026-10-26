@@ -455,6 +455,9 @@ impl State {
                 self.queue.push_back(Internal::DerpDisconnected(region));
             }
             NodeAction::DeliveredIpv4 { peer, packet } => self.deliver(&peer, packet.as_slice()),
+            // This browser TCP stack remains IPv4-only; IPv6 exit routing
+            // belongs to gateway runtimes.
+            NodeAction::DeliveredIpv6 { .. } => {}
             NodeAction::PersistState(state) => {
                 use base64::Engine as _;
                 let saved = storage_set(

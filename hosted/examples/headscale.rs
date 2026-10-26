@@ -24,11 +24,49 @@ fn main() {
     let keys: Vec<String> =
         serde_json::from_slice(&std::fs::read(root.join("keys.json")).unwrap()).unwrap();
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let server=Client::start(config(&root,"hosted-server",keys[0].clone())).unwrap();
-        let client=Client::start(config(&root,"hosted-client",keys[1].clone())).unwrap();
+        let resident=std::env::args().any(|arg|arg=="--resident-retry");
+        let server_config=config(&root,"hosted-server",keys[0].clone());
+        let server=if resident {Client::start_resident(server_config)} else {Client::start(server_config)}.unwrap();
+        let client_config=config(&root,"hosted-client",keys[1].clone());
+        let client=if resident {Client::start_resident(client_config)} else {Client::start(client_config)}.unwrap();
         let server_ip=tokio::time::timeout(Duration::from_secs(60),server.ready()).await.unwrap().unwrap();
         let client_ip=tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap();
         println!("PASS: real Headscale registration/map with private CA; server={server_ip}, client={client_ip}");
+        if resident {
+            use tokio::io::{AsyncReadExt,AsyncWriteExt};
+            let mut old_listener=server.listen(2223).await.unwrap();
+            let mut old_from=client.connect(server_ip,2223).await.unwrap();
+            let mut old_to=tokio::time::timeout(Duration::from_secs(10),old_listener.accept()).await.unwrap().unwrap();
+            old_from.write_all(b"before-rejection").await.unwrap();
+            let mut prior=[0;16];old_to.read_exact(&mut prior).await.unwrap();
+            assert_eq!(&prior,b"before-rejection");
+            println!("READY: reject map for resident retry");
+            use std::io::Write;std::io::stdout().flush().unwrap();
+            tokio::time::timeout(Duration::from_secs(60),async {
+                while !root.join("rejected").exists(){tokio::time::sleep(Duration::from_millis(20)).await;}
+                while server.status().address.is_some(){tokio::time::sleep(Duration::from_millis(20)).await;}
+            }).await.unwrap();
+            let mut byte=[0];
+            assert_eq!(tokio::time::timeout(Duration::from_secs(3),old_from.read(&mut byte)).await.unwrap().unwrap(),0);
+            assert_eq!(tokio::time::timeout(Duration::from_secs(3),old_to.read(&mut byte)).await.unwrap().unwrap(),0);
+            drop(old_listener);drop(old_from);drop(old_to);
+            // The deliberately revoked stream must report its failed drain;
+            // consume that outcome before testing a new successful transfer.
+            tokio::time::timeout(Duration::from_secs(10),async {
+                loop {
+                    if client.drain().await.is_err(){break;}
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            println!("PASS: rejected resident map closes established TCP streams before recovery");
+            println!("READY: restore resident map");
+            std::io::stdout().flush().unwrap();
+            tokio::time::timeout(Duration::from_secs(60),async {
+                while !root.join("continue").exists(){tokio::time::sleep(Duration::from_millis(20)).await;}
+            }).await.unwrap();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(60),server.ready()).await.unwrap().unwrap(),server_ip);
+            println!("PASS: rejected oversized map recovers on the retained ephemeral client and address");
+        }
         if std::env::args().any(|arg|arg=="--offline-direct") {
             println!("READY: stop the fixture, then create continue in its directory");
             use std::io::Write;std::io::stdout().flush().unwrap();
@@ -68,12 +106,20 @@ fn main() {
             println!("PASS: direct TCP works with control and DERP offline");return;
         }
         drop(to);drop(listener);drop(server);
-        let client=Client::start(config(&root,"hosted-client",String::new())).unwrap();
-        assert_eq!(tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap(),client_ip);
-        println!("PASS: session identity reconnects without an auth key and keeps its address");
+        if !std::env::args().any(|arg|arg=="--ephemeral") {
+            let client=Client::start(config(&root,"hosted-client",String::new())).unwrap();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(60),client.ready()).await.unwrap().unwrap(),client_ip);
+            println!("PASS: persistent session identity reconnects without an auth key and keeps its address");
+        } else {
+            println!("PASS: ephemeral clients log out when their final handle is dropped");
+        }
         let rejected=Client::start(config(&root,"hosted-rejected","fixture-invalid-key".into())).unwrap();
         let error=tokio::time::timeout(Duration::from_secs(10),rejected.ready()).await.unwrap().unwrap_err();
         assert_eq!(error.to_string(),"registration rejected");
         println!("PASS: rejected preauth key returns an error instead of hanging ready()");
+        let rejected=Client::start_resident(config(&root,"hosted-resident-rejected","fixture-invalid-key".into())).unwrap();
+        let error=tokio::time::timeout(Duration::from_secs(10),rejected.ready()).await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(),"registration rejected");
+        println!("PASS: resident initial registration rejection is terminal");
     });
 }

@@ -1,6 +1,6 @@
 //! Peers, and the table that survives deltas.
 
-use core::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use core::str::FromStr;
 
 use crate::keys::{DiscoPublic, NodePublic};
@@ -33,21 +33,9 @@ impl Cidr {
     }
 }
 
-/// A peer's subnet, stored IPv4-only.
-///
-/// Peers are the one part of the staged map that scales with the tailnet, and
-/// the staged map lives in the C6's 16 KiB RTC-fast bank, which is silicon and
-/// cannot be grown. A [`Cidr`] spends 24 bytes to hold an address family this
-/// device's data plane does not have: `wirefeather` reads IPv4 headers, the
-/// harness binds `AF_INET`, and [`Peer::endpoints`] is already `SocketAddrV4`
-/// for exactly that reason. Eight bytes here instead saves 192 bytes per peer
-/// across [`MAX_ADDRESSES`] and [`MAX_ALLOWED_IPS`] — the difference between a
-/// 3-peer and a 9-peer table, which is the difference between reaching the
-/// device from your laptop and not.
-///
-/// Self addresses and routes keep the full [`Cidr`]: `default_routes_approved`
-/// must still see the `::/0` the control plane sends, and there is one such
-/// record rather than one per peer.
+/// A compact IPv4 peer subnet. IPv6 host ownership is retained separately
+/// in [`Peer::ipv6_address`], so every route entry need not pay for a second
+/// address family. IPv6 subnet routing is outside the exit-node path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr4 {
     pub address: Ipv4Addr,
@@ -55,8 +43,7 @@ pub struct Cidr4 {
 }
 
 impl Cidr4 {
-    /// The IPv4 half of a parsed CIDR. `None` for IPv6, which this node cannot
-    /// route and therefore does not retain.
+    /// The IPv4 half of a parsed CIDR. IPv6 host addresses are stored separately.
     pub fn from_cidr(cidr: Cidr) -> Option<Self> {
         match cidr.address {
             IpAddr::V4(address) => Some(Self {
@@ -86,11 +73,12 @@ pub struct Peer {
     /// The DERP region this peer is reachable through when no direct path
     /// exists. Zero means none advertised.
     pub home_derp: u16,
+    /// Exact IPv6 host address assigned by control, for cryptokey source checks.
+    pub ipv6_address: Option<Ipv6Addr>,
     pub addresses: heapless::Vec<Cidr4, MAX_ADDRESSES>,
     pub allowed_ips: heapless::Vec<Cidr4, MAX_ALLOWED_IPS>,
-    /// Usable direct paths for this IPv4-only node. IPv6 endpoints from a map
-    /// are valid but intentionally not retained, just as IPv6 payloads are
-    /// counted and rejected by the data plane.
+    /// Usable IPv4 underlay paths. IPv6 inner packets can travel over these
+    /// WireGuard sessions or DERP without an IPv6 underlay endpoint.
     pub endpoints: heapless::Vec<SocketAddrV4, MAX_ENDPOINTS>,
     /// What to call this peer on a screen: the first label of its MagicDNS
     /// name, or its self-reported host name when it has none. Empty when the
@@ -108,6 +96,7 @@ impl Peer {
             state_flags: 0,
             approved_ipv6_default: false,
             home_derp: 0,
+            ipv6_address: None,
             addresses: heapless::Vec::new(),
             allowed_ips: heapless::Vec::new(),
             endpoints: heapless::Vec::new(),
@@ -154,18 +143,20 @@ impl Peer {
         self.state_flags & 2 != 0
     }
 
-    /// This peer's tailnet IPv4 address, which is what traffic to it is
-    /// addressed to.
+    /// This peer's exact tailnet IPv6 host address, bound to its node key.
+    pub fn tailscale_ipv6(&self) -> Option<Ipv6Addr> {
+        self.ipv6_address
+    }
+
+    /// This peer's tailnet IPv4 address.
     pub fn tailscale_ipv4(&self) -> Option<Ipv4Addr> {
         self.addresses.first().map(|cidr| cidr.address)
     }
 
     /// The first endpoint that can be used directly.
     ///
-    /// IPv4 only, because the data plane below is: `wirefeather` reads IPv4 headers
-    /// and the harness binds `AF_INET` sockets. A peer reachable only over IPv6
-    /// has no direct path as far as this node is concerned, and must be reached
-    /// through DERP.
+    /// Direct underlay discovery is IPv4-only. A peer advertising only IPv6
+    /// underlay endpoints remains reachable through DERP.
     pub fn direct_endpoint(&self) -> Option<core::net::SocketAddrV4> {
         self.endpoints.first().copied()
     }

@@ -1,8 +1,10 @@
 // Unicode 17.0.0 decomposition and combining-class tables vendored from
 // unicode-normalization 0.1.25. The upstream iterator requires `alloc`; this
-// module exposes only the table-backed primitives used by our bounded,
-// allocation-free X.509 name comparator.
+// module exposes table-backed primitives for our bounded, allocation-free X.509
+// name comparator, alongside full folding generated from Unicode 17 UCD data.
 
+mod case_folding;
+mod case_folding_tables;
 #[allow(dead_code)]
 mod lookups;
 #[allow(dead_code)]
@@ -21,5 +23,6 @@ enum IsNormalized {
     Maybe,
 }
 
+pub(crate) use case_folding::CaseFold;
 pub(crate) use lookups::canonical_combining_class;
 pub(crate) use normalize::decompose_compatible;

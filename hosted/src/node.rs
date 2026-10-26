@@ -12,7 +12,7 @@ use tailfeather::control::{
     transport::{self, MapEvent, MapStream},
 };
 use tailfeather::{ControlCommand, ControlEvent, Node, NodeAction, PersistState};
-pub const PEERS: usize = 128;
+pub const PEERS: usize = 256;
 const HOST_OS: &str = if cfg!(target_os = "macos") {
     "darwin"
 } else {
@@ -27,6 +27,8 @@ pub struct Shared {
     candidate_generation: Cell<u64>,
     local_candidate: Cell<Option<core::net::SocketAddrV4>>,
     direct: bool,
+    resident: bool,
+    slots: [crate::relay::Slot; 2],
 }
 struct Probe {
     transaction: [u8; 12],
@@ -122,6 +124,8 @@ pub async fn run(
     config: crate::Config,
     mut commands: tokio::sync::mpsc::Receiver<crate::Command>,
     status: tokio::sync::watch::Sender<crate::Status>,
+    stopped: tokio::sync::oneshot::Receiver<()>,
+    resident: bool,
 ) -> Result<(), Error> {
     let reactor = Reactor::new();
     let authority = Authority::parse(&config.control_url, false).map_err(|_| "HTTPS authority")?;
@@ -157,14 +161,99 @@ pub async fn run(
         candidate_generation: Cell::new(0),
         local_candidate: Cell::new(None),
         direct: !config.relay_only,
+        resident,
+        slots: [crate::relay::Slot::new(), crate::relay::Slot::new()],
     };
     let actions = Actions::default();
-    let slots = [crate::relay::Slot::new(), crate::relay::Slot::new()];
-    tokio::select! {
+    let result = tokio::select! {
         result=control_loop(&reactor, &node, &actions, &store, &authority, &status, &config)=>result,
-        result=packets(&reactor, &node, &actions, &node.udp, &slots, &mut commands, &status)=>result,
-        result=crate::relay::worker(&reactor, &node, &actions, &slots[0], &config.control_ca_der)=>result,
-        result=crate::relay::worker(&reactor, &node, &actions, &slots[1], &config.control_ca_der)=>result,
+        result=packets(&reactor, &node, &actions, &node.udp, &node.slots, &mut commands, &status)=>result,
+        result=crate::relay::worker(&reactor, &node, &actions, &node.slots[0], &config.control_ca_der)=>result,
+        result=crate::relay::worker(&reactor, &node, &actions, &node.slots[1], &config.control_ca_der)=>result,
+        _=stopped=>Ok(()),
+    };
+    if config.ephemeral && node.borrow().is_enrolled() {
+        // Bound shutdown even if DNS or the coordinator is unavailable. A
+        // crash/offline exit still relies on the provider's inactive-node GC.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            logout(&reactor, &node, &authority, &config),
+        )
+        .await;
+    }
+    result
+}
+
+async fn logout(
+    reactor: &Reactor,
+    node: &Shared,
+    authority: &Authority,
+    config: &crate::Config,
+) -> Result<(), Error> {
+    let mut read = [0; tailfeather::control::tls::TLS_READ_BUFFER];
+    let mut write = [0; tailfeather::control::tls::TLS_WRITE_BUFFER];
+    let host = format!("{}:{}", authority.host(), authority.port());
+    let socket = tcp(reactor, authority.host(), authority.port()).await?;
+    let mut stream = crate::tls::connect(
+        socket,
+        authority.host(),
+        &config.control_ca_der,
+        &mut read,
+        &mut write,
+    )
+    .await
+    .map_err(|_| "logout TLS")?;
+    let key = transport::fetch_server_key(&mut stream, &host)
+        .await
+        .map_err(|_| "logout server key")?;
+    drop(stream);
+    let socket = tcp(reactor, authority.host(), authority.port()).await?;
+    let stream = crate::tls::connect(
+        socket,
+        authority.host(),
+        &config.control_ca_der,
+        &mut read,
+        &mut write,
+    )
+    .await
+    .map_err(|_| "logout TLS")?;
+    let identity = node.borrow().identity().clone();
+    let noise = transport::establish(stream, &host, &identity, &key, &mut OsRng)
+        .await
+        .map_err(|_| "logout Noise")?;
+    let mut http = noise.into_https2().await.map_err(|_| "logout HTTP/2")?;
+    let public = identity.node.public();
+    let request = RegisterRequest {
+        version: tailfeather::control::CAPABILITY_VERSION,
+        node_key: &public,
+        old_node_key: None,
+        auth_key: "",
+        hostinfo: Hostinfo {
+            hostname: &config.hostname,
+            os: HOST_OS,
+            ..Default::default()
+        },
+        ephemeral: true,
+    };
+    let mut body = [0; 2048];
+    let body = request
+        .write_logout(&mut body)
+        .map_err(|_| "logout request size")?;
+    let mut response = [0; 4096];
+    let (status, _) = http
+        .request(
+            "POST",
+            tailfeather::control::register::PATH,
+            &host,
+            body,
+            &mut response,
+        )
+        .await
+        .map_err(|_| "logout request")?;
+    if status == 200 {
+        Ok(())
+    } else {
+        Err("logout rejected")
     }
 }
 fn persist(node: &Shared, store: &crate::store::FileStore, now: u64) -> Result<(), Error> {
@@ -201,6 +290,7 @@ async fn control_loop(
     status: &tokio::sync::watch::Sender<crate::Status>,
     config: &crate::Config,
 ) -> Result<(), Error> {
+    let mut retry_delay = 1000u64;
     loop {
         if node.borrow().requires_persistence() {
             persist(node, store, reactor.clock_millis())?;
@@ -216,14 +306,36 @@ async fn control_loop(
             reactor.sleep(100).await;
             continue;
         }
+        let started = reactor.clock_millis();
         let session = control_session(reactor, node, actions, authority, status, config);
         if let Err(stage) = session.await {
-            if matches!(stage, "registration rejected" | "netmap rejected") {
+            let rejected = matches!(stage, "registration rejected" | "netmap rejected");
+            if rejected && (!node.resident || stage == "registration rejected") {
                 return Err(stage);
+            }
+            if rejected {
+                // A retained owner waits for a fresh accepted map. Never reset
+                // persisted enrollment or substitute a new node on rejection.
+                // Reject the previous data-plane authority too: retaining an
+                // enrollment does not retain permission from a rejected map.
+                node.borrow_mut()
+                    .adopt_reconnected_map(&mut tailfeather::netmap::Netmap::new())
+                    .map_err(node_error)?;
+                for slot in &node.slots {
+                    slot.revoke();
+                }
+                status.send_replace(crate::Status::default());
+                actions.ready.notify_one();
+            }
+            if reactor.clock_millis().saturating_sub(started) >= 60_000 {
+                retry_delay = 1000;
             }
             tracing::debug!("POCKETBOOT TAILNET_CONTROL_RETRY stage={stage}");
             node.borrow_mut().control_failed(reactor.clock_millis(), 0);
-            reactor.sleep(1000).await;
+            reactor.sleep(retry_delay).await;
+            if node.resident {
+                retry_delay = (retry_delay * 2).min(60_000);
+            }
         }
     }
 }
@@ -256,7 +368,11 @@ async fn control_session(
         {
             let candidate = core::net::SocketAddrV4::new(*local.ip(), bound.port());
             node.local_candidate.set(Some(candidate));
-            node.candidate(candidate);
+            if node.direct {
+                for candidate in crate::discovery::local_candidates(Some(candidate)) {
+                    node.candidate(candidate);
+                }
+            }
         }
         let tls = crate::tls::connect(socket, authority.host(), ca, &mut read, &mut write);
         let mut stream = match exec::select(tls, reactor.sleep(20000)).await {
@@ -521,9 +637,7 @@ async fn select_home(reactor: &Reactor, node: &Shared) -> u16 {
     if !node.direct {
         return best.home();
     }
-    let mut candidates: Vec<_> = node
-        .local_candidate
-        .get()
+    let mut candidates: Vec<_> = crate::discovery::local_candidates(node.local_candidate.get())
         .into_iter()
         .map(|a| a.to_string())
         .collect();
@@ -631,6 +745,10 @@ async fn packets(
         if let Some(address) = status.borrow().address {
             net.borrow_mut()
                 .set_address(address, reactor.clock_millis(), seed);
+        } else {
+            net.borrow_mut().clear_address();
+            outgoing.clear();
+            punches.clear();
         }
         let queued = actions.borrow_mut().len();
         for _ in 0..queued {
@@ -643,7 +761,9 @@ async fn packets(
                     packet,
                     ..
                 } => {
-                    let _ = udp.send_to(packet.as_slice(), &to).await;
+                    if status.borrow().address.is_some() {
+                        let _ = udp.send_to(packet.as_slice(), &to).await;
+                    }
                 }
                 NodeAction::DeliveredIpv4 { peer, packet } => {
                     let bytes = packet.as_slice();
@@ -665,7 +785,14 @@ async fn packets(
                         net.borrow_mut().deliver(bytes);
                     }
                 }
+                // This adapter exposes an IPv4 local device only.
+                NodeAction::DeliveredIpv6 { .. } => {}
                 NodeAction::Derp(command) => {
+                    if status.borrow().address.is_none()
+                        && matches!(command, tailfeather::DerpCommand::Send { .. })
+                    {
+                        continue;
+                    }
                     if let Some(command) = crate::relay::dispatch(
                         slots,
                         command,
@@ -746,9 +873,9 @@ async fn packets(
                 })
                 .collect();
             punches.retain(|(peer, _, _)| active.contains(peer));
-            for peer in active {
-                if !punches.iter().any(|(key, _, _)| *key == peer) {
-                    punches.push((peer, 0, 0));
+            for peer in &active {
+                if !punches.iter().any(|(key, _, _)| key == peer) {
+                    punches.push((*peer, 0, 0));
                 }
             }
             let candidates: Vec<core::net::SocketAddr> = node
@@ -769,11 +896,19 @@ async fn packets(
                     *next = now + 1000;
                 }
             }
+            for peer in &active {
+                if actions.borrow_mut().len() >= 16 {
+                    break;
+                }
+                enqueue(
+                    actions,
+                    node.borrow_mut()
+                        .poll_disco_for(peer, now, &mut OsRng)
+                        .ok()
+                        .flatten(),
+                );
+            }
         }
-        enqueue(
-            actions,
-            node.borrow_mut().poll_disco(now, &mut OsRng).ok().flatten(),
-        );
         enqueue(actions, node.borrow_mut().poll_derp().ok().flatten());
         let timestamp = node.timestamp.borrow().candidate()?;
         let handshake = node
@@ -861,6 +996,8 @@ mod tests {
             candidate_generation: Cell::new(0),
             local_candidate: Cell::new(None),
             direct: true,
+            resident: false,
+            slots: [crate::relay::Slot::new(), crate::relay::Slot::new()],
         }
     }
     #[test]
@@ -877,6 +1014,34 @@ mod tests {
             let reactor=Reactor::new();
             assert!(tokio::time::timeout(std::time::Duration::from_millis(50),crate::relay::worker(&reactor,&node,&actions,&slots[0],&[])).await.is_err());
             assert!(matches!(server.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        });
+    }
+    #[test]
+    fn revocation_discards_a_full_relay_queue_and_releases_the_slot() {
+        crate::on_worker_stack(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let server=std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).unwrap();
+                server.set_nonblocking(true).unwrap();
+                let port=server.local_addr().unwrap().port();
+                let node=fixture().await;
+                let actions=Actions::default();
+                let slots=[crate::relay::Slot::new(),crate::relay::Slot::new()];
+                let endpoint=tailfeather::Endpoint::new("127.0.0.1",port).unwrap();
+                assert!(crate::relay::dispatch(&slots,tailfeather::DerpCommand::Connect{region:7,endpoint},&node,&actions,0).is_none());
+                for _ in 0..15 {
+                    let command=tailfeather::DerpCommand::Send {region:7,peer:tailfeather::keys::NodePublic::from_bytes([7;32]),packet:tailfeather::SecretBuffer::try_from_slice(b"revoked").unwrap()};
+                    assert!(crate::relay::dispatch(&slots,command,&node,&actions,0).is_none());
+                }
+                slots[0].revoke();
+                let reactor=Reactor::new();
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(50),crate::relay::worker(&reactor,&node,&actions,&slots[0],&[])).await.is_err());
+                assert!(matches!(server.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+                // A fresh region must reuse this slot and actually reach TCP.
+                let command=tailfeather::DerpCommand::Connect {region:8,endpoint:tailfeather::Endpoint::new("127.0.0.1",port).unwrap()};
+                assert!(crate::relay::dispatch(&slots,command,&node,&actions,0).is_none());
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(50),crate::relay::worker(&reactor,&node,&actions,&slots[0],&[])).await.is_err());
+                assert!(server.accept().is_ok(), "revoked slot could not reconnect");
+            });
         });
     }
     #[test]
@@ -1068,9 +1233,48 @@ mod tests {
             });
     }
     #[test]
+    fn hosted_peer_capacity_keeps_the_last_peer_and_reports_overflow() {
+        crate::on_worker_stack(|| {
+            for count in [PEERS, PEERS + 1] {
+                let peers = (1..=count)
+                    .map(|id| {
+                        let mut private = [0; 32];
+                        private[..8].copy_from_slice(&(id as u64).to_le_bytes());
+                        let key = tailfeather::keys::NodePrivate::from_bytes(private).public();
+                        let mut encoded = [0; 128];
+                        let key = key.encode(&mut encoded).unwrap();
+                        format!(
+                            r#"{{"ID":{id},"Key":"{key}","Addresses":["100.64.{}.{}/32"]}}"#,
+                            id / 256,
+                            id % 256
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let json = format!(r#"{{"Peers":[{peers}]}}"#);
+                let mut map = tailfeather::netmap::Netmap::<PEERS>::new();
+                let mut parser = tailfeather::netmap::Parser::new();
+                let result = parser
+                    .push(&mut map, json.as_bytes())
+                    .and_then(|()| parser.finish(&mut map));
+                if count <= PEERS {
+                    result.unwrap();
+                    assert_eq!(map.peers.len(), PEERS);
+                    assert!(map.peers.iter().any(|peer| peer.id == PEERS as u64));
+                    assert!(!map.peers_truncated);
+                } else {
+                    result.unwrap();
+                    assert_eq!(map.peers.len(), PEERS);
+                    assert!(map.peers_truncated);
+                }
+            }
+        });
+    }
+
+    #[test]
     fn expanded_fleet_acl_is_complete_and_still_bounded() {
         std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
-            for count in [40, 256, 257] {
+            for count in [40, 512, 513] {
                 let sources = (1..=count).map(|n| format!("\"100.64.{}.{}/32\"", n / 256, n % 256)).collect::<Vec<_>>().join(",");
                 let destinations = (1..=count).map(|n| format!(r#"{{"IP":"100.65.{}.{}/32","Ports":{{"First":2222,"Last":2222}}}}"#, n / 256, n % 256)).collect::<Vec<_>>().join(",");
                 let json = format!(r#"{{"PacketFilter":[{{"SrcIPs":[{sources}],"DstPorts":[{destinations}],"IPProto":[6]}}]}}"#);
@@ -1078,7 +1282,7 @@ mod tests {
                 let mut parser = tailfeather::netmap::Parser::new();
                 parser.push(&mut map, json.as_bytes()).unwrap();
                 let result = parser.finish(&mut map);
-                if count > 256 {
+                if count > 512 {
                     assert!(matches!(result, Err(tailfeather::netmap::Error::Full(_))));
                 } else {
                     result.unwrap();

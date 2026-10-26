@@ -12,7 +12,7 @@ import { WebSocketServer, createWebSocketStream } from "ws";
 
 const { Server, utils } = ssh2;
 
-function shell(stream) {
+function shell(stream, onCommand) {
   let line = "";
   stream.write("welcome to e2e-sshd\r\n$ ");
   stream.on("data", (data) => {
@@ -45,6 +45,7 @@ function shell(stream) {
           return;
         }
         else if (command.startsWith("echo ")) stream.write(`${command.slice(5)}\r\n`);
+        else if (onCommand(command, stream)) return;
         else if (command) stream.write(`unknown: ${command}\r\n`);
       }
       stream.write("$ ");
@@ -52,7 +53,10 @@ function shell(stream) {
   });
 }
 
-export async function startLocalSsh(httpServer) {
+export async function startLocalSsh(httpServer, {
+  forwardTarget = null, onForward = () => {}, forwardDelay = () => 0, onForwardClose = () => {},
+  onShellCommand = () => false,
+} = {}) {
   const hostKey = utils.generateKeyPairSync("ed25519");
   const ssh = new Server(
     { hostKeys: [hostKey.private], banner: "e2e-sshd banner: authorized testing only\nApprove: https://login.tailscale.com/a/banner-example\n" },
@@ -68,11 +72,46 @@ export async function startLocalSsh(httpServer) {
         context.reject(context.username === "kbd" ? ["keyboard-interactive"] : ["none"]);
       });
       client.on("ready", () => {
+        client.on("tcpip", (accept, reject, info) => {
+          if (!forwardTarget || info.destPort !== forwardTarget.port || !["localhost", "127.0.0.1", "::1"].includes(info.destIP)) return reject();
+          onForward(info);
+          const delay = forwardDelay(info);
+          // Emulate the remote namespace on a separate local backing port.
+          const upstream = forwardTarget.backingSocket
+            ? connect({ path: forwardTarget.backingSocket, allowHalfOpen: true })
+            : connect({ port: forwardTarget.backingPort, host: "127.0.0.1", allowHalfOpen: true });
+          upstream.on("error", () => { try { reject(); } catch {} });
+          upstream.on("connect", () => {
+            const open = () => {
+              const stream = accept();
+              // ssh2 closes server channels when their writable side finishes.
+              // Relay TCP FIN as SSH EOF without ending that writable until
+              // both directions have finished, preserving half-open uploads.
+              let upstreamEnded = false;
+              let channelEnded = false;
+              upstream.pipe(stream, { end: false });
+              stream.pipe(upstream);
+              upstream.on("end", () => {
+                upstreamEnded = true;
+                stream.eof();
+                if (channelEnded) stream.end();
+              });
+              stream.on("end", () => {
+                channelEnded = true;
+                if (upstreamEnded) stream.end();
+              });
+              stream.on("error", () => upstream.destroy());
+              stream.on("close", () => { upstream.destroy(); onForwardClose(info); });
+            };
+            if (delay) setTimeout(open, delay);
+            else open();
+          });
+        });
         client.on("session", (accept) => {
           const session = accept();
           session.on("pty", (acceptPty) => acceptPty && acceptPty());
           session.on("window-change", (acceptChange) => acceptChange && acceptChange());
-          session.on("shell", (acceptShell) => shell(acceptShell()));
+          session.on("shell", (acceptShell) => shell(acceptShell(), onShellCommand));
         });
       });
       client.on("error", () => {});

@@ -179,3 +179,17 @@ where
             .map_err(|_| "UDP send")
     }
 }
+
+impl crate::runtime::SplitStream for TcpSocket<'_> {
+    type Reader<'a>
+        = embassy_net::tcp::TcpReader<'a>
+    where
+        Self: 'a;
+    type Writer<'a>
+        = embassy_net::tcp::TcpWriter<'a>
+    where
+        Self: 'a;
+    fn split(&mut self) -> (Self::Reader<'_>, Self::Writer<'_>) {
+        TcpSocket::split(self)
+    }
+}

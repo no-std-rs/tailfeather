@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { TerminalUrlScanner, safeWebUrl, isTailscaleAuthUrl } from "../www/terminal-url-scanner.js";
+import { TerminalUrlScanner, safeWebUrl, isTailscaleAuthUrl, loopbackDestination } from "../www/terminal-url-scanner.js";
 
 test("split SSH URLs and formatting sequences produce only complete links", () => {
   const urls = [];
@@ -65,4 +65,15 @@ test("overlong remote tokens are discarded and the next URL still works", () => 
   const scanner = new TerminalUrlScanner((url) => urls.push(url));
   scanner.write(`https://example.org/${"x".repeat(6000)}\nhttps://example.org/ok\n`);
   assert.deepEqual(urls, ["https://example.org/ok"]);
+});
+
+test("loopback links preserve OAuth URLs and identify HTTP(S) hosts and ports", () => {
+  for (const [url, host, port] of [
+    ["http://127.0.0.1:53682/auth?state=opaque%2Bvalue", "127.0.0.1", 53682],
+    ["https://localhost/callback", "localhost", 443],
+    ["http://[::1]:53682/auth", "::1", 53682],
+  ]) assert.deepEqual(loopbackDestination(url), { url, host, port });
+  for (const url of ["https://localhost.evil/", "http://127.0.0.2:53682/", "https://example.org/", "javascript:localhost", "http://user:password@localhost/"]) {
+    assert.equal(loopbackDestination(url), null);
+  }
 });

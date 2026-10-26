@@ -8,6 +8,7 @@
 #![no_std]
 
 mod inner;
+pub mod ipv6;
 pub mod nat;
 pub mod peerapi;
 pub mod policy;

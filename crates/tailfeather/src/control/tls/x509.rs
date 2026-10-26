@@ -1,5 +1,7 @@
 //! Bounded borrowed-DER path validation for the TLS client.
 
+mod teletex;
+
 use core::str::FromStr as _;
 
 use embedded_tls::{CertificateEntryRef, CertificateRef, TlsClock, TlsError};
@@ -450,26 +452,47 @@ fn directory_value_equal(left: Tlv<'_>, right: Tlv<'_>) -> bool {
         loop {
             match (left.next(), right.next()) {
                 (Some(left), Some(right)) if left == right => {}
-                (None, None) => return !left.input.failed && !right.input.failed,
+                (None, None) => {
+                    return !directory_string_failed(&left) && !directory_string_failed(&right);
+                }
                 _ => return false,
             }
         }
     }
-    left.tag == right.tag && left.value == right.value
+    // Malformed supported strings cannot compare equal through the opaque
+    // fallback, including two identical malformed TeletexString values.
+    !matches!(left.tag, 0x0c | 0x13 | 0x14 | 0x16 | 0x1e | 0x1c)
+        && left.tag == right.tag
+        && left.value == right.value
 }
 
-fn normalized_directory_string(
-    input: DirectoryChars<'_>,
-) -> NormalizedDirectoryString<UnicodeNormalizedChars<FoldedDirectoryChars<DirectoryChars<'_>>>> {
-    NormalizedDirectoryString::new(UnicodeNormalizedChars::new(FoldedDirectoryChars::new(
-        input,
-    )))
+type PreparedDirectoryString<'a> = NormalizedDirectoryString<
+    UnicodeNormalizedChars<
+        crate::unicode_normalization::CaseFold<UnicodeNormalizedChars<DirectoryChars<'a>>>,
+    >,
+>;
+
+fn directory_string_failed(value: &PreparedDirectoryString<'_>) -> bool {
+    // Both bounded normalization stages must finish without overflow. The
+    // folding iterator deliberately does not hide the inner stage's state.
+    value.input.failed || value.input.input.input.get_ref().failed
+}
+
+fn normalized_directory_string(input: DirectoryChars<'_>) -> PreparedDirectoryString<'_> {
+    // Normalize before folding as well as after it: folding U+0345 emits a
+    // starter (iota), so canonical reordering must happen before that mapping.
+    // Compatibility decomposition can also expose uppercase letters that
+    // CaseFolding.txt intentionally leaves unchanged in their original form.
+    NormalizedDirectoryString::new(UnicodeNormalizedChars::new(
+        crate::unicode_normalization::CaseFold::new(UnicodeNormalizedChars::new(input)),
+    ))
 }
 
 enum DirectoryChars<'a> {
     Utf8(core::str::Chars<'a>),
     Bmp(core::slice::ChunksExact<'a, u8>),
     Universal(core::slice::ChunksExact<'a, u8>),
+    Teletex(teletex::TeletexChars<'a>),
 }
 
 impl Iterator for DirectoryChars<'_> {
@@ -478,6 +501,7 @@ impl Iterator for DirectoryChars<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Utf8(chars) => chars.next(),
+            Self::Teletex(chars) => chars.next(),
             Self::Bmp(chunks) => {
                 let bytes = chunks.next()?;
                 char::from_u32(u32::from(u16::from_be_bytes([bytes[0], bytes[1]])))
@@ -492,7 +516,8 @@ impl Iterator for DirectoryChars<'_> {
 
 fn directory_chars(value: Tlv<'_>) -> Option<DirectoryChars<'_>> {
     match value.tag {
-        0x0c | 0x13 | 0x14 | 0x16 => Some(DirectoryChars::Utf8(
+        0x14 => teletex::TeletexChars::new(value.value).map(DirectoryChars::Teletex),
+        0x0c | 0x13 | 0x16 => Some(DirectoryChars::Utf8(
             core::str::from_utf8(value.value).ok()?.chars(),
         )),
         0x1e if value.value.len().is_multiple_of(2) => {
@@ -515,51 +540,6 @@ fn directory_chars(value: Tlv<'_>) -> Option<DirectoryChars<'_>> {
                 .then_some(DirectoryChars::Universal(chunks))
         }
         _ => None,
-    }
-}
-
-struct FoldedDirectoryChars<I> {
-    input: I,
-    lowercase: Option<core::char::ToLowercase>,
-    pending: Option<char>,
-}
-
-impl<I: Iterator<Item = char>> FoldedDirectoryChars<I> {
-    fn new(input: I) -> Self {
-        Self {
-            input,
-            lowercase: None,
-            pending: None,
-        }
-    }
-}
-
-impl<I: Iterator<Item = char>> Iterator for FoldedDirectoryChars<I> {
-    type Item = char;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(value) = self.pending.take() {
-            return Some(value);
-        }
-        loop {
-            let value = if let Some(lowercase) = &mut self.lowercase {
-                if let Some(value) = lowercase.next() {
-                    value
-                } else {
-                    self.lowercase = None;
-                    continue;
-                }
-            } else {
-                let value = self.input.next()?;
-                if matches!(value, 'ß' | 'ẞ') {
-                    self.pending = Some('s');
-                    return Some('s');
-                }
-                self.lowercase = Some(value.to_lowercase());
-                continue;
-            };
-            return Some(if value == 'ς' { 'σ' } else { value });
-        }
     }
 }
 
@@ -1635,14 +1615,18 @@ fn hostname_matches_san(hostname: &str, input: &[u8]) -> bool {
     let Ok(sequence) = single_tlv(input, 0x30) else {
         return false;
     };
-    let ipv4 = core::net::Ipv4Addr::from_str(hostname).ok();
+    let ip = core::net::IpAddr::from_str(hostname).ok();
     let mut offset = 0;
     while offset < sequence.value.len() {
         let Ok(name) = next_tlv(sequence.value, &mut offset) else {
             return false;
         };
-        if let Some(address) = ipv4 {
-            if name.tag == 0x87 && name.value == address.octets() {
+        if let Some(address) = ip {
+            let matches = match address {
+                core::net::IpAddr::V4(address) => name.value == address.octets(),
+                core::net::IpAddr::V6(address) => name.value == address.octets(),
+            };
+            if name.tag == 0x87 && matches {
                 return true;
             }
         } else if name.tag == 0x82 && dns_name_matches(name.value, hostname.as_bytes()) {
@@ -1693,6 +1677,21 @@ mod tests {
     use base64::Engine as _;
     use embedded_tls::{CertificateVerifyRef, SignatureScheme, TlsVerifier as _};
 
+    #[test]
+    fn ip_certificate_identities_match_their_complete_address_family() {
+        let ipv6 = [
+            0x30, 0x12, 0x87, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        let ipv4 = [0x30, 0x06, 0x87, 0x04, 127, 0, 0, 1];
+        assert!(hostname_matches_san("::1", &ipv6));
+        assert!(hostname_matches_san("0:0:0:0:0:0:0:1", &ipv6));
+        assert!(!hostname_matches_san("::2", &ipv6));
+        assert!(!hostname_matches_san("127.0.0.1", &ipv6));
+        assert!(hostname_matches_san("127.0.0.1", &ipv4));
+        assert!(!hostname_matches_san("::ffff:127.0.0.1", &ipv4));
+        assert!(!hostname_matches_san("localhost", &ipv6));
+    }
+
     struct CaptureClock;
     impl TlsClock for CaptureClock {
         fn now() -> Option<u64> {
@@ -1715,6 +1714,166 @@ mod tests {
     impl TlsClock for MissingClock {
         fn now() -> Option<u64> {
             None
+        }
+    }
+
+    fn string_value(tag: u8, value: &[u8]) -> Tlv<'_> {
+        Tlv {
+            tag,
+            value,
+            full: &[],
+        }
+    }
+
+    #[test]
+    fn directory_strings_full_fold_all_unicode_encodings_and_canonical_forms() {
+        let cases = [
+            ("ϑ", "θ"),
+            ("\u{345}", "ι"),
+            ("ẞ", "ss"),
+            ("ᾲ", "ὰι"),
+            ("α\u{345}\u{301}", "άι"),
+            ("ﬃ", "ffi"),
+            ("Ꭰ", "ꭰ"),
+            ("İ", "i\u{307}"),
+            ("𝔸", "a"),
+        ];
+        for (input, expected) in cases {
+            for tag in [0x0c, 0x1e, 0x1c] {
+                let encoded: std::vec::Vec<u8> = match tag {
+                    0x0c => input.as_bytes().to_vec(),
+                    0x1e if input.chars().all(|c| c as u32 <= 0xffff) => input
+                        .chars()
+                        .flat_map(|c| (c as u16).to_be_bytes())
+                        .collect(),
+                    0x1e => continue,
+                    _ => input
+                        .chars()
+                        .flat_map(|c| (c as u32).to_be_bytes())
+                        .collect(),
+                };
+                assert!(
+                    directory_value_equal(
+                        string_value(tag, &encoded),
+                        string_value(0x0c, expected.as_bytes())
+                    ),
+                    "{input:?} / {tag:x}"
+                );
+            }
+        }
+        for (left, right) in [("ı", "i"), ("İ", "i"), ("é", "e"), ("ß", "s")] {
+            assert!(!directory_value_equal(
+                string_value(0x0c, left.as_bytes()),
+                string_value(0x0c, right.as_bytes())
+            ));
+        }
+        // Overflow in either normalization stage must reject equal inputs.
+        let oversized =
+            std::string::String::from("a") + &"\u{301}".repeat(MAX_COMBINING_SEQUENCE + 1);
+        assert!(!directory_value_equal(
+            string_value(0x0c, oversized.as_bytes()),
+            string_value(0x0c, oversized.as_bytes())
+        ));
+    }
+
+    #[test]
+    fn teletex_directory_strings_compare_to_unicode_and_reject_invalid_suffixes() {
+        for (input, expected) in [
+            (&[0xc2, b'e'][..], "É"),
+            (&[0xe1, 0xc8, b'u', 0xfb][..], "æÜss"),
+            (&[0xcb, b'C'][..], "c\u{327}"),
+            (&[0xa4][..], "$"),
+            (&[0x24][..], "¤"),
+        ] {
+            assert!(directory_value_equal(
+                string_value(0x14, input),
+                string_value(0x0c, expected.as_bytes())
+            ));
+        }
+        for input in [
+            &[0xc2][..],
+            &[b'a', 0xc2][..],
+            &[0xc3, 0xa9][..],
+            &[0xff][..],
+        ] {
+            assert!(!directory_value_equal(
+                string_value(0x14, input),
+                string_value(0x14, input)
+            ));
+            assert!(!directory_value_equal(
+                string_value(0x14, input),
+                string_value(0x0c, b"a")
+            ));
+        }
+    }
+
+    #[test]
+    fn teletex_capital_eth_folds_as_eth_without_aliasing_d_with_stroke() {
+        let eth = string_value(0x14, &[0xe2]);
+        for value in ["Ð", "ð"] {
+            assert!(directory_value_equal(
+                eth,
+                string_value(0x0c, value.as_bytes())
+            ));
+        }
+        assert!(directory_value_equal(eth, string_value(0x14, &[0xf3])));
+        for value in ["Đ", "đ"] {
+            assert!(!directory_value_equal(
+                eth,
+                string_value(0x0c, value.as_bytes())
+            ));
+        }
+        assert!(!directory_value_equal(eth, string_value(0x14, &[0xf2])));
+        assert!(directory_value_equal(
+            string_value(0x14, &[0xf2]),
+            string_value(0x0c, "Đ".as_bytes())
+        ));
+    }
+
+    #[test]
+    fn teletex_vertical_line_matches_each_unicode_directory_encoding() {
+        let teletex = string_value(0x14, b"Root|CA");
+        for (tag, bytes) in [
+            (0x0c, b"root|ca".to_vec()),
+            (
+                0x1e,
+                "root|ca"
+                    .chars()
+                    .flat_map(|c| (c as u16).to_be_bytes())
+                    .collect(),
+            ),
+            (
+                0x1c,
+                "root|ca"
+                    .chars()
+                    .flat_map(|c| (c as u32).to_be_bytes())
+                    .collect(),
+            ),
+        ] {
+            assert!(directory_value_equal(teletex, string_value(tag, &bytes)));
+        }
+        assert!(directory_value_equal(teletex, teletex));
+        for reserved in [b'\\', b'^', b'`', b'{', b'}', b'~', 0x7f] {
+            let bytes = [b'|', reserved];
+            let invalid = string_value(0x14, &bytes);
+            assert!(!directory_value_equal(invalid, invalid));
+        }
+    }
+
+    #[test]
+    fn teletex_accent_pairs_follow_the_defined_case_sensitive_repertoire() {
+        // T.61 Annex B defines lowercase g acute and uppercase G cedilla,
+        // but their opposite-case encodings are not members of its repertoire.
+        // Unicode directory-string comparison still performs full case folding.
+        for (encoded, unicode) in [(&[0xc2, b'g'][..], "Ǵ"), (&[0xcb, b'G'][..], "ģ")] {
+            assert!(directory_value_equal(
+                string_value(0x14, encoded),
+                string_value(0x0c, unicode.as_bytes())
+            ));
+        }
+        for encoded in [&[0xc2, b'G'][..], &[0xcb, b'g'][..]] {
+            let invalid = string_value(0x14, encoded);
+            assert!(!directory_value_equal(invalid, invalid));
         }
     }
 
@@ -1962,6 +2121,14 @@ mod tests {
         let composed = name(0x0c, " École CA ".as_bytes());
         let decomposed = name(0x0c, "e\u{301}cole   ca".as_bytes());
         assert!(name_equal(&composed, &decomposed));
+        let teletex = name(
+            0x14,
+            &[0xc2, b'E', b'c', b'o', b'l', b'e', b' ', b'C', b'A'],
+        );
+        assert!(name_equal(&teletex, &composed));
+        let greek = name(0x0c, "\u{345}".as_bytes());
+        let folded_greek = name(0x1e, &[0x03, 0xb9]);
+        assert!(name_equal(&greek, &folded_greek));
         let macron_composed = name(0x0c, "Ārbol CA".as_bytes());
         let macron_decomposed = name(0x0c, "a\u{304}rbol ca".as_bytes());
         assert!(name_equal(&macron_composed, &macron_decomposed));
