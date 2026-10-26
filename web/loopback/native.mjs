@@ -46,7 +46,13 @@ export class LoopbackHost {
                 this.readPending.set(socketId, { id, data, offset: 0 });
                 this.resume(socketId);
               });
-              socket.on("end", () => this.send({ type: "eof", id, socket: socketId }));
+              socket.on("end", () => {
+                // Node may emit end after a data event larger than one frame,
+                // while its remaining frames are still waiting for ACKs.
+                const pending = this.readPending.get(socketId);
+                if (pending) pending.eof = true;
+                else this.send({ type: "eof", id, socket: socketId });
+              });
               socket.on("error", () => {});
               socket.on("close", () => {
                 this.sockets.delete(socketId);
@@ -118,7 +124,8 @@ export class LoopbackHost {
       this.send({ type: "data", id: pending.id, socket: socketId, data: chunk.toString("base64") });
     } else {
       this.readPending.delete(socketId);
-      this.sockets.get(socketId)?.resume();
+      if (pending?.eof) this.send({ type: "eof", id: pending.id, socket: socketId });
+      else this.sockets.get(socketId)?.resume();
     }
   }
 

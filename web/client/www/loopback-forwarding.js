@@ -111,10 +111,11 @@ export class LoopbackForwarding {
       try {
         const pipe = await this.getSession().open_forward(entry.host, entry.port,
           (bytes) => this.request({ type: "write", socket, data: bytesToBase64(bytes) }),
+          () => this.request({ type: "eof", socket }),
           () => {
             record.closed = true;
             this.pipes.delete(socket);
-            if (!this.disposed) this.post({ type: "eof", socket });
+            if (!this.disposed) this.post({ type: "close", socket });
           });
         if (record.closed || this.disposed) { pipe.close(); return; }
         record.pipe = pipe;

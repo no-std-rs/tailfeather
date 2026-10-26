@@ -78,12 +78,28 @@ export async function startLocalSsh(httpServer, {
           const delay = forwardDelay(info);
           // Emulate the remote namespace on a separate local backing port.
           const upstream = forwardTarget.backingSocket
-            ? connect(forwardTarget.backingSocket) : connect(forwardTarget.backingPort, "127.0.0.1");
+            ? connect({ path: forwardTarget.backingSocket, allowHalfOpen: true })
+            : connect({ port: forwardTarget.backingPort, host: "127.0.0.1", allowHalfOpen: true });
           upstream.on("error", () => { try { reject(); } catch {} });
           upstream.on("connect", () => {
             const open = () => {
               const stream = accept();
-              upstream.pipe(stream).pipe(upstream);
+              // ssh2 closes server channels when their writable side finishes.
+              // Relay TCP FIN as SSH EOF without ending that writable until
+              // both directions have finished, preserving half-open uploads.
+              let upstreamEnded = false;
+              let channelEnded = false;
+              upstream.pipe(stream, { end: false });
+              stream.pipe(upstream);
+              upstream.on("end", () => {
+                upstreamEnded = true;
+                stream.eof();
+                if (channelEnded) stream.end();
+              });
+              stream.on("end", () => {
+                channelEnded = true;
+                if (upstreamEnded) stream.end();
+              });
               stream.on("error", () => upstream.destroy());
               stream.on("close", () => { upstream.destroy(); onForwardClose(info); });
             };

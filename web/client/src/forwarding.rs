@@ -16,6 +16,7 @@ pub(crate) struct Request {
     pub host: String,
     pub port: u16,
     pub write: js_sys::Function,
+    pub eof: js_sys::Function,
     pub closed: js_sys::Function,
     pub input: mpsc::Receiver<Command>,
     pub ready: oneshot::Sender<Result<(), String>>,
@@ -69,6 +70,7 @@ pub(crate) fn request(
     host: String,
     port: u16,
     write: js_sys::Function,
+    eof: js_sys::Function,
     closed: js_sys::Function,
 ) -> Result<
     (
@@ -91,6 +93,7 @@ pub(crate) fn request(
             host,
             port,
             write,
+            eof,
             closed,
             input,
             ready,
@@ -119,6 +122,7 @@ pub(crate) async fn run<H: russh::client::Handler>(
         host,
         port,
         write,
+        eof,
         closed,
         mut input,
         ready,
@@ -166,19 +170,23 @@ pub(crate) async fn run<H: russh::client::Handler>(
             let mut buffer = [0u8; 32768];
             loop {
                 let len = match reader.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => {
+                        let result = eof.call0(&JsValue::NULL).map_err(|_| ())?;
+                        return wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(
+                            &result,
+                        ))
+                        .await
+                        .map(|_| ())
+                        .map_err(|_| ());
+                    }
+                    Err(_) => return Err(()),
                     Ok(len) => len,
                 };
                 let array = js_sys::Uint8Array::from(&buffer[..len]);
-                let Ok(result) = write.call1(&JsValue::NULL, &array) else {
-                    break;
-                };
-                if wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&result))
+                let result = write.call1(&JsValue::NULL, &array).map_err(|_| ())?;
+                wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&result))
                     .await
-                    .is_err()
-                {
-                    break;
-                }
+                    .map_err(|_| ())?;
             }
         };
         let outbound = async {
@@ -189,19 +197,19 @@ pub(crate) async fn run<H: russh::client::Handler>(
                         let failed = result.is_err();
                         let _ = ready.send(result);
                         if failed {
-                            break;
+                            return Err(());
                         }
                     }
                     Command::Eof => {
-                        if writer.shutdown().await.is_err() {
-                            break;
-                        }
+                        return writer.shutdown().await.map_err(|_| ());
                     }
                 }
             }
+            writer.shutdown().await.map_err(|_| ())
         };
-        futures::pin_mut!(inbound, outbound);
-        futures::select! { _ = inbound.fuse() => {}, _ = outbound.fuse() => {} }
+        // A clean EOF finishes only that half. An error or cancellation still
+        // drops both halves immediately; normal completion waits for both.
+        let _ = futures::try_join!(inbound, outbound);
     };
     futures::pin_mut!(operation);
     futures::select! { _ = operation.fuse() => {}, _ = cancelled => {} }

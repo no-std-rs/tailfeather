@@ -2,7 +2,7 @@
 // runtime API is shimmed; the shipped content script is executed unchanged.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { createServer as tcpServer } from "node:net";
+import { createServer as tcpServer, connect } from "node:net";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { serve } from "./serve.mjs";
@@ -70,8 +70,9 @@ export async function loopbackTest(context, { nativeExtension = false } = {}) {
   let delayedInfo;
   let lateClosed;
   const lateClose = new Promise((resolve) => { lateClosed = resolve; });
+  const forwardTarget = { port, backingPort };
   const ssh = await startLocalSsh(server, {
-    forwardTarget: { port, backingPort }, onForward: (info) => forwards.push(info),
+    forwardTarget, onForward: (info) => forwards.push(info),
     forwardDelay: (info) => {
       if (!delayNext) return 0;
       delayNext = false;
@@ -138,7 +139,7 @@ export async function loopbackTest(context, { nativeExtension = false } = {}) {
     await popup.waitForSelector("button");
     // Server policy rejection is preserved by the existing authenticated session.
     const denied = await page.evaluate(async (port) => {
-      try { await window.tailfeather.session.open_forward("127.0.0.1", port, () => {}, () => {}); return false; }
+      try { await window.tailfeather.session.open_forward("127.0.0.1", port, () => {}, () => {}, () => {}); return false; }
       catch { return true; }
     }, port === 65535 ? port - 1 : port + 1);
     check(denied, "server forwarding policy was bypassed");
@@ -159,7 +160,7 @@ export async function loopbackTest(context, { nativeExtension = false } = {}) {
       const reading = new Promise((resolve) => { seen = resolve; });
       const blocked = new Promise((resolve) => { window.__releaseDuplex = resolve; });
       window.__duplexPipe = await window.tailfeather.session.open_forward("127.0.0.1", port,
-        () => { seen(); return blocked; }, () => {});
+        () => { seen(); return blocked; }, () => {}, () => {});
       await window.__duplexPipe.send(new TextEncoder().encode(
         "POST /duplex HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n"));
       await reading;
@@ -184,11 +185,57 @@ export async function loopbackTest(context, { nativeExtension = false } = {}) {
       const returned = new Uint8Array(await response.arrayBuffer());
       return returned.length === body.length && returned.every((value, index) => value === body[index]);
     }), "forwarded binary request/response lost bytes across frame boundaries");
+    // TCP EOF closes only one direction. Exercise both orders through the
+    // actual native socket, browser/WASM and authenticated SSH channel.
+    for (const remoteFirst of [true, false]) {
+      const upload = Buffer.from("upload after half-close ".repeat(4096));
+      const response = Buffer.from(remoteFirst ? "early response" : "response after local EOF");
+      let uploaded;
+      const received = new Promise((resolve) => { uploaded = resolve; });
+      const upstreams = new Set();
+      const halfClose = tcpServer({ allowHalfOpen: true }, (socket) => {
+        upstreams.add(socket);
+        socket.on("close", () => upstreams.delete(socket));
+        const chunks = [];
+        socket.on("data", (chunk) => chunks.push(chunk));
+        socket.on("end", () => {
+          uploaded(Buffer.concat(chunks));
+          if (!remoteFirst) socket.end(response);
+        });
+        if (remoteFirst) socket.end(response);
+      });
+      let client;
+      let deadline;
+      try {
+        forwardTarget.backingPort = await listen(halfClose);
+        client = connect({ host: "127.0.0.1", port, allowHalfOpen: true });
+        const chunks = [];
+        client.on("data", (chunk) => chunks.push(chunk));
+        const ended = once(client, "end");
+        const exchange = async () => {
+          if (remoteFirst) await ended;
+          client.end(upload);
+          assert.ok((await received).equals(upload), `upload truncated in ${remoteFirst ? "remote" : "local"}-first half-close`);
+          await ended;
+          assert.ok(Buffer.concat(chunks).equals(response), "half-closed response was truncated");
+        };
+        await Promise.race([exchange(), new Promise((_resolve, reject) => {
+          deadline = setTimeout(() => reject(Error(`forwarding lost ${remoteFirst ? "upload after remote" : "response after local"} EOF`)), 5000);
+        })]);
+      } finally {
+        clearTimeout(deadline);
+        client?.destroy();
+        for (const socket of upstreams) socket.destroy();
+        halfClose.close();
+        forwardTarget.backingPort = backingPort;
+      }
+    }
+    console.log("  remote-first and local-first TCP EOF preserve the remaining direction and complete payload");
     // A server may confirm an open only after the client deadline. The late
     // channel must be closed rather than leaked inside the live SSH session.
     delayNext = true;
     check(await page.evaluate(async (port) => {
-      try { await window.tailfeather.session.open_forward("127.0.0.1", port, () => {}, () => {}); return false; }
+      try { await window.tailfeather.session.open_forward("127.0.0.1", port, () => {}, () => {}, () => {}); return false; }
       catch { return true; }
     }, port), "delayed channel open did not time out");
     let lateTimer;

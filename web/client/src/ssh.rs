@@ -140,15 +140,17 @@ pub struct SshSession {
 #[wasm_bindgen]
 impl SshSession {
     /// Open a loopback channel through this exact authenticated SSH session.
+    /// `eof` ends the remote-to-local half; `closed` releases the entire pipe.
     pub async fn open_forward(
         &self,
         host: String,
         port: u16,
         write: js_sys::Function,
+        eof: js_sys::Function,
         closed: js_sys::Function,
     ) -> Result<crate::forwarding::SshForwardPipe, JsError> {
         use futures::SinkExt;
-        let (request, pipe, ready) = crate::forwarding::request(host, port, write, closed)?;
+        let (request, pipe, ready) = crate::forwarding::request(host, port, write, eof, closed)?;
         self.input
             .clone()
             .send(Input::Forward(request))

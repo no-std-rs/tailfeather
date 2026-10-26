@@ -184,11 +184,11 @@ test("page controller isolates sessions, backpressures bytes, and drops native/S
   let controller;
   let closed = 0;
   const forwarded = [];
-  const ssh = { async open_forward(host, port, write, close) {
+  const ssh = { async open_forward(host, port, write, eof, close) {
     forwarded.push({ host, port });
     return {
       async send(bytes) { await write(bytes); },
-      async eof() { close(); },
+      async eof() { await eof(); close(); },
       close() { closed++; },
     };
   } };
