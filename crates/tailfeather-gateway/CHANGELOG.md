@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/no-std-rs/tailfeather/compare/tailfeather-gateway-v0.1.0...tailfeather-gateway-v0.2.0) (2026-10-26)
+
+
+### Features
+
+* **gateway:** implement bounded IPv6 exit forwarding ([#25](https://github.com/no-std-rs/tailfeather/issues/25)) ([545286f](https://github.com/no-std-rs/tailfeather/commit/545286fa870ead690b2be70f786aae8357174fc1))
+
 ## [0.1.0](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.0.1...tailfeather-gateway-v0.1.0) (2026-10-18)
 
 
