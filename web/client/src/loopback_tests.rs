@@ -90,6 +90,7 @@ fn netmap(own: &str, peer_key: NodePublic, peer_address: &str) -> Netmap<4> {
         .insert(DerpRegion {
             id: REGION,
             code: heapless::String::try_from("tst").unwrap(),
+            no_measure_no_home: false,
             nodes,
         })
         .unwrap();

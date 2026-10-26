@@ -25,6 +25,7 @@ import { check, launch, openPage, stripAnsi } from "./browser.mjs";
 import { startLocalSsh } from "./local-ssh.mjs";
 import { workspaceTest } from "./workspace.mjs";
 import { accountsTest } from "./accounts.mjs";
+import { loopbackTest } from "./loopback.mjs";
 
 const relay = process.env.RELAY ?? "";
 const derpRegion = process.env.DERP_REGION ?? "waw";
@@ -324,6 +325,7 @@ for (const [name, test] of [
   ["minted-key", mintedKeyTest],
   ["one-tab", oneTabTest],
   ["ssh-local", localSshTest],
+  ["ssh-loopback", loopbackTest],
   ["workspace", workspaceTest],
   ["workspace-mobile", workspaceTest],
   ["derp", derpTest],

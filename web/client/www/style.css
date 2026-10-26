@@ -441,6 +441,10 @@ dialog label { margin: 0; }
 
 .ssh-auth-dismiss { margin-left: auto; padding: 0; }
 
+.ssh-forwarding-status { padding: 8px 10px; overflow-wrap: anywhere; }
+.ssh-forwarding-status:empty { display: none; }
+.ssh-loopback-link { margin: 4px 0; text-align: left; }
+
 .ssh-link-list { margin: 0; padding: 0 10px; }
 .ssh-link-list ul { margin: 0 0 6px; padding: 0; list-style: none; }
 .ssh-link-list a {
