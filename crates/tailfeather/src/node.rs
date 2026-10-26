@@ -2096,23 +2096,38 @@ mod tests {
     #[test]
     #[cfg(feature = "hosted-policy")]
     fn hosted_policy_node_fits_host_budget() {
+        use crate::netmap::policy::{
+            MAX_FILTER_DESTINATIONS, MAX_FILTER_RULES, MAX_FILTER_SOURCES,
+        };
         // Hosted clients deliberately retain larger ACL address lists. Their
         // layout has a separate bound; the device contract above still covers
         // every build without hosted-policy, including other optional features.
+        // These budgets originally covered 256 addresses per rule. Account
+        // for the later capacity increase using the retained eight-byte IPv4
+        // ranges and four additional destination-port bytes. Other layout
+        // growth, including the IPv6 pool, must fit the original headroom.
+        let additional_acl_storage = MAX_FILTER_RULES
+            * ((MAX_FILTER_SOURCES - 256) * 8 + (MAX_FILTER_DESTINATIONS - 256) * 12);
+        let node_budget = 256 * 1024 + additional_acl_storage;
+        let netmap_budget = 192 * 1024 + additional_acl_storage;
         assert!(
-            core::mem::size_of::<Node<32>>() <= 256 * 1024,
-            "Node<32> with hosted policy is {} bytes",
-            core::mem::size_of::<Node<32>>()
+            core::mem::size_of::<Node<32>>() <= node_budget,
+            "Node<32> with hosted policy is {} bytes (budget {node_budget})",
+            core::mem::size_of::<Node<32>>(),
         );
         assert!(
-            core::mem::size_of::<Netmap<32>>() <= 192 * 1024,
-            "Netmap<32> with hosted policy is {} bytes",
-            core::mem::size_of::<Netmap<32>>()
+            core::mem::size_of::<Netmap<32>>() <= netmap_budget,
+            "Netmap<32> with hosted policy is {} bytes (budget {netmap_budget})",
+            core::mem::size_of::<Netmap<32>>(),
         );
     }
 
     #[test]
     fn registration_and_map_lease_lifecycle_is_explicit() {
+        on_node_test_stack(registration_and_map_lease_lifecycle_is_explicit_fixture);
+    }
+
+    fn registration_and_map_lease_lifecycle_is_explicit_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         node.set_control_endpoint(Endpoint::new("control.example", 443).unwrap());
         node.set_registration_body(b"synthetic registration")
@@ -2192,6 +2207,10 @@ mod tests {
 
     #[test]
     fn trusted_time_disconnects_and_blocks_maps_until_persisted() {
+        on_node_test_stack(trusted_time_disconnects_and_blocks_maps_until_persisted_fixture);
+    }
+
+    fn trusted_time_disconnects_and_blocks_maps_until_persisted_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         node.set_control_endpoint(Endpoint::new("control.example", 443).unwrap());
         node.set_registration_body(b"{}").unwrap();
@@ -2240,6 +2259,10 @@ mod tests {
 
     #[test]
     fn node_key_rotation_is_staged_and_cleared_durably() {
+        on_node_test_stack(node_key_rotation_is_staged_and_cleared_durably_fixture);
+    }
+
+    fn node_key_rotation_is_staged_and_cleared_durably_fixture() {
         let mut node = Node::<1>::factory_reset(Identity::generate(&mut Counter(30)), 4);
         node.enrolled = true;
         node.registration = RegistrationState::Registered;
@@ -2274,6 +2297,10 @@ mod tests {
 
     #[test]
     fn a_new_direct_endpoint_is_probed_before_derp_fallback() {
+        on_node_test_stack(a_new_direct_endpoint_is_probed_before_derp_fallback_fixture);
+    }
+
+    fn a_new_direct_endpoint_is_probed_before_derp_fallback_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -2339,6 +2366,12 @@ mod tests {
 
     #[test]
     fn active_peer_discovery_is_not_blocked_by_an_unreachable_earlier_peer() {
+        on_node_test_stack(
+            active_peer_discovery_is_not_blocked_by_an_unreachable_earlier_peer_fixture,
+        );
+    }
+
+    fn active_peer_discovery_is_not_blocked_by_an_unreachable_earlier_peer_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -2382,6 +2415,10 @@ mod tests {
 
     #[test]
     fn disco_learns_a_path_only_from_an_authenticated_expected_pong() {
+        on_node_test_stack(disco_learns_a_path_only_from_an_authenticated_expected_pong_fixture);
+    }
+
+    fn disco_learns_a_path_only_from_an_authenticated_expected_pong_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -2449,6 +2486,12 @@ mod tests {
 
     #[test]
     fn disco_rotates_candidates_preserves_deltas_and_skips_exhausted_peers() {
+        on_node_test_stack(
+            disco_rotates_candidates_preserves_deltas_and_skips_exhausted_peers_fixture,
+        );
+    }
+
+    fn disco_rotates_candidates_preserves_deltas_and_skips_exhausted_peers_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -2512,6 +2555,10 @@ mod tests {
 
     #[test]
     fn peer_gone_restarts_exhausted_direct_discovery() {
+        on_node_test_stack(peer_gone_restarts_exhausted_direct_discovery_fixture);
+    }
+
+    fn peer_gone_restarts_exhausted_direct_discovery_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -2552,6 +2599,10 @@ mod tests {
 
     #[test]
     fn call_me_maybe_preserves_an_authenticated_working_direct_path() {
+        on_node_test_stack(call_me_maybe_preserves_an_authenticated_working_direct_path_fixture);
+    }
+
+    fn call_me_maybe_preserves_an_authenticated_working_direct_path_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         persisted(&mut node);
         let peer_key = NodePrivate::from_bytes([77; 32]).public();
@@ -2700,6 +2751,12 @@ mod tests {
 
     #[test]
     fn authenticated_call_me_maybe_from_derp_stages_a_bounded_direct_probe() {
+        on_node_test_stack(
+            authenticated_call_me_maybe_from_derp_stages_a_bounded_direct_probe_fixture,
+        );
+    }
+
+    fn authenticated_call_me_maybe_from_derp_stages_a_bounded_direct_probe_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -2841,6 +2898,10 @@ mod tests {
 
     #[test]
     fn a_direct_only_peer_keeps_retrying_its_advertised_endpoint() {
+        on_node_test_stack(a_direct_only_peer_keeps_retrying_its_advertised_endpoint_fixture);
+    }
+
+    fn a_direct_only_peer_keeps_retrying_its_advertised_endpoint_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -2869,6 +2930,10 @@ mod tests {
 
     #[test]
     fn an_unhealthy_direct_only_peer_keeps_sending_data_directly() {
+        on_node_test_stack(an_unhealthy_direct_only_peer_keeps_sending_data_directly_fixture);
+    }
+
+    fn an_unhealthy_direct_only_peer_keeps_sending_data_directly_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -2900,6 +2965,12 @@ mod tests {
 
     #[test]
     fn an_authenticated_inbound_derp_region_routes_before_home_derp_arrives() {
+        on_node_test_stack(
+            an_authenticated_inbound_derp_region_routes_before_home_derp_arrives_fixture,
+        );
+    }
+
+    fn an_authenticated_inbound_derp_region_routes_before_home_derp_arrives_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -2947,6 +3018,10 @@ mod tests {
 
     #[test]
     fn a_changed_advertised_endpoint_invalidates_the_old_direct_path() {
+        on_node_test_stack(changed_advertised_endpoint_invalidates_old_direct_path);
+    }
+
+    fn changed_advertised_endpoint_invalidates_old_direct_path() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -2993,6 +3068,10 @@ mod tests {
     /// and had to be torn down as soon as that peer was actually addressed.
     #[test]
     fn a_peers_advertised_home_outranks_the_first_map_region() {
+        on_node_test_stack(a_peers_advertised_home_outranks_the_first_map_region_fixture);
+    }
+
+    fn a_peers_advertised_home_outranks_the_first_map_region_fixture() {
         fn region(id: u16) -> crate::netmap::DerpRegion {
             let mut nodes = heapless::Vec::new();
             nodes
@@ -3047,6 +3126,10 @@ mod tests {
 
     #[test]
     fn insecure_derp_keeps_its_certificate_name() {
+        on_node_test_stack(insecure_derp_keeps_its_certificate_name_fixture);
+    }
+
+    fn insecure_derp_keeps_its_certificate_name_fixture() {
         let mut node = Node::<1>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         let generation = match node.poll(0).unwrap().unwrap() {
             NodeAction::PersistState(state) => state.generation(),
@@ -3095,6 +3178,10 @@ mod tests {
 
     #[test]
     fn only_home_and_active_peer_derp_are_kept_connected() {
+        on_node_test_stack(only_home_and_active_peer_derp_are_kept_connected_fixture);
+    }
+
+    fn only_home_and_active_peer_derp_are_kept_connected_fixture() {
         fn region(id: u16) -> crate::netmap::DerpRegion {
             let mut nodes = heapless::Vec::new();
             nodes
@@ -3228,6 +3315,10 @@ mod tests {
 
     #[test]
     fn no_home_region_is_skipped_for_rendezvous_but_allowed_for_a_peer() {
+        on_node_test_stack(no_home_region_is_skipped_for_rendezvous_but_allowed_for_a_peer_fixture);
+    }
+
+    fn no_home_region_is_skipped_for_rendezvous_but_allowed_for_a_peer_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         persisted(&mut node);
         let mut lease = Netmap::new();
@@ -3267,6 +3358,12 @@ mod tests {
 
     #[test]
     fn standalone_stun_region_cannot_block_relay_backup_after_a_dial_failure() {
+        on_node_test_stack(
+            standalone_stun_region_cannot_block_relay_backup_after_a_dial_failure_fixture,
+        );
+    }
+
+    fn standalone_stun_region_cannot_block_relay_backup_after_a_dial_failure_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         persisted(&mut node);
         let mut lease = Netmap::new();
@@ -3297,6 +3394,10 @@ mod tests {
 
     #[test]
     fn failed_home_derp_does_not_block_the_peer_region() {
+        on_node_test_stack(failed_home_derp_does_not_block_the_peer_region_fixture);
+    }
+
+    fn failed_home_derp_does_not_block_the_peer_region_fixture() {
         fn region(id: u16) -> crate::netmap::DerpRegion {
             let mut nodes = heapless::Vec::new();
             nodes
@@ -3354,6 +3455,12 @@ mod tests {
 
     #[test]
     fn removing_a_peer_clears_its_queued_derp_packet_when_the_region_stays() {
+        on_node_test_stack(
+            removing_a_peer_clears_its_queued_derp_packet_when_the_region_stays_fixture,
+        );
+    }
+
+    fn removing_a_peer_clears_its_queued_derp_packet_when_the_region_stays_fixture() {
         fn region(id: u16) -> crate::netmap::DerpRegion {
             let mut nodes = heapless::Vec::new();
             nodes
@@ -3453,6 +3560,10 @@ mod tests {
 
     #[test]
     fn exit_readiness_uses_the_approved_address_family() {
+        on_node_test_stack(exit_readiness_uses_the_approved_address_family_fixture);
+    }
+
+    fn exit_readiness_uses_the_approved_address_family_fixture() {
         for (routes, ipv4_ready, status) in [
             ("[]", false, NodeStatus::AwaitingRouteApproval),
             (r#"["0.0.0.0/0"]"#, true, NodeStatus::MapActive),
@@ -3486,6 +3597,12 @@ mod tests {
 
     #[test]
     fn outbound_call_me_maybe_uses_the_peer_relay_and_current_endpoints() {
+        on_node_test_stack(
+            outbound_call_me_maybe_uses_the_peer_relay_and_current_endpoints_fixture,
+        );
+    }
+
+    fn outbound_call_me_maybe_uses_the_peer_relay_and_current_endpoints_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         persisted(&mut node);
         let key = NodePrivate::from_bytes([77; 32]).public();
@@ -3547,6 +3664,10 @@ mod tests {
 
     #[test]
     fn exhausted_direct_probes_restart_for_a_peer_seen_on_a_relay() {
+        on_node_test_stack(exhausted_direct_probes_restart_for_a_peer_seen_on_a_relay_fixture);
+    }
+
+    fn exhausted_direct_probes_restart_for_a_peer_seen_on_a_relay_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         persisted(&mut node);
         let key = NodePrivate::from_bytes([77; 32]).public();
@@ -3582,6 +3703,10 @@ mod tests {
 
     #[test]
     fn a_relay_only_node_never_transmits_directly() {
+        on_node_test_stack(a_relay_only_node_never_transmits_directly_fixture);
+    }
+
+    fn a_relay_only_node_never_transmits_directly_fixture() {
         let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         persisted(&mut node);
         node.set_direct_paths(false);
@@ -3759,6 +3884,10 @@ mod tests {
 
     #[test]
     fn on_demand_initiation_handshakes_only_with_addressed_peers() {
+        on_node_test_stack(on_demand_initiation_handshakes_only_with_addressed_peers_fixture);
+    }
+
+    fn on_demand_initiation_handshakes_only_with_addressed_peers_fixture() {
         let mut node = Node::<4>::factory_reset(Identity::generate(&mut Counter(1)), 1);
         persisted(&mut node);
         node.set_direct_paths(false);

@@ -13,6 +13,18 @@ use std::path::PathBuf;
 
 use tailfeather::netmap::parser::{Netmap, Parser};
 
+fn on_capture_test_stack(test: fn()) {
+    #[cfg(feature = "hosted-policy")]
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(test)
+        .unwrap()
+        .join()
+        .unwrap();
+    #[cfg(not(feature = "hosted-policy"))]
+    test();
+}
+
 fn vectors() -> PathBuf {
     std::env::var_os("TS_CONFORMANCE_VECTORS")
         .map(PathBuf::from)
@@ -286,6 +298,11 @@ fn oversized_unknown_keys_are_ignored_with_their_subtrees() {
 /// with JSON structure.
 #[test]
 fn the_result_is_the_same_however_the_stream_is_chunked() {
+    // Keep both complete maps on the same stack budget as hosted node fixtures.
+    on_capture_test_stack(chunked_stream_matches_reference);
+}
+
+fn chunked_stream_matches_reference() {
     let documents = captured();
     let reference = {
         let mut netmap = Netmap::<32>::new();
