@@ -114,6 +114,56 @@ fn endpoints<P: Network, S: State, const PEERS: usize, const A: usize>(
         .collect()
 }
 
+fn local_candidates<P: Network>(network: &P) -> Vec<SocketAddrV4, 8> {
+    let Ok(endpoint) = network.local_endpoint() else {
+        return Vec::new();
+    };
+    candidate_addresses(
+        SocketAddrV4::new(
+            network.interface_address().unwrap_or(*endpoint.ip()),
+            endpoint.port(),
+        ),
+        |visit| network.visit_local_addresses(visit),
+    )
+}
+
+fn candidate_addresses(
+    fallback: SocketAddrV4,
+    addresses: impl FnOnce(&mut dyn FnMut(Ipv4Addr)),
+) -> Vec<SocketAddrV4, 8> {
+    fn usable(address: Ipv4Addr) -> bool {
+        !address.is_unspecified()
+            && !address.is_loopback()
+            && !address.is_multicast()
+            && !address.is_broadcast()
+            // Advertising the overlay itself cannot establish a UDP path.
+            && (u32::from(address) & 0xffc0_0000) != 0x6440_0000
+    }
+    let keep_fallback = usable(*fallback.ip());
+    // Keep half of the bounded advertisement for STUN-derived endpoints.
+    let limit = 4 - usize::from(keep_fallback);
+    let mut ips = Vec::<Ipv4Addr, 4>::new();
+    addresses(&mut |address| {
+        if !usable(address) || address == *fallback.ip() || ips.contains(&address) {
+            return;
+        }
+        if ips.len() < limit {
+            let _ = ips.push(address);
+        } else if address < ips[limit - 1] {
+            ips[limit - 1] = address;
+        }
+        ips.sort_unstable();
+    });
+    let mut candidates: Vec<SocketAddrV4, 8> = ips
+        .into_iter()
+        .map(|address| SocketAddrV4::new(address, fallback.port()))
+        .collect();
+    if keep_fallback || (candidates.is_empty() && fallback.ip().is_loopback()) {
+        let _ = candidates.push(fallback);
+    }
+    candidates
+}
+
 async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
     runtime: &Runtime<'_, P, S, PEERS, A>,
     reactor: &Reactor<&P>,
@@ -139,13 +189,11 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
             )
             .await
             .map_err(|_| "key TLS deadline")??;
-        let mut candidates = Vec::new();
-        if !config.relay_only
-            && let Some(address) = runtime.network.interface_address()
-        {
-            let endpoint = runtime.network.local_endpoint()?;
-            let _ = candidates.push(SocketAddrV4::new(address, endpoint.port()));
-        }
+        let candidates = if config.relay_only {
+            Vec::new()
+        } else {
+            local_candidates(runtime.network)
+        };
         runtime.candidates(candidates);
         reactor
             .timeout(20_000, transport::fetch_server_key(&mut stream, &host))
@@ -386,12 +434,7 @@ async fn discover_home<P: Network, S: State, const PEERS: usize, const A: usize>
         return selection.home();
     }
     let deadline = reactor.clock_millis().saturating_add(12_000);
-    let mut candidates = Vec::new();
-    if let Some(address) = runtime.network.interface_address()
-        && let Ok(endpoint) = runtime.network.local_endpoint()
-    {
-        let _ = candidates.push(SocketAddrV4::new(address, endpoint.port()));
-    }
+    let mut candidates = local_candidates(runtime.network);
     let mut index = 0;
     'regions: loop {
         let region = runtime
@@ -459,4 +502,65 @@ async fn discover_home<P: Network, S: State, const PEERS: usize, const A: usize>
     }
     runtime.candidates(candidates);
     selection.home()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_interfaces_share_the_data_port_and_leave_room_for_stun() {
+        let candidates = candidate_addresses("192.168.6.3:41641".parse().unwrap(), |visit| {
+            for text in [
+                "127.0.0.1",
+                "0.0.0.0",
+                "224.0.0.1",
+                "255.255.255.255",
+                "100.64.1.1",
+                "192.168.6.3",
+                "10.203.0.1",
+                "10.203.0.1",
+                "10.203.1.1",
+                "10.88.0.1",
+                "172.16.0.1",
+            ] {
+                visit(text.parse().unwrap());
+            }
+        });
+        assert_eq!(
+            candidates.as_slice(),
+            &[
+                "10.88.0.1:41641",
+                "10.203.0.1:41641",
+                "10.203.1.1:41641",
+                "192.168.6.3:41641"
+            ]
+            .map(|text| text.parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_lan_without_the_control_route_is_advertised_and_refreshes() {
+        for address in ["10.203.0.2", "192.168.6.3"] {
+            let candidates = candidate_addresses("127.0.0.1:1234".parse().unwrap(), |visit| {
+                visit(address.parse().unwrap());
+            });
+            assert_eq!(
+                candidates.as_slice(),
+                &[SocketAddrV4::new(address.parse().unwrap(), 1234)]
+            );
+        }
+    }
+
+    #[test]
+    fn single_interface_fallback_and_loopback_fixtures_remain_supported() {
+        for fallback in ["192.168.6.3:41641", "127.0.0.1:41641"] {
+            let fallback = fallback.parse().unwrap();
+            assert_eq!(
+                candidate_addresses(fallback, |_| {}).as_slice(),
+                &[fallback]
+            );
+        }
+        assert!(candidate_addresses("100.64.1.1:41641".parse().unwrap(), |_| {}).is_empty());
+    }
 }

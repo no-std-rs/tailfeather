@@ -5,7 +5,7 @@
 
 #[cfg(feature = "alloc")]
 use alloc::vec;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, SocketAddrV4};
 use heapless::{Deque, Vec};
 use smoltcp::iface::SocketStorage;
 
@@ -734,6 +734,24 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
             .then(|| self.sockets.get_mut::<tcp::Socket>(handle.socket))
     }
 
+    /// The current peer endpoint, retaining it across a write-side half-close.
+    /// Removed, reset and address-revoked sockets cannot expose a stale peer.
+    pub fn remote_endpoint(&self, handle: TcpHandle) -> Option<SocketAddrV4> {
+        if !self.valid(handle) {
+            return None;
+        }
+        let socket = self.sockets.get::<tcp::Socket>(handle.socket);
+        if socket.state() == tcp::State::Closed {
+            return None;
+        }
+        let endpoint = socket.remote_endpoint()?;
+        match endpoint.addr {
+            IpAddress::Ipv4(address) => Some(SocketAddrV4::new(address, endpoint.port)),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     fn valid(&self, handle: TcpHandle) -> bool {
         handle.stack == self.id
             && self
@@ -766,6 +784,58 @@ fn instant(now_ms: u64) -> Instant {
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_endpoints_survive_half_close_but_not_reset_revocation_or_handle_reuse() {
+        for reset in [true, false] {
+            let mut local = OwnedStack::new(1);
+            let mut remote = OwnedStack::new(2);
+            local.set_address("100.64.0.1".parse().unwrap(), 0, 1);
+            remote.set_address("100.64.0.2".parse().unwrap(), 0, 2);
+            let accepted = remote.listen(2222).unwrap();
+            assert_eq!(remote.remote_endpoint(accepted), None);
+            let client = local
+                .connect("100.64.0.2".parse().unwrap(), 2222, 49152)
+                .unwrap();
+            for now in 0..10 {
+                for bytes in local.poll(now) {
+                    remote.deliver(&bytes);
+                }
+                for bytes in remote.poll(now) {
+                    local.deliver(&bytes);
+                }
+            }
+            let endpoint = "100.64.0.2:2222".parse().unwrap();
+            assert_eq!(local.remote_endpoint(client), Some(endpoint));
+            assert_eq!(
+                remote.remote_endpoint(accepted),
+                Some("100.64.0.1:49152".parse().unwrap())
+            );
+            assert_eq!(remote.remote_endpoint(client), None, "foreign stack handle");
+            local.tcp(client).unwrap().close();
+            assert_eq!(local.remote_endpoint(client), Some(endpoint));
+            if reset {
+                local.tcp(client).unwrap().abort();
+            } else {
+                local.clear_address();
+            }
+            assert_eq!(local.remote_endpoint(client), None);
+            local.remove(client);
+            local.set_address("100.64.0.1".parse().unwrap(), 10, 3);
+            let replacement = local
+                .connect("100.64.0.3".parse().unwrap(), 2223, 49152)
+                .unwrap();
+            assert_eq!(
+                local.remote_endpoint(client),
+                None,
+                "reused socket slot must not revive the old handle"
+            );
+            assert_eq!(
+                local.remote_endpoint(replacement),
+                Some("100.64.0.3:2223".parse().unwrap())
+            );
+        }
+    }
+
     #[test]
     fn drain_distinguishes_a_reset_from_acknowledged_final_data() {
         for reset in [false, true] {

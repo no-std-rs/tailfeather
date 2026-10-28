@@ -1,0 +1,58 @@
+load("@reactor_deps//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml", "Cargo.lock"])
+
+rust_library(
+    name = "tailfeather_reactor_portable",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tailfeather_reactor",
+    edition = "2024",
+    rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
+    deps = all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "tailfeather_reactor",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tailfeather_reactor",
+    crate_features = ["alloc", "std", "embassy", "tls", "accelerated-crypto"],
+    edition = "2024",
+    rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_test",
+    aliases = aliases(),
+    crate = ":tailfeather_reactor",
+    crate_features = ["alloc", "std", "embassy", "tls", "accelerated-crypto"],
+    deps = all_crate_deps(normal_dev = True, cargo_only = True),
+)
+
+rust_test(
+    name = "tcp_parity_test",
+    srcs = ["tests/tcp_parity.rs"],
+    aliases = aliases(),
+    crate_name = "tcp_parity_test",
+    crate_features = ["std", "embassy"],
+    edition = "2024",
+    deps = [":tailfeather_reactor"] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
+)
+
+rust_binary(
+    name = "throughput",
+    srcs = ["benches/throughput.rs", "benches/throughput/mesh.rs"],
+    aliases = aliases(),
+    crate_name = "throughput",
+    crate_features = ["std", "embassy"],
+    crate_root = "benches/throughput.rs",
+    edition = "2024",
+    deps = [":tailfeather_reactor"] + all_crate_deps(normal = True, normal_dev = True),
+)
