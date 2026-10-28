@@ -111,7 +111,18 @@ crate.from_cargo(
     cargo_toml = "//crates/tailfeather-ssh/probe:Cargo.toml",
     platform_triples = ["x86_64-unknown-linux-gnu"],
 )
-use_repo(crate, "firmware_deps", "harness_deps", "ssh_probe_deps", "tailfeather_root_deps")
+crate.from_cargo(
+    name = "reactor_deps",
+    cargo_lock = "//crates/tailfeather-reactor:Cargo.lock",
+    cargo_toml = "//crates/tailfeather-reactor:Cargo.toml",
+    platform_triples = ["x86_64-unknown-linux-gnu"],
+)
+crate.annotation(
+    crate = "tailfeather-reactor",
+    repositories = ["reactor_deps"],
+    crate_features = ["std", "embassy", "accelerated-crypto"],
+)
+use_repo(crate, "firmware_deps", "harness_deps", "reactor_deps", "ssh_probe_deps", "tailfeather_root_deps")
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")

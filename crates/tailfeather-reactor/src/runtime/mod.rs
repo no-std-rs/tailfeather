@@ -115,6 +115,14 @@ pub trait Network: Clock {
     fn unix_millis(&self) -> Result<u64, Error>;
     fn local_endpoint(&self) -> Result<SocketAddrV4, Error>;
     fn interface_address(&self) -> Option<Ipv4Addr>;
+    /// Visit usable local interfaces independently of the route to control.
+    /// Adapters should omit down and point-to-point interfaces. Existing
+    /// single-interface adapters retain their coordinator-facing fallback.
+    fn visit_local_addresses(&self, mut visit: impl FnMut(Ipv4Addr)) {
+        if let Some(address) = self.interface_address() {
+            visit(address);
+        }
+    }
     fn validate_ca(&self, ca: &[u8]) -> Result<(), Error>;
     async fn resolve(&self, host: &str) -> Result<Vec<Ipv4Addr, 16>, Error>;
     async fn connect<'a>(
@@ -539,6 +547,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             A,
         > = Vec::new();
         let mut punches: Vec<(tailfeather::keys::NodePublic, u64, u8), PEERS> = Vec::new();
+        let mut discovery_cursor = 0;
         let mut generation = self.candidate_generation.get();
         let mut seed = [0; 8];
         self.network.rng().fill_bytes(&mut seed);
@@ -632,9 +641,9 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                         }
                     });
                     punches.retain(|(peer, _, _)| active.contains(peer));
-                    for peer in active {
-                        if !punches.iter().any(|(key, _, _)| *key == peer) {
-                            let _ = punches.push((peer, 0, 0));
+                    for peer in &active {
+                        if !punches.iter().any(|(key, _, _)| key == peer) {
+                            let _ = punches.push((*peer, 0, 0));
                         }
                     }
                     let candidates: Vec<core::net::SocketAddr, 8> = self
@@ -660,14 +669,36 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                             *next = now.saturating_add(1000);
                         }
                     }
+                    // Probe application peers first. A long control-plane
+                    // peer list must not delay a local transfer behind nodes
+                    // which are offline or unrelated to this connection.
+                    let start = discovery_cursor % active.len().max(1);
+                    for offset in 0..active.len() {
+                        if self.actions.borrow().len() >= A.div_ceil(2) {
+                            break;
+                        }
+                        let index = (start + offset) % active.len();
+                        self.enqueue(
+                            self.node
+                                .borrow_mut()
+                                .poll_disco_for(&active[index], now, &mut self.network.rng())
+                                .ok()
+                                .flatten(),
+                        );
+                        discovery_cursor = (index + 1) % active.len();
+                    }
+                    // Packet devices such as TUN have no socket inventory.
+                    // Preserve discovery for those adapters and idle servers.
+                    if active.is_empty() {
+                        self.enqueue(
+                            self.node
+                                .borrow_mut()
+                                .poll_disco(now, &mut self.network.rng())
+                                .ok()
+                                .flatten(),
+                        );
+                    }
                 }
-                self.enqueue(
-                    self.node
-                        .borrow_mut()
-                        .poll_disco(now, &mut self.network.rng())
-                        .ok()
-                        .flatten(),
-                );
                 self.enqueue(self.node.borrow_mut().poll_derp().ok().flatten());
                 let timestamp = self.timestamp()?;
                 let handshake = self
@@ -788,7 +819,7 @@ mod tests {
             (Self, Self)
         }
     }
-    struct Offline(Cell<u64>);
+    struct Offline(Cell<u64>, RefCell<std::vec::Vec<SocketAddrV4>>);
     impl Clock for Offline {
         fn now_millis(&self) -> u64 {
             self.0.get()
@@ -842,7 +873,10 @@ mod tests {
         async fn receive(&self, _: &mut [u8]) -> Result<(usize, SocketAddrV4), Error> {
             core::future::pending().await
         }
-        async fn send(&self, _: &[u8], _: SocketAddrV4) -> Result<(), Error> {
+        async fn send(&self, packet: &[u8], endpoint: SocketAddrV4) -> Result<(), Error> {
+            if tailfeather::disco::is_disco(packet) {
+                self.1.borrow_mut().push(endpoint);
+            }
             Ok(())
         }
     }
@@ -879,13 +913,124 @@ mod tests {
         }
     }
 
+    struct ActiveDevice(std::vec::Vec<Ipv4Addr>);
+    impl Device for ActiveDevice {
+        fn set_address(&self, _: Option<Ipv4Addr>, _: u64, _: u64) -> Result<(), Error> {
+            Ok(())
+        }
+        fn visit_remote_addresses(&self, mut visit: impl FnMut(Ipv4Addr)) {
+            self.0.iter().copied().for_each(&mut visit);
+        }
+        async fn run<C: Clock, I: PacketIo<Error = Error>>(
+            &self,
+            _: &Reactor<C>,
+            _: &I,
+        ) -> Result<(), Error> {
+            core::future::pending().await
+        }
+    }
+
+    #[test]
+    fn active_peers_are_probed_before_unrelated_nodes_with_bounded_queue_fairness() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                use core::future::Future;
+                use tailfeather::{
+                    control::authority::Authority,
+                    keys::{DiscoPrivate, Identity, NodePrivate},
+                    netmap::{Cidr, Cidr4, Netmap, Peer},
+                };
+                let network = Offline(Cell::new(0), RefCell::new(std::vec::Vec::new()));
+                let state = MemoryState::default();
+                let mut config = config();
+                config.relay_only = false;
+                let authority = Authority::parse(config.control_url, false)
+                    .unwrap()
+                    .digest();
+                let mut node = std::boxed::Box::new(Node::<16>::factory_reset_for_authority(
+                    Identity::generate(&mut crate::native::OsRng),
+                    1,
+                    authority,
+                ));
+                let generation = match node.poll(0).unwrap().unwrap() {
+                    NodeAction::PersistState(state) => state.generation(),
+                    _ => unreachable!(),
+                };
+                node.persistence_result(generation, true).unwrap();
+                node.set_initiate_on_demand(true);
+                let mut map = Netmap::<16>::new();
+                map.addresses
+                    .push(Cidr::parse("100.64.0.1/32").unwrap())
+                    .unwrap();
+                for index in 1..=16u8 {
+                    let mut peer = Peer::new(
+                        u64::from(index),
+                        NodePrivate::from_bytes([index; 32]).public(),
+                    );
+                    peer.disco_key = Some(DiscoPrivate::from_bytes([index + 16; 32]).public());
+                    let address = Cidr4::from_cidr(
+                        Cidr::parse(&std::format!("100.64.0.{}/32", index + 1)).unwrap(),
+                    )
+                    .unwrap();
+                    peer.addresses.push(address).unwrap();
+                    peer.allowed_ips.push(address).unwrap();
+                    peer.endpoints
+                        .push(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, index), 41641))
+                        .unwrap();
+                    map.peers.upsert(peer).unwrap();
+                }
+                node.handle_control_event(ControlEvent::MapFinished {
+                    lease: &mut map,
+                    result: Ok(()),
+                })
+                .unwrap();
+                let runtime =
+                    Runtime::<_, _, 16, 4>::new(config, &mut node, &network, &state).unwrap();
+                let device = ActiveDevice((11..=17).map(|n| Ipv4Addr::new(100, 64, 0, n)).collect());
+                let reactor = Reactor::with_clock(&network);
+                let mut packets = std::boxed::Box::pin(runtime.packets(&device, &reactor));
+                let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+                for tick in 0..8 {
+                    network.0.set(tick * 100);
+                    for _ in 0..3 {
+                        assert!(packets.as_mut().poll(&mut cx).is_pending());
+                    }
+                }
+                let sent = network.1.borrow();
+                assert!(!sent.is_empty());
+                assert!(
+                    sent.iter().all(|to| to.ip().octets()[3] >= 10),
+                    "inactive earlier peers must not consume the probe budget: {sent:?}"
+                );
+                for index in 10..=16 {
+                    assert!(
+                        sent.contains(&SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, index), 41641)),
+                        "every active peer must progress across bounded maintenance rounds: {sent:?}"
+                    );
+                }
+                drop(sent);
+                let count = network.1.borrow().len();
+                for _ in 0..3 {
+                    assert!(packets.as_mut().poll(&mut cx).is_pending());
+                }
+                assert_eq!(
+                    network.1.borrow().len(),
+                    count,
+                    "an unchanged clock must not busy-probe peers"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
     #[test]
     fn idle_nodes_do_not_write_timestamp_reservations_and_cancellation_wakes_ready() {
         std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 use core::future::Future;
-                let network = Offline(Cell::new(0));
+                let network = Offline(Cell::new(0), RefCell::new(std::vec::Vec::new()));
                 let state = MemoryState::default();
                 let config = config();
                 let mut node = restore::<_, _, 1>(&config, &network, &state).unwrap();
@@ -960,7 +1105,7 @@ mod tests {
                 use core::future::Future;
                 let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
                 for failure in [None, Some("TUN interface closed")] {
-                    let network = Offline(Cell::new(0));
+                    let network = Offline(Cell::new(0), RefCell::new(std::vec::Vec::new()));
                     let state = MemoryState::default();
                     let config = config();
                     let mut node = restore::<_, _, 1>(&config, &network, &state).unwrap();
@@ -1020,7 +1165,7 @@ mod tests {
 
     #[test]
     fn identity_authority_and_custom_ca_are_checked_before_any_write() {
-        let network = Offline(Default::default());
+        let network = Offline(Default::default(), RefCell::new(std::vec::Vec::new()));
         let state = MemoryState::default();
         let mut node = restore::<_, _, 1>(&config(), &network, &state).unwrap();
         let mut other = config();

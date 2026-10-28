@@ -53,10 +53,18 @@ async fn exchange<'a, C: Clock, B: PacketQueue<8>>(
                 .connect(&clock, "100.64.0.2".parse().unwrap(), 2222, 49152)
                 .await
                 .unwrap();
+            assert_eq!(
+                stream.remote_endpoint(),
+                Some("100.64.0.2:2222".parse().unwrap())
+            );
             let send = async {
                 let mut writer = &stream;
                 writer.write_all(&[42; 8192]).await.unwrap();
                 stream.shutdown().unwrap();
+                assert_eq!(
+                    stream.remote_endpoint(),
+                    Some("100.64.0.2:2222".parse().unwrap())
+                );
             };
             let receive = async {
                 let mut reader = &stream;
@@ -76,6 +84,10 @@ async fn exchange<'a, C: Clock, B: PacketQueue<8>>(
         };
         let server = async {
             let mut stream = listener.accept().await.unwrap();
+            assert_eq!(
+                stream.remote_endpoint(),
+                Some("100.64.0.1:49152".parse().unwrap())
+            );
             let mut count = 0;
             let mut buffer = [0; 333];
             loop {

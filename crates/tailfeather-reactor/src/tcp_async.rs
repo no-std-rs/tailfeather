@@ -356,6 +356,12 @@ pub struct Stream<'r, 'a, const N: usize, const Q: usize, B: PacketQueue<Q>> {
 }
 
 impl<const N: usize, const Q: usize, B: PacketQueue<Q>> Stream<'_, '_, N, Q, B> {
+    /// The peer's inner TCP endpoint. A write-side half-close
+    /// retains it; a reset, removed socket or revoked local address returns None.
+    pub fn remote_endpoint(&self) -> Option<core::net::SocketAddrV4> {
+        self.tcp.stack.borrow().remote_endpoint(self.handle)
+    }
+
     /// Close only the write direction, preserving responses from the peer.
     pub fn shutdown(&self) -> Result<(), Error> {
         self.tcp

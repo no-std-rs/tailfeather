@@ -10,6 +10,9 @@ exports_files([
 
 FIRST_PARTY_RUST_TARGETS = [
     "//crates/tailfeather:tailfeather",
+    "//crates/tailfeather-reactor:tailfeather_reactor",
+    "//crates/tailfeather-reactor:tailfeather_reactor_portable",
+    "//crates/tailfeather-reactor:throughput",
     "//crates/tailfeather-gateway:tailfeather_gateway",
     "//crates/tailfeather-ssh:tailfeather_ssh",
     "//crates/tailfeather-ssh:footprint",
@@ -24,6 +27,7 @@ FIRST_PARTY_RUST_TARGETS = [
 ]
 
 INTEGRATION_RUST_TEST_TARGETS = [
+    "//crates/tailfeather-reactor:tcp_parity_test",
     "//crates/tailfeather-testkit:fixtures_test",
     "//crates/tailfeather:netmap_capture_test",
     "//crates/tailfeather:noise_kat_test",
@@ -73,6 +77,8 @@ test_suite(
     name = "unit_tests",
     tests = [
         "//crates/tailfeather:unit_test",
+        "//crates/tailfeather-reactor:unit_test",
+        "//crates/tailfeather-reactor:tcp_parity_test",
         "//crates/tailfeather:netmap_capture_test",
         "//crates/tailfeather:noise_kat_test",
         "//crates/tailfeather:doc_test",

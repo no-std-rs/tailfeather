@@ -105,6 +105,20 @@ a DPDK driver.
 
 ## Verification and local throughput
 
+
+Local discovery calls `Network::visit_local_addresses` during enrollment and
+periodic endpoint refresh. A multihomed adapter should visit every up,
+non-point-to-point IPv4 interface, including LAN interfaces which do not carry
+its coordinator connection. The default implementation retains
+`interface_address` for single-interface adapters. All candidates use the bound
+UDP data port; the runtime reserves half of its eight advertised endpoints for
+STUN and excludes loopback, multicast and overlay addresses from LAN candidates.
+Active userspace TCP peers receive bounded, round-robin discovery probes ahead
+of unrelated control-plane peers. Packet devices without a socket inventory
+retain global discovery, and idle actors continue to sleep between maintenance
+rounds.
+
+
 ```sh
 cargo test --locked --features std,embassy,accelerated-crypto
 cargo test --locked --no-default-features --features embassy
@@ -134,16 +148,18 @@ Timings exclude connection/handshake setup and include both endpoints on one
 worker. It prints three JSON samples after warmup and checks received length
 and checksum.
 
+The declared Bazel targets run the shared runtime regressions and the same
+optimized benchmark with both fixed and owned TCP storage:
+
 ```sh
-cargo bench --locked --no-default-features --features embassy --bench throughput -- --buffers fixed
-cargo bench --locked --no-default-features --features embassy,accelerated-crypto --bench throughput -- --buffers fixed
-cargo bench --locked --features std,embassy,accelerated-crypto --bench throughput -- --buffers owned
+bazel test //crates/tailfeather-reactor:unit_test //crates/tailfeather-reactor:tcp_parity_test
+bazel run --config=optimized //crates/tailfeather-reactor:throughput -- --buffers fixed --mesh
+bazel run --config=optimized //crates/tailfeather-reactor:throughput -- --buffers owned --mesh
 ```
 
-Add `--mesh` to any command to measure the full runtime. To build and measure
-all six buffer/feature combinations sequentially and save the samples plus CPU
-and compiler metadata, run `python3 tools/benchmark.py --output results.json`
-from this crate. On Linux, `--cpu N` pins each measurement to one CPU.
+Omit `--mesh` to measure TCP with and without WireGuard. These Bazel products
+use the Tokio clock and accelerated cryptography. On Linux, run the built
+benchmark under `taskset -c N` to pin both endpoint actors to one CPU.
 
 Compare payload Gbit/s, packet rate, and the active provider. Packet-rate figures
 include ACKs; packet-byte figures include inner headers and WireGuard padding/tags.
