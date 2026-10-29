@@ -687,9 +687,11 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                         );
                         discovery_cursor = (index + 1) % active.len();
                     }
-                    // Packet devices such as TUN have no socket inventory.
-                    // Preserve discovery for those adapters and idle servers.
-                    if active.is_empty() {
+                    // A passive peer's authenticated rendezvous can precede
+                    // its first TCP SYN. Keep background discovery progressing
+                    // after active peers, within the same bounded probe budget.
+                    // This also serves devices such as TUN with no inventory.
+                    if self.actions.borrow().len() < A.div_ceil(2) {
                         self.enqueue(
                             self.node
                                 .borrow_mut()
@@ -931,6 +933,131 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_passive_rendezvous_is_probed_while_another_peer_stays_active() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                use core::future::Future;
+                use tailfeather::{
+                    DerpEvent,
+                    disco::{CallMeMaybe, Message},
+                    keys::{DiscoPrivate, Identity, NodePrivate},
+                    netmap::{Cidr, Cidr4, Netmap, Peer},
+                };
+                let network = Offline(Cell::new(0), RefCell::new(std::vec::Vec::new()));
+                let state = MemoryState::default();
+                let mut config = config();
+                config.relay_only = false;
+                let authority = Authority::parse(config.control_url, false)
+                    .unwrap()
+                    .digest();
+                let mut node = std::boxed::Box::new(Node::<2>::factory_reset_for_authority(
+                    Identity::generate(&mut crate::native::OsRng),
+                    1,
+                    authority,
+                ));
+                let generation = match node.poll(0).unwrap().unwrap() {
+                    NodeAction::PersistState(state) => state.generation(),
+                    _ => unreachable!(),
+                };
+                node.persistence_result(generation, true).unwrap();
+                let passive_key = NodePrivate::from_bytes([1; 32]).public();
+                let passive_disco = DiscoPrivate::from_bytes([17; 32]);
+                let active_endpoint = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 2), 41641);
+                let passive_endpoint = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 50123);
+                let mut map = Netmap::<2>::new();
+                map.addresses
+                    .push(Cidr::parse("100.64.0.1/32").unwrap())
+                    .unwrap();
+                for index in 1..=2u8 {
+                    let mut peer = Peer::new(
+                        u64::from(index),
+                        NodePrivate::from_bytes([index; 32]).public(),
+                    );
+                    peer.disco_key = Some(DiscoPrivate::from_bytes([index + 16; 32]).public());
+                    let address = Cidr4::from_cidr(
+                        Cidr::parse(&std::format!("100.64.0.{}/32", index + 1)).unwrap(),
+                    )
+                    .unwrap();
+                    peer.addresses.push(address).unwrap();
+                    peer.allowed_ips.push(address).unwrap();
+                    if index == 2 {
+                        peer.endpoints.push(active_endpoint).unwrap();
+                    }
+                    map.peers.upsert(peer).unwrap();
+                }
+                node.handle_control_event(ControlEvent::MapFinished {
+                    lease: &mut map,
+                    result: Ok(()),
+                })
+                .unwrap();
+                // The passive peer has no control-plane endpoint. Its only
+                // candidate comes from this authenticated, node-bound DERP CMM.
+                let mut endpoints = Vec::new();
+                endpoints.push(passive_endpoint.into()).unwrap();
+                let message = Message::CallMeMaybe(CallMeMaybe { endpoints });
+                let mut plaintext = [0; tailfeather::disco::MAX_PACKET];
+                let len = message.encode(&mut plaintext).unwrap();
+                let mut packet = [0; tailfeather::disco::MAX_PACKET];
+                let len = tailfeather::disco::seal(
+                    &passive_disco,
+                    &passive_disco.public(),
+                    &node.identity().disco.public(),
+                    &plaintext[..len],
+                    &mut network.rng(),
+                    &mut packet,
+                )
+                .unwrap();
+                assert!(
+                    node.handle_derp_event(
+                        DerpEvent::Packet {
+                            region: 9,
+                            peer: passive_key,
+                            payload: &packet[..len],
+                        },
+                        0,
+                        &mut network.rng(),
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+                let runtime =
+                    Runtime::<_, _, 2, 2>::new(config, &mut node, &network, &state).unwrap();
+                // The other peer remains in the TCP inventory for every poll;
+                // an inbound-only peer cannot appear there before its SYN.
+                let device = ActiveDevice(std::vec![Ipv4Addr::new(100, 64, 0, 3)]);
+                let reactor = Reactor::with_clock(&network);
+                let mut packets = std::boxed::Box::pin(runtime.packets(&device, &reactor));
+                let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+                for tick in 0..=2 {
+                    network.0.set(tick * 100);
+                    for _ in 0..3 {
+                        assert!(packets.as_mut().poll(&mut cx).is_pending());
+                    }
+                }
+                assert_eq!(network.1.borrow().first(), Some(&active_endpoint));
+                assert!(
+                    network.1.borrow().contains(&passive_endpoint),
+                    "authenticated passive rendezvous must progress within two maintenance rounds while another TCP peer stays active: {:?}",
+                    network.1.borrow()
+                );
+                for tick in 3..=40 {
+                    network.0.set(tick * 100);
+                    for _ in 0..3 {
+                        assert!(packets.as_mut().poll(&mut cx).is_pending());
+                    }
+                }
+                let sent = network.1.borrow();
+                assert_eq!(sent.iter().filter(|to| **to == active_endpoint).count(), 3);
+                assert_eq!(sent.iter().filter(|to| **to == passive_endpoint).count(), 3);
+                assert!(!runtime.overflow.get(), "discovery must retain bounded queues");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn active_peers_are_probed_before_unrelated_nodes_with_bounded_queue_fairness() {
         std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
@@ -1000,8 +1127,8 @@ mod tests {
                 let sent = network.1.borrow();
                 assert!(!sent.is_empty());
                 assert!(
-                    sent.iter().all(|to| to.ip().octets()[3] >= 10),
-                    "inactive earlier peers must not consume the probe budget: {sent:?}"
+                    sent.iter().take(7).all(|to| to.ip().octets()[3] >= 10),
+                    "every due active peer must precede background discovery: {sent:?}"
                 );
                 for index in 10..=16 {
                     assert!(
