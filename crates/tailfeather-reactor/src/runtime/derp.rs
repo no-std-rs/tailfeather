@@ -16,6 +16,10 @@ pub(super) struct Slot<const A: usize> {
     stopped: Signal<NoopRawMutex, ()>,
 }
 impl<const A: usize> Slot<A> {
+    #[cfg(all(test, feature = "std"))]
+    pub(super) fn pop_for_test(&self) -> Option<DerpCommand> {
+        self.queue.borrow_mut().pop_front()
+    }
     pub const fn new() -> Self {
         Self {
             region: Cell::new(None),
@@ -25,6 +29,22 @@ impl<const A: usize> Slot<A> {
             stopped: Signal::new(),
         }
     }
+}
+
+// Called synchronously before removing a packet action. A full relay must not
+// rotate its older sends behind later packets while waiting for its writer.
+pub(super) fn ready<P: Network, S: State, const PEERS: usize, const A: usize>(
+    runtime: &Runtime<'_, P, S, PEERS, A>,
+    command: &DerpCommand,
+) -> bool {
+    let DerpCommand::Send { region, .. } = command else {
+        return true;
+    };
+    runtime
+        .slots
+        .iter()
+        .find(|slot| slot.region.get() == Some(*region))
+        .is_none_or(|slot| !slot.queue.borrow().is_full())
 }
 
 pub(super) fn dispatch<P: Network, S: State, const PEERS: usize, const A: usize>(

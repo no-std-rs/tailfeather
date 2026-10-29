@@ -497,7 +497,13 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
         }
     }
     fn pop(&self) -> Option<NodeAction> {
-        let result = self.actions.borrow_mut().pop();
+        let result = self
+            .actions
+            .borrow_mut()
+            .pop_packet_if(|action| match action {
+                NodeAction::Derp(command) => derp::ready(self, command),
+                _ => true,
+            });
         self.space.sender().send(self.network.now_millis());
         result
     }
@@ -1309,5 +1315,239 @@ mod tests {
         ));
         assert_eq!(state.identities.get(), 0);
         assert_eq!(state.timestamps.get(), 0);
+    }
+    #[test]
+    fn blocked_relay_queue_retains_packet_order_after_space_returns() {
+        use core::future::Future;
+        use tailfeather::{keys::NodePrivate, node::SecretBuffer};
+        let network = Offline(Cell::new(0), RefCell::new(std::vec::Vec::new()));
+        let state = MemoryState::default();
+        let mut node = restore::<_, _, 1>(&config(), &network, &state).unwrap();
+        // This is the application's actual action/relay queue capacity.
+        let runtime = Runtime::<_, _, 1, 32>::new(config(), &mut node, &network, &state).unwrap();
+        let peer = NodePrivate::from_bytes([7; 32]).public();
+        let command = |sequence: u8| DerpCommand::Send {
+            region: 999,
+            peer,
+            packet: SecretBuffer::try_from_slice(&[sequence]).unwrap(),
+        };
+        assert!(
+            derp::dispatch(
+                &runtime,
+                DerpCommand::Connect {
+                    region: 999,
+                    endpoint: tailfeather::Endpoint::new("relay.invalid", 443).unwrap(),
+                }
+            )
+            .is_none()
+        );
+        for _ in 1..32 {
+            assert!(derp::dispatch(&runtime, command(255)).is_none());
+        }
+        for sequence in 0..3 {
+            runtime.enqueue(Some(NodeAction::Derp(command(sequence))));
+        }
+        let device = ActiveDevice(std::vec![]);
+        let reactor = Reactor::with_clock(&network);
+        let mut packets = std::boxed::Box::pin(runtime.packets(&device, &reactor));
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert!(packets.as_mut().poll(&mut cx).is_pending());
+        // The relay writer now drains its existing burst. No network, TLS,
+        // packet loss, wall-clock timeout, or bigger stack is involved.
+        for _ in 0..32 {
+            assert!(runtime.slots[0].pop_for_test().is_some());
+        }
+        runtime.ready.signal(());
+        assert!(packets.as_mut().poll(&mut cx).is_pending());
+        let mut actual = std::vec::Vec::new();
+        while let Some(command) = runtime.slots[0].pop_for_test() {
+            if let DerpCommand::Send { packet, .. } = command {
+                actual.push(packet.as_slice()[0]);
+            }
+        }
+        assert_eq!(
+            actual,
+            [0, 1, 2],
+            "relay backpressure must preserve the original packet order"
+        );
+    }
+
+    #[test]
+    fn a_full_relay_does_not_block_other_regions_udp_or_authenticated_delivery() {
+        use core::future::Future;
+        use tailfeather::{
+            keys::NodePrivate,
+            netmap::{Cidr, Cidr4, Netmap, Peer},
+            node::SecretBuffer,
+        };
+        let network = Offline(Cell::new(0), RefCell::new(std::vec::Vec::new()));
+        let state = MemoryState::default();
+        let mut node = restore::<_, _, 1>(&config(), &network, &state).unwrap();
+        let generation = match node.poll(0).unwrap().unwrap() {
+            NodeAction::PersistState(state) => state.generation(),
+            _ => unreachable!(),
+        };
+        node.persistence_result(generation, true).unwrap();
+        let peer = NodePrivate::from_bytes([7; 32]).public();
+        let mut map = Netmap::<1>::new();
+        map.addresses
+            .push(Cidr::parse("100.64.0.1/32").unwrap())
+            .unwrap();
+        let mut entry = Peer::new(1, peer);
+        let peer_address = Cidr4::from_cidr(Cidr::parse("100.64.0.2/32").unwrap()).unwrap();
+        entry.addresses.push(peer_address).unwrap();
+        entry.allowed_ips.push(peer_address).unwrap();
+        map.peers.upsert(entry).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut map,
+            result: Ok(()),
+        })
+        .unwrap();
+        let runtime = Runtime::<_, _, 1, 32>::new(config(), &mut node, &network, &state).unwrap();
+        let command = |region, sequence: u8| DerpCommand::Send {
+            region,
+            peer,
+            packet: SecretBuffer::try_from_slice(&[sequence]).unwrap(),
+        };
+        for region in [999, 1000] {
+            assert!(
+                derp::dispatch(
+                    &runtime,
+                    DerpCommand::Connect {
+                        region,
+                        endpoint: tailfeather::Endpoint::new("relay.invalid", 443).unwrap(),
+                    }
+                )
+                .is_none()
+            );
+        }
+        for _ in 1..32 {
+            assert!(derp::dispatch(&runtime, command(999, 255)).is_none());
+        }
+        let udp = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 41641);
+        runtime.enqueue(Some(NodeAction::Derp(command(999, 0))));
+        runtime.enqueue(Some(NodeAction::Derp(command(1000, 10))));
+        runtime.enqueue(Some(NodeAction::Derp(command(999, 1))));
+        runtime.enqueue(Some(NodeAction::DirectTransmit {
+            peer,
+            endpoint: udp.into(),
+            packet: SecretBuffer::try_from_slice(&tailfeather::disco::MAGIC).unwrap(),
+        }));
+        let mut inner = [0u8; 40];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&40u16.to_be_bytes());
+        inner[9] = 6;
+        inner[12..16].copy_from_slice(&[100, 64, 0, 2]);
+        inner[16..20].copy_from_slice(&[100, 64, 0, 1]);
+        inner[32] = 0x50;
+        inner[33] = 0x10;
+        runtime.enqueue(Some(NodeAction::DeliveredIpv4 {
+            peer,
+            packet: SecretBuffer::try_from_slice(&inner).unwrap(),
+        }));
+        runtime.enqueue(Some(NodeAction::Derp(command(1000, 11))));
+        let device = ActiveDevice(std::vec![]);
+        let reactor = Reactor::with_clock(&network);
+        let mut packets = std::boxed::Box::pin(runtime.packets(&device, &reactor));
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert!(packets.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(&*network.1.borrow(), &[udp]);
+        assert_eq!(runtime.delivered.try_receive().unwrap().as_slice(), &inner);
+        let mut other_region = std::vec::Vec::new();
+        while let Some(command) = runtime.slots[1].pop_for_test() {
+            if let DerpCommand::Send { packet, .. } = command {
+                other_region.push(packet.as_slice()[0]);
+            }
+        }
+        assert_eq!(other_region, [10, 11]);
+        assert_eq!(runtime.actions.borrow().len(), 2);
+        // A second poll with no relay space still returns Pending and retains
+        // the blocked actions. A new arrival goes behind those older sends.
+        assert!(packets.as_mut().poll(&mut cx).is_pending());
+        runtime.enqueue(Some(NodeAction::Derp(command(999, 2))));
+        for _ in 0..32 {
+            assert!(runtime.slots[0].pop_for_test().is_some());
+        }
+        runtime.ready.signal(());
+        assert!(packets.as_mut().poll(&mut cx).is_pending());
+        let mut first_region = std::vec::Vec::new();
+        while let Some(command) = runtime.slots[0].pop_for_test() {
+            if let DerpCommand::Send { packet, .. } = command {
+                first_region.push(packet.as_slice()[0]);
+            }
+        }
+        assert_eq!(first_region, [0, 1, 2]);
+        assert!(!runtime.overflow.get());
+        // Disconnect remains stateful and immediately selectable even if its
+        // relay is full; missing-region sends also retain normal handling.
+        for _ in 0..32 {
+            assert!(derp::dispatch(&runtime, command(999, 255)).is_none());
+        }
+        runtime.enqueue(Some(NodeAction::Derp(command(999, 3))));
+        runtime.enqueue(Some(NodeAction::Derp(DerpCommand::Disconnect {
+            region: 999,
+        })));
+        assert!(matches!(
+            runtime.pop(),
+            Some(NodeAction::Derp(DerpCommand::Disconnect { region: 999 }))
+        ));
+        assert!(derp::ready(&runtime, &command(1234, 0)));
+    }
+    #[test]
+    fn two_blocked_relays_resume_independently_without_reordering_either_region() {
+        use core::future::Future;
+        use tailfeather::{keys::NodePrivate, node::SecretBuffer};
+        let network = Offline(Cell::new(0), RefCell::new(std::vec::Vec::new()));
+        let state = MemoryState::default();
+        let mut node = restore::<_, _, 1>(&config(), &network, &state).unwrap();
+        let runtime = Runtime::<_, _, 1, 32>::new(config(), &mut node, &network, &state).unwrap();
+        let peer = NodePrivate::from_bytes([7; 32]).public();
+        let command = |region, sequence: u8| DerpCommand::Send {
+            region,
+            peer,
+            packet: SecretBuffer::try_from_slice(&[sequence]).unwrap(),
+        };
+        for region in [999, 1000] {
+            assert!(
+                derp::dispatch(
+                    &runtime,
+                    DerpCommand::Connect {
+                        region,
+                        endpoint: tailfeather::Endpoint::new("relay.invalid", 443).unwrap(),
+                    }
+                )
+                .is_none()
+            );
+            for _ in 1..32 {
+                assert!(derp::dispatch(&runtime, command(region, 255)).is_none());
+            }
+        }
+        for sequence in 0..3 {
+            for region in [999, 1000] {
+                runtime.enqueue(Some(NodeAction::Derp(command(region, sequence))));
+            }
+        }
+        let device = ActiveDevice(std::vec![]);
+        let reactor = Reactor::with_clock(&network);
+        let mut packets = std::boxed::Box::pin(runtime.packets(&device, &reactor));
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert!(packets.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(runtime.actions.borrow().len(), 6);
+        for slot_index in [1, 0] {
+            for _ in 0..32 {
+                assert!(runtime.slots[slot_index].pop_for_test().is_some());
+            }
+            runtime.ready.signal(());
+            assert!(packets.as_mut().poll(&mut cx).is_pending());
+            let mut actual = std::vec::Vec::new();
+            while let Some(command) = runtime.slots[slot_index].pop_for_test() {
+                if let DerpCommand::Send { packet, .. } = command {
+                    actual.push(packet.as_slice()[0]);
+                }
+            }
+            assert_eq!(actual, [0, 1, 2]);
+        }
+        assert!(runtime.actions.borrow().is_empty());
+        assert!(!runtime.overflow.get());
     }
 }
