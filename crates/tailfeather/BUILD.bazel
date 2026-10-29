@@ -93,6 +93,24 @@ rust_test(
     tags = ["no-remote"],
 )
 
+# Match the bounded policy/address-name layout used by native fleet consumers.
+# The filter runs the lease regressions with that layout without duplicating
+# the entire default suite.
+rust_test(
+    name = "map_lease_hosted_test",
+    args = ["map_lease_", "--nocapture", "--test-threads=1"],
+    aliases = aliases(),
+    crate = ":tailfeather",
+    crate_features = ["fast-curve25519", "hosted-policy", "peer-names"],
+    compile_data = [
+        "src/unicode_normalization/CaseFolding-17.0.0.txt",
+        "//tests/vectors:vectors",
+    ],
+    deps = all_crate_deps(normal_dev = True),
+    env = {"PATH": "/usr/bin:/bin"},
+    tags = ["no-remote"],
+)
+
 [
     rust_test(
         name = name + "_test",

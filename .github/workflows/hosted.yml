@@ -28,6 +28,9 @@ jobs:
       - if: runner.os == 'Linux'
         run: cargo test --locked -p tailfeather control::register
       - if: runner.os == 'Linux'
+        name: Streaming map leases with native policy and name capacities
+        run: cargo test --locked -p tailfeather --no-default-features --features fast-curve25519,hosted-policy,peer-names map_lease_ -- --nocapture --test-threads=1
+      - if: runner.os == 'Linux'
         run: cargo test --locked -p wirefeather --features accelerated-crypto
       - if: runner.os == 'Linux'
         name: Complete runtime benchmark smoke with owned buffers

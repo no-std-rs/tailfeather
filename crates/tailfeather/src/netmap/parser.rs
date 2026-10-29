@@ -353,6 +353,8 @@ struct State {
     /// The self record in progress named its home region numerically, which
     /// outranks the legacy `DERP` string whatever the member order.
     self_numeric_derp: bool,
+    /// This response explicitly replaced the self home, including legacy DERP.
+    self_home_derp_set: bool,
     pending: Pending,
     /// The first peer that overflowed before a snapshot identified its self
     /// key. It can fill the slot released when that delayed self record is
@@ -458,7 +460,10 @@ impl State {
     fn on_start<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
         let context = self.child_context();
         match context {
-            Context::Root => self.self_routes_seen = false,
+            Context::Root => {
+                self.self_routes_seen = false;
+                self.self_home_derp_set = false;
+            }
             Context::SelfNode => self.self_numeric_derp = false,
             Context::PeerObject | Context::PatchObject => self.pending.reset(),
             Context::PeerArray => {
@@ -805,6 +810,7 @@ impl State {
                 "DERP" if !self.self_numeric_derp => {
                     if let Some(region) = legacy_derp_region(value) {
                         netmap.home_derp = region;
+                        self.self_home_derp_set = true;
                     }
                 }
                 #[cfg(feature = "peer-names")]
@@ -971,6 +977,7 @@ impl State {
                     Ok(region) => {
                         netmap.home_derp = region;
                         self.self_numeric_derp = true;
+                        self.self_home_derp_set = true;
                     }
                     Err(_) => self.fail(Error::MalformedField(MalformedField::HomeDerp)),
                 }
@@ -1216,6 +1223,7 @@ impl<const PEERS: usize> Parser<PEERS> {
                 key_oversized: false,
                 self_routes_seen: false,
                 self_numeric_derp: false,
+                self_home_derp_set: false,
                 pending: Pending::new(),
                 deferred_peer: None,
                 region: PendingRegion::new(),
@@ -1234,6 +1242,7 @@ impl<const PEERS: usize> Parser<PEERS> {
         self.state.key_oversized = false;
         self.state.self_routes_seen = false;
         self.state.self_numeric_derp = false;
+        self.state.self_home_derp_set = false;
         self.state.pending.reset();
         self.state.deferred_peer = None;
         self.state.region = PendingRegion::new();
@@ -1257,6 +1266,12 @@ impl<const PEERS: usize> Parser<PEERS> {
     /// Whether the document has been closed.
     pub fn is_done(&self) -> bool {
         self.scanner.is_done()
+    }
+
+    /// Whether this response supplied a valid explicit self home. Transport
+    /// staging can otherwise inherit a newer local choice made mid-document.
+    pub(crate) fn sets_home_derp(&self) -> bool {
+        self.state.self_home_derp_set
     }
 
     /// Finish one response, reporting the first error if there was one.
