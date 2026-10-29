@@ -1846,6 +1846,33 @@ mod tests {
         }
     }
 
+    // Native policy storage is deliberately large even for a two-peer map.
+    // Keep fixture values behind separate heap boundaries so debug builds do
+    // not reserve several complete map temporaries in one test entry frame.
+    #[inline(never)]
+    fn lease_netmap<const PEERS: usize>() -> std::boxed::Box<Netmap<PEERS>> {
+        std::boxed::Box::new(Netmap::new())
+    }
+
+    #[inline(never)]
+    fn lease_empty_map<const PEERS: usize>() -> std::boxed::Box<MapStream<PEERS>> {
+        std::boxed::Box::new(MapStream::new())
+    }
+
+    fn lease_stream<const PEERS: usize>(
+        http: &mut Http2<Scripted>,
+    ) -> std::boxed::Box<MapStream<PEERS>> {
+        let mut map = lease_empty_map();
+        block_on(MapStream::start_in(
+            &mut map,
+            http,
+            "control.example",
+            b"{}",
+        ))
+        .unwrap();
+        map
+    }
+
     fn lease_peer_response(id: u64, endpoint: &str) -> std::string::String {
         std::format!(
             "{{\"PeersChanged\":[{{\"ID\":{id},\"Key\":\"nodekey:{}\",\"Endpoints\":[\"{endpoint}\"]}}],\"KeepAlive\":false}}",
@@ -1938,9 +1965,8 @@ mod tests {
                 lease_headers(3, true),
             ]);
             http.stream.pause_at_end = true;
-            let mut map =
-                block_on(MapStream::<2>::start(&mut http, "control.example", b"{}")).unwrap();
-            let mut staging = Netmap::<2>::new();
+            let mut map = lease_stream::<2>(&mut http);
+            let mut staging = lease_netmap::<2>();
             block_on(send_endpoint_update(
                 &mut http,
                 &mut map,
@@ -1989,9 +2015,9 @@ mod tests {
         ];
         let mut http = lease_http(&frames);
         lease_available_frames(&mut http, &frames, 3);
-        let mut map = block_on(MapStream::<2>::start(&mut http, "control.example", b"{}")).unwrap();
-        let mut active = Netmap::<2>::new();
-        let mut staging = Netmap::<2>::new();
+        let mut map = lease_stream::<2>(&mut http);
+        let mut active = lease_netmap::<2>();
+        let mut staging = lease_netmap::<2>();
         block_on(send_endpoint_update(
             &mut http,
             &mut map,
@@ -2026,8 +2052,15 @@ mod tests {
     }
 
     #[inline(never)]
-    fn lease_new_map256() -> MapStream<256> {
-        MapStream::new()
+    fn lease_new_map256() -> std::boxed::Box<MapStream<256>> {
+        lease_empty_map()
+    }
+
+    #[inline(never)]
+    fn lease_owned_start_future_size() -> usize {
+        let mut http = lease_http(&[]);
+        let future = MapStream::<256>::start(&mut http, "control.example", b"{}");
+        core::mem::size_of_val(&future)
     }
 
     #[test]
@@ -2047,14 +2080,11 @@ mod tests {
                 cfg!(feature = "ssh-policy")
             );
         }
+        std::println!(
+            "map_lease_layout peers=256 start_future_bytes={}",
+            lease_owned_start_future_size()
+        );
         let mut http = lease_http(&[]);
-        {
-            let future = MapStream::<256>::start(&mut http, "control.example", b"{}");
-            std::println!(
-                "map_lease_layout peers=256 start_future_bytes={}",
-                size_of_val(&future)
-            );
-        }
         let mut place = std::hint::black_box(lease_new_map256());
         let reset = MapStream::start_in(&mut place, &mut http, "control.example", b"{}");
         std::println!(
@@ -2086,11 +2116,10 @@ mod tests {
                 lease_headers(3, true),
                 lease_data(&body[split..]),
             ]);
-            let mut map =
-                block_on(MapStream::<2>::start(&mut http, "control.example", b"{}")).unwrap();
-            let mut active = Netmap::<2>::new();
+            let mut map = lease_stream::<2>(&mut http);
+            let mut active = lease_netmap::<2>();
             active.home_derp = 17;
-            let mut staging = Netmap::<2>::new();
+            let mut staging = lease_netmap::<2>();
             staging.copy_from(&active);
             block_on(send_endpoint_update(
                 &mut http,
@@ -2132,8 +2161,8 @@ mod tests {
         // Permit one byte of the next encrypted record header, then pause.
         // Both the map parser and HTTP/Noise read now own incomplete progress.
         http.stream.available = http.stream.available.map(|limit| limit + 1);
-        let mut map = block_on(MapStream::<2>::start(&mut http, "control.example", b"{}")).unwrap();
-        let mut active = Netmap::<2>::new();
+        let mut map = lease_stream::<2>(&mut http);
+        let mut active = lease_netmap::<2>();
         active
             .peers
             .upsert(crate::netmap::Peer::new(
@@ -2141,7 +2170,7 @@ mod tests {
                 crate::keys::NodePublic::from_bytes([1; 32]),
             ))
             .unwrap();
-        let mut staging = Netmap::<2>::new();
+        let mut staging = lease_netmap::<2>();
         staging.copy_from(&active);
         {
             let mut next = core::pin::pin!(map.next(&mut http, &mut staging));
@@ -2180,9 +2209,9 @@ mod tests {
             lease_headers(3, true),
             lease_data(&[0; 4]),
         ]);
-        let mut map = block_on(MapStream::<2>::start(&mut http, "control.example", b"{}")).unwrap();
-        let mut active = Netmap::<2>::new();
-        let mut staging = Netmap::<2>::new();
+        let mut map = lease_stream::<2>(&mut http);
+        let mut active = lease_netmap::<2>();
+        let mut staging = lease_netmap::<2>();
         block_on(send_endpoint_update(
             &mut http,
             &mut map,
@@ -2221,9 +2250,9 @@ mod tests {
             lease_headers(3, true),
             lease_data(&body[4 + split..]),
         ]);
-        let mut map = block_on(MapStream::<2>::start(&mut http, "control.example", b"{}")).unwrap();
-        let active = Netmap::<2>::new();
-        let mut staging = Netmap::<2>::new();
+        let mut map = lease_stream::<2>(&mut http);
+        let active = lease_netmap::<2>();
+        let mut staging = lease_netmap::<2>();
         staging.copy_from(&active);
         block_on(send_endpoint_update(
             &mut http,
@@ -2265,9 +2294,9 @@ mod tests {
             lease_data(&body_b[4 + split..]),
             lease_data(&[0; 4]),
         ]);
-        let mut map = block_on(MapStream::<2>::start(&mut http, "control.example", b"{}")).unwrap();
-        let mut active = Netmap::<2>::new();
-        let mut staging = Netmap::<2>::new();
+        let mut map = lease_stream::<2>(&mut http);
+        let mut active = lease_netmap::<2>();
+        let mut staging = lease_netmap::<2>();
         staging.copy_from(&active);
         block_on(send_endpoint_update(
             &mut http,
@@ -2321,9 +2350,9 @@ mod tests {
             lease_data(&lease_map_bytes(&response)),
             lease_headers(3, true),
         ]);
-        let mut map = block_on(MapStream::<2>::start(&mut http, "control.example", b"{}")).unwrap();
-        let active = Netmap::<2>::new();
-        let mut staging = Netmap::<2>::new();
+        let mut map = lease_stream::<2>(&mut http);
+        let active = lease_netmap::<2>();
+        let mut staging = lease_netmap::<2>();
         block_on(send_endpoint_update(
             &mut http,
             &mut map,
