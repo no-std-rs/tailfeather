@@ -513,6 +513,7 @@ async fn control_session(
     .map_err(|_| "map start deadline")?
     .map_err(|_| "map start")?;
     let mut staging = tailfeather::netmap::Netmap::new();
+    let mut working = tailfeather::netmap::Netmap::new();
     // A reconnect may inherit a coordinator-side preference from the previous
     // stream. Unknown is distinct from explicitly advertising no home.
     let mut published_home = None;
@@ -523,12 +524,16 @@ async fn control_session(
         if !maps.has_pending_update() {
             node.borrow().seed_staging(&mut staging);
         }
-        let event =
-            match exec::select(maps.next(&mut http, &mut staging), reactor.sleep(90000)).await {
-                Either::First(Ok(event)) => event,
-                Either::First(Err(error)) => return Err(map_failure(error)),
-                _ => return Err("map timeout"),
-            };
+        let event = match exec::select(
+            maps.next(&mut http, &mut staging, &mut working),
+            reactor.sleep(90000),
+        )
+        .await
+        {
+            Either::First(Ok(event)) => event,
+            Either::First(Err(error)) => return Err(map_failure(error)),
+            _ => return Err("map timeout"),
+        };
         if matches!(event, MapEvent::Applied) {
             enqueue(
                 actions,
@@ -579,6 +584,7 @@ async fn control_session(
                         &mut http,
                         &mut maps,
                         &mut staging,
+                        &mut working,
                         &host,
                         request,
                     ),

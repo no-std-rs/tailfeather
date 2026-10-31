@@ -1,5 +1,6 @@
 use super::*;
 use core::fmt::Write as _;
+use core::{future::Future, pin::Pin, task::Poll};
 use heapless::String;
 use tailfeather::control::{
     Hostinfo, MapRequest, RegisterRequest, RegisterResponse,
@@ -55,6 +56,7 @@ pub(super) async fn run<P: Network, S: State, const PEERS: usize, const A: usize
     reactor: &Reactor<&P>,
     buffers: &mut LinkBuffers,
     staging: &mut tailfeather::netmap::Netmap<PEERS>,
+    working: &mut tailfeather::netmap::Netmap<PEERS>,
 ) -> Result<(), Error> {
     let authority =
         Authority::parse(runtime.config.control_url, false).map_err(|_| "HTTPS authority")?;
@@ -74,7 +76,7 @@ pub(super) async fn run<P: Network, S: State, const PEERS: usize, const A: usize
             reactor.sleep(100).await;
             continue;
         }
-        match session(runtime, reactor, &authority, buffers, staging).await {
+        match session(runtime, reactor, &authority, buffers, staging, working).await {
             Err(error @ ("registration rejected" | "netmap rejected")) => return Err(error),
             Err(_) => {
                 runtime
@@ -164,12 +166,94 @@ fn candidate_addresses(
     candidates
 }
 
+/// Keep the complete HTTP operation alive even when discovery finishes during
+/// a partial encrypted write. Only that operation can release its mutable
+/// transport/staging borrows; discovery completion is retained for a boundary.
+async fn drive_http<F: Future, D: Future>(
+    operation: F,
+    mut discovery: Pin<&mut D>,
+    completed: &mut Option<D::Output>,
+    discover: bool,
+) -> F::Output {
+    let mut operation = core::pin::pin!(operation);
+    core::future::poll_fn(|cx| {
+        if discover
+            && completed.is_none()
+            && let Poll::Ready(result) = discovery.as_mut().poll(cx)
+        {
+            *completed = Some(result);
+        }
+        operation.as_mut().poll(cx)
+    })
+    .await
+}
+
+fn validated_home<const PEERS: usize>(
+    map: &tailfeather::netmap::Netmap<PEERS>,
+    preferred: u16,
+) -> u16 {
+    if preferred != 0
+        && map
+            .derp
+            .region(preferred)
+            .is_some_and(|region| region.can_be_home())
+    {
+        preferred
+    } else {
+        tailfeather::stun::Selection::new(map).home()
+    }
+}
+
+struct ClearProbe<'a>(&'a RefCell<Option<Probe>>);
+
+impl Drop for ClearProbe<'_> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().take();
+    }
+}
+
+fn apply_map<P: Network, S: State, const PEERS: usize, const A: usize>(
+    runtime: &Runtime<'_, P, S, PEERS, A>,
+    staging: &mut tailfeather::netmap::Netmap<PEERS>,
+    event: MapEvent,
+) -> Result<(), Error> {
+    if matches!(event, MapEvent::Applied) {
+        runtime.enqueue(
+            runtime
+                .node
+                .borrow_mut()
+                .handle_control_event(ControlEvent::MapFinished {
+                    lease: staging,
+                    result: Ok(()),
+                })
+                .map_err(|_| "map state")?,
+        );
+        let address = runtime
+            .node
+            .borrow()
+            .netmap()
+            .addresses
+            .iter()
+            .find_map(|cidr| match cidr.address {
+                core::net::IpAddr::V4(address) => Some(address),
+                _ => None,
+            })
+            .ok_or("assigned IPv4")?;
+        runtime.publish_status(Status {
+            address: Some(address),
+            error: None,
+        });
+    }
+    Ok(())
+}
+
 async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
     runtime: &Runtime<'_, P, S, PEERS, A>,
     reactor: &Reactor<&P>,
     authority: &Authority,
     buffers: &mut LinkBuffers,
     staging: &mut tailfeather::netmap::Netmap<PEERS>,
+    working: &mut tailfeather::netmap::Netmap<PEERS>,
 ) -> Result<(), Error> {
     let config = &runtime.config;
     let mut host = String::<160>::new();
@@ -318,110 +402,129 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
     let request = request
         .write(&mut body[..])
         .map_err(|_| "map request size")?;
-    let mut maps = reactor
-        .timeout(30_000, MapStream::<PEERS>::start(&mut http, &host, request))
+    // Keep the map in the session's persistent storage. Returning the complete
+    // bounded map through start's future duplicates it in nested poll frames.
+    let mut maps = MapStream::<PEERS>::new();
+    reactor
+        .timeout(
+            30_000,
+            MapStream::start_in(&mut maps, &mut http, &host, request),
+        )
         .await
         .map_err(|_| "map start deadline")?
         .map_err(|_| "map start")?;
     let mut home = 0;
     let mut published_home = None;
     let mut published_generation = 0;
-    let mut discovery_at = 0;
+    let mut bootstrapped = false;
     loop {
-        if !maps.has_pending_update() {
-            runtime.node.borrow().seed_staging(staging);
-        }
-        let event = reactor
-            .timeout(90_000, maps.next(&mut http, staging))
+        // One sweep remains pinned across both map reads and endpoint writes.
+        // Its body is not polled until the initial map's fallback home/local
+        // endpoints have been published successfully.
+        let mut discovery = core::pin::pin!(async {
+            let measured = discover_home(runtime, reactor).await;
+            (measured, reactor.clock_millis())
+        });
+        let mut completed = None;
+        loop {
+            if !maps.has_pending_update() {
+                runtime.node.borrow().seed_staging(staging);
+            }
+            let event = drive_http(
+                reactor.timeout(90_000, maps.next(&mut http, staging, working)),
+                discovery.as_mut(),
+                &mut completed,
+                bootstrapped,
+            )
             .await
             .map_err(|_| "map timeout")?
             .map_err(map_error)?;
-        if matches!(event, MapEvent::Applied) {
-            runtime.enqueue(
+            apply_map(runtime, staging, event)?;
+            if maps.has_pending_update() {
+                // A queued keepalive can precede an already parsed Applied
+                // event. Consume it before selecting/publishing from the old
+                // active map, preserving the uncommitted staging lease.
+                crate::exec::yield_now().await;
+                continue;
+            }
+            if !bootstrapped && !matches!(event, MapEvent::Applied) {
+                crate::exec::yield_now().await;
+                continue;
+            }
+
+            loop {
+                // A sweep can finish against a map that has since changed. Never
+                // select a removed/ineligible home, including a stale fallback.
+                let measured = completed.as_ref().map_or(home, |(measured, _)| *measured);
+                home = validated_home(runtime.node.borrow().netmap(), measured);
                 runtime
                     .node
                     .borrow_mut()
-                    .handle_control_event(ControlEvent::MapFinished {
-                        lease: staging,
-                        result: Ok(()),
-                    })
-                    .map_err(|_| "map state")?,
-            );
-            let address = runtime
-                .node
-                .borrow()
-                .netmap()
-                .addresses
-                .iter()
-                .find_map(|cidr| match cidr.address {
-                    core::net::IpAddr::V4(address) => Some(address),
-                    _ => None,
-                })
-                .ok_or("assigned IPv4")?;
-            runtime.publish_status(Status {
-                address: Some(address),
-                error: None,
-            });
-        }
-        let discover = reactor.clock_millis() >= discovery_at;
-        if matches!(event, MapEvent::Applied) || discover {
-            if home != 0
-                && runtime
-                    .node
-                    .borrow()
-                    .netmap()
-                    .derp
-                    .region(home)
-                    .is_none_or(|region| !region.can_be_home())
-            {
-                home = 0;
-            }
-            if home == 0 || discover {
-                home = discover_home(runtime, reactor).await;
-            }
-            runtime
-                .node
-                .borrow_mut()
-                .prefer_derp(home)
-                .map_err(|_| "home relay")?;
-            if discover {
-                discovery_at = reactor.clock_millis().saturating_add(30_000);
-            }
-            let generation = runtime.candidate_generation.get();
-            if published_home != Some(home) || published_generation != generation {
-                let texts = endpoints(runtime);
-                let refs: Vec<&str, 8> = texts.iter().map(|text| text.as_str()).collect();
-                let request = MapRequest {
-                    version: tailfeather::control::CAPABILITY_VERSION,
-                    node_key: &public,
-                    disco_key: &disco,
-                    hostinfo: hostinfo(config, home, home == 0),
-                    stream: false,
-                    omit_peers: true,
-                    read_only: false,
-                    endpoints: &refs,
-                };
-                let request = request
-                    .write(&mut body[..])
-                    .map_err(|_| "endpoint request size")?;
-                if !maps.has_pending_update() {
-                    runtime.node.borrow().seed_staging(staging);
-                }
-                reactor
-                    .timeout(
-                        30_000,
-                        transport::send_endpoint_update(
-                            &mut http, &mut maps, staging, &host, request,
+                    .prefer_derp(home)
+                    .map_err(|_| "home relay")?;
+                let generation = runtime.candidate_generation.get();
+                if published_home != Some(home) || published_generation != generation {
+                    let texts = endpoints(runtime);
+                    let refs: Vec<&str, 8> = texts.iter().map(|text| text.as_str()).collect();
+                    let request = MapRequest {
+                        version: tailfeather::control::CAPABILITY_VERSION,
+                        node_key: &public,
+                        disco_key: &disco,
+                        hostinfo: hostinfo(config, home, home == 0),
+                        stream: false,
+                        omit_peers: true,
+                        read_only: false,
+                        endpoints: &refs,
+                    };
+                    let request = request
+                        .write(&mut body[..])
+                        .map_err(|_| "endpoint request size")?;
+                    if !maps.has_pending_update() {
+                        runtime.node.borrow().seed_staging(staging);
+                    }
+                    let was_complete = completed.is_some();
+                    drive_http(
+                        reactor.timeout(
+                            30_000,
+                            transport::send_endpoint_update(
+                                &mut http, &mut maps, staging, working, &host, request,
+                            ),
                         ),
+                        discovery.as_mut(),
+                        &mut completed,
+                        bootstrapped,
                     )
                     .await
                     .map_err(|_| "endpoint update deadline")?
                     .map_err(map_error)?;
-                published_home = Some(home);
-                published_generation = generation;
+                    // Discovery may have changed candidates while the old snapshot
+                    // was being sent. Acknowledge only the generation actually sent.
+                    published_home = Some(home);
+                    published_generation = generation;
+                    // The transport is free here. If discovery finished during this
+                    // write, publish its now-known snapshot before parking another
+                    // map read, unless the update already queued a newer map.
+                    // Only one Pending -> Complete transition exists per sweep, so
+                    // at most one additional publication is made at this boundary.
+                    if !was_complete && completed.is_some() && !maps.has_pending_update() {
+                        bootstrapped = true;
+                        continue;
+                    }
+                }
+                bootstrapped = true;
+                break;
             }
+            if completed
+                .as_ref()
+                .is_some_and(|(_, at)| reactor.clock_millis() >= at.saturating_add(30_000))
+            {
+                break;
+            }
+            // Completion during a quiet pending map read does not cancel that
+            // read to publish new endpoints. Publication waits for an HTTP/map
+            // boundary (or the existing deadline abandons the whole session).
+            crate::exec::yield_now().await;
         }
-        crate::exec::yield_now().await;
     }
 }
 
@@ -429,6 +532,7 @@ async fn discover_home<P: Network, S: State, const PEERS: usize, const A: usize>
     runtime: &Runtime<'_, P, S, PEERS, A>,
     reactor: &Reactor<&P>,
 ) -> u16 {
+    let _clear_probe = ClearProbe(&runtime.probe);
     let mut selection = tailfeather::stun::Selection::new(runtime.node.borrow().netmap());
     if runtime.config.relay_only {
         return selection.home();
@@ -507,6 +611,278 @@ async fn discover_home<P: Network, S: State, const PEERS: usize, const A: usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::task::{Context, Waker};
+
+    #[test]
+    fn bootstrap_http_completes_before_discovery_is_polled() {
+        let polls = Cell::new(0);
+        let mut discovery = core::pin::pin!(core::future::poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            Poll::Ready(17)
+        }));
+        let mut completed = None;
+        let mut operation = core::pin::pin!(drive_http(
+            async { "bootstrap published" },
+            discovery.as_mut(),
+            &mut completed,
+            false,
+        ));
+        assert_eq!(
+            operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready("bootstrap published")
+        );
+        assert_eq!(polls.get(), 0);
+    }
+
+    #[test]
+    fn a_later_map_completes_while_the_same_discovery_remains_pending() {
+        let probes = Cell::new(0);
+        let finish = Cell::new(false);
+        let mut discovery = core::pin::pin!(core::future::poll_fn(|_| {
+            probes.set(probes.get() + 1);
+            if finish.get() {
+                Poll::Ready(17)
+            } else {
+                Poll::Pending
+            }
+        }));
+        let mut completed = None;
+        let mut context = Context::from_waker(Waker::noop());
+        {
+            let mut map = core::pin::pin!(drive_http(
+                async { MapEvent::Applied },
+                discovery.as_mut(),
+                &mut completed,
+                true,
+            ));
+            assert_eq!(
+                map.as_mut().poll(&mut context),
+                Poll::Ready(MapEvent::Applied)
+            );
+        }
+        assert_eq!(probes.get(), 1);
+        assert_eq!(completed, None);
+        finish.set(true);
+        {
+            let mut next_map = core::pin::pin!(drive_http(
+                async { MapEvent::KeepAlive },
+                discovery.as_mut(),
+                &mut completed,
+                true,
+            ));
+            assert_eq!(
+                next_map.as_mut().poll(&mut context),
+                Poll::Ready(MapEvent::KeepAlive)
+            );
+        }
+        assert_eq!(probes.get(), 2);
+        assert_eq!(completed, Some(17));
+        // Completed futures must never be polled again at later boundaries.
+        let mut next_map = core::pin::pin!(drive_http(
+            async { MapEvent::Applied },
+            discovery.as_mut(),
+            &mut completed,
+            true,
+        ));
+        assert_eq!(
+            next_map.as_mut().poll(&mut context),
+            Poll::Ready(MapEvent::Applied)
+        );
+        assert_eq!(probes.get(), 2);
+    }
+
+    #[test]
+    fn discovery_completion_does_not_cancel_a_partial_http_operation() {
+        struct PartialWriter<'a> {
+            allow_tail: &'a Cell<bool>,
+            bytes: std::vec::Vec<u8>,
+        }
+        impl embedded_io_async::ErrorType for PartialWriter<'_> {
+            type Error = core::convert::Infallible;
+        }
+        impl Write for PartialWriter<'_> {
+            async fn write(&mut self, bytes: &[u8]) -> Result<usize, Self::Error> {
+                core::future::poll_fn(|_| {
+                    if !self.bytes.is_empty() && !self.allow_tail.get() {
+                        return Poll::Pending;
+                    }
+                    let amount = bytes.len().min(2);
+                    self.bytes.extend_from_slice(&bytes[..amount]);
+                    Poll::Ready(Ok(amount))
+                })
+                .await
+            }
+            async fn flush(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+        struct OperationGuard<'a> {
+            finished: &'a Cell<bool>,
+            abandoned: &'a Cell<bool>,
+        }
+        impl Drop for OperationGuard<'_> {
+            fn drop(&mut self) {
+                if !self.finished.get() {
+                    self.abandoned.set(true);
+                }
+            }
+        }
+        let allow_tail = Cell::new(false);
+        let discovery_ready = Cell::new(false);
+        let discovery_polls = Cell::new(0);
+        let finished = Cell::new(false);
+        let abandoned = Cell::new(false);
+        let starts = Cell::new(0);
+        let mut writer = PartialWriter {
+            allow_tail: &allow_tail,
+            bytes: std::vec::Vec::new(),
+        };
+        let mut discovery = core::pin::pin!(core::future::poll_fn(|_| {
+            discovery_polls.set(discovery_polls.get() + 1);
+            if discovery_ready.get() {
+                Poll::Ready(17)
+            } else {
+                Poll::Pending
+            }
+        }));
+        let mut completed = None;
+        let mut context = Context::from_waker(Waker::noop());
+        {
+            let operation = async {
+                starts.set(starts.get() + 1);
+                let _guard = OperationGuard {
+                    finished: &finished,
+                    abandoned: &abandoned,
+                };
+                writer.write_all(b"one encrypted record").await.unwrap();
+                finished.set(true);
+                MapEvent::Applied
+            };
+            let mut operation = core::pin::pin!(drive_http(
+                operation,
+                discovery.as_mut(),
+                &mut completed,
+                true
+            ));
+            assert_eq!(operation.as_mut().poll(&mut context), Poll::Pending);
+            discovery_ready.set(true);
+            assert_eq!(operation.as_mut().poll(&mut context), Poll::Pending);
+            assert!(!abandoned.get());
+            assert!(!finished.get());
+            allow_tail.set(true);
+            assert_eq!(
+                operation.as_mut().poll(&mut context),
+                Poll::Ready(MapEvent::Applied)
+            );
+        }
+        assert!(!abandoned.get());
+        assert_eq!(starts.get(), 1);
+        assert_eq!(discovery_polls.get(), 2);
+        assert_eq!(completed, Some(17));
+        assert_eq!(writer.bytes, b"one encrypted record");
+    }
+
+    #[test]
+    fn endpoint_ack_keeps_a_newly_discovered_generation_dirty() {
+        let generation = Cell::new(0);
+        let discovery_ready = Cell::new(false);
+        let update_ready = Cell::new(false);
+        let discovery_polls = Cell::new(0);
+        let mut discovery = core::pin::pin!(core::future::poll_fn(|_| {
+            discovery_polls.set(discovery_polls.get() + 1);
+            if discovery_ready.get() {
+                generation.set(1);
+                Poll::Ready(23)
+            } else {
+                Poll::Pending
+            }
+        }));
+        let sent_generation = generation.get();
+        let mut completed = None;
+        let mut context = Context::from_waker(Waker::noop());
+        {
+            let update = core::future::poll_fn(|_| {
+                if update_ready.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            });
+            let mut update =
+                core::pin::pin!(drive_http(update, discovery.as_mut(), &mut completed, true));
+            assert_eq!(update.as_mut().poll(&mut context), Poll::Pending);
+            discovery_ready.set(true);
+            assert_eq!(update.as_mut().poll(&mut context), Poll::Pending);
+            update_ready.set(true);
+            assert_eq!(update.as_mut().poll(&mut context), Poll::Ready(()));
+        }
+        assert_eq!(completed, Some(23));
+        let acknowledged_generation = sent_generation;
+        assert_ne!(acknowledged_generation, generation.get());
+        // With no pending map operation, the retained completion can drive the
+        // second endpoint request immediately, without repolling the sweep or
+        // waiting for another map notification.
+        {
+            let mut update = core::pin::pin!(drive_http(
+                async { generation.get() },
+                discovery.as_mut(),
+                &mut completed,
+                true,
+            ));
+            assert_eq!(update.as_mut().poll(&mut context), Poll::Ready(1));
+        }
+        assert_eq!(discovery_polls.get(), 2);
+    }
+
+    #[test]
+    fn a_result_from_an_old_map_cannot_restore_a_removed_or_ineligible_home() {
+        use tailfeather::netmap::{DerpNode, DerpRegion, Netmap};
+        let mut map = Netmap::<1>::new();
+        let relay = DerpNode {
+            host_name: String::try_from("relay.invalid").unwrap(),
+            cert_name: None,
+            port: 443,
+            stun_port: 3478,
+        };
+        let mut region = DerpRegion {
+            id: 23,
+            code: String::new(),
+            no_measure_no_home: false,
+            nodes: Vec::new(),
+        };
+        region.nodes.push(relay).unwrap();
+        map.derp.insert(region.clone()).unwrap();
+        assert_eq!(validated_home(&map, 17), 23);
+        assert_eq!(validated_home(&map, 0), 23);
+        region.no_measure_no_home = true;
+        map.derp.insert(region).unwrap();
+        assert_eq!(validated_home(&map, 23), 0);
+        map.derp.clear();
+        assert_eq!(validated_home(&map, 17), 0);
+    }
+
+    #[test]
+    fn abandoning_a_session_clears_its_pending_stun_probe() {
+        let probe = RefCell::new(Some(Probe {
+            transaction: [17; 12],
+            server: "192.0.2.1:3478".parse().unwrap(),
+            received: None,
+        }));
+        {
+            let mut sweep = core::pin::pin!(async {
+                let _clear = ClearProbe(&probe);
+                core::future::pending::<()>().await;
+            });
+            assert_eq!(
+                sweep.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            );
+            assert!(probe.borrow().is_some());
+        }
+        assert!(probe.borrow().is_none());
+    }
 
     #[test]
     fn local_interfaces_share_the_data_port_and_leave_room_for_stun() {

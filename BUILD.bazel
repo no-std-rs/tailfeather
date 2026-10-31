@@ -77,6 +77,7 @@ test_suite(
     name = "unit_tests",
     tests = [
         "//crates/tailfeather:unit_test",
+        "//crates/tailfeather:map_lease_hosted_test",
         "//crates/tailfeather-reactor:unit_test",
         "//crates/tailfeather-reactor:tcp_parity_test",
         "//crates/tailfeather:netmap_capture_test",

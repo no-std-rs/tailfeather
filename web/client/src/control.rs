@@ -160,15 +160,19 @@ async fn run(runtime: &Shared, id: u64) -> Result<(), ControlError> {
     .map_err(|_| failed("map request", "timed out"))?
     .map_err(|e| failed("map request", e))?;
     let mut staging: Box<Netmap<PEERS>> = Box::new(Netmap::new());
+    let mut working: Box<Netmap<PEERS>> = Box::new(Netmap::new());
     with(runtime, |state| {
         state.seed_staging(&mut staging);
         state.control_log(id, "Control: streaming the netmap.");
     });
     loop {
-        let event = timeout(MAP_LIVENESS_MS, map.next(&mut http2, &mut staging))
-            .await
-            .map_err(|_| failed("netmap", "no map traffic; reconnecting"))?
-            .map_err(|e| failed("netmap", e))?;
+        let event = timeout(
+            MAP_LIVENESS_MS,
+            map.next(&mut http2, &mut staging, &mut working),
+        )
+        .await
+        .map_err(|_| failed("netmap", "no map traffic; reconnecting"))?
+        .map_err(|e| failed("netmap", e))?;
         let applied = event == MapEvent::Applied;
         if !applied && map.has_pending_update() {
             // A newer map is already staged; handle it with its own event.
@@ -184,6 +188,7 @@ async fn run(runtime: &Shared, id: u64) -> Result<(), ControlError> {
                     &mut http2,
                     &mut map,
                     &mut staging,
+                    &mut working,
                     CONTROL_HOST,
                     &update,
                 ),

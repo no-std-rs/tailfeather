@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022, macos-14]
+        os: [ubuntu-24.04, windows-2022, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +27,9 @@ jobs:
       - run: cargo clippy --manifest-path crates/tailfeather-reactor/Cargo.toml --locked --all-targets --features std,embassy,accelerated-crypto -- -D warnings
       - if: runner.os == 'Linux'
         run: cargo test --locked -p tailfeather control::register
+      - if: runner.os == 'Linux'
+        name: Streaming map leases with native policy and name capacities
+        run: cargo test --locked -p tailfeather --no-default-features --features fast-curve25519,hosted-policy,peer-names map_lease_ -- --nocapture --test-threads=1
       - if: runner.os == 'Linux'
         run: cargo test --locked -p wirefeather --features accelerated-crypto
       - if: runner.os == 'Linux'
