@@ -56,6 +56,7 @@ pub(super) async fn run<P: Network, S: State, const PEERS: usize, const A: usize
     reactor: &Reactor<&P>,
     buffers: &mut LinkBuffers,
     staging: &mut tailfeather::netmap::Netmap<PEERS>,
+    working: &mut tailfeather::netmap::Netmap<PEERS>,
 ) -> Result<(), Error> {
     let authority =
         Authority::parse(runtime.config.control_url, false).map_err(|_| "HTTPS authority")?;
@@ -75,7 +76,7 @@ pub(super) async fn run<P: Network, S: State, const PEERS: usize, const A: usize
             reactor.sleep(100).await;
             continue;
         }
-        match session(runtime, reactor, &authority, buffers, staging).await {
+        match session(runtime, reactor, &authority, buffers, staging, working).await {
             Err(error @ ("registration rejected" | "netmap rejected")) => return Err(error),
             Err(_) => {
                 runtime
@@ -252,6 +253,7 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
     authority: &Authority,
     buffers: &mut LinkBuffers,
     staging: &mut tailfeather::netmap::Netmap<PEERS>,
+    working: &mut tailfeather::netmap::Netmap<PEERS>,
 ) -> Result<(), Error> {
     let config = &runtime.config;
     let mut host = String::<160>::new();
@@ -429,7 +431,7 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
                 runtime.node.borrow().seed_staging(staging);
             }
             let event = drive_http(
-                reactor.timeout(90_000, maps.next(&mut http, staging)),
+                reactor.timeout(90_000, maps.next(&mut http, staging, working)),
                 discovery.as_mut(),
                 &mut completed,
                 bootstrapped,
@@ -485,7 +487,7 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
                         reactor.timeout(
                             30_000,
                             transport::send_endpoint_update(
-                                &mut http, &mut maps, staging, &host, request,
+                                &mut http, &mut maps, staging, working, &host, request,
                             ),
                         ),
                         discovery.as_mut(),

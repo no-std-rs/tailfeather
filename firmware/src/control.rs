@@ -52,10 +52,12 @@ static H2_CONNECTION: StaticCell<micro_h2::Connection> = StaticCell::new();
 static RSA_WORKSPACE: StaticCell<RsaWorkspace> = StaticCell::new();
 static RECOVERY: StaticCell<RecoveryConfig> = StaticCell::new();
 static MAP_STREAM: StaticCell<MapStream<PEERS>> = StaticCell::new();
-// Keep the staged map in RTC-fast SRAM so main SRAM remains available for the
-// P-256 work done by the control TLS handshake.
+// The one rotating map lease lives in RTC-fast SRAM so main SRAM remains
+// available for the P-256 work done by the control TLS handshake. The map
+// stream accumulates documents directly in this lease (next_in_place), so
+// no second retained netmap is needed beside the node's active map.
 #[esp_hal::ram(unstable(rtc_fast))]
-static STAGING: StaticCell<Netmap<PEERS>> = StaticCell::new();
+static LEASE: StaticCell<Netmap<PEERS>> = StaticCell::new();
 const STUN_PACKETS: usize = 2;
 const STUN_BUFFER: usize = 256;
 static STUN_RX_META: StaticCell<[PacketMetadata; STUN_PACKETS]> = StaticCell::new();
@@ -135,12 +137,12 @@ impl Link<'_> {
     ) -> Result<MapEvent, Failure> {
         match self {
             Self::Secure(http2) => map
-                .next(http2, staging)
+                .next_in_place(http2, staging)
                 .await
                 .map_err(|error| transport_failure(ControlStage::MapParsing, error)),
             #[cfg(feature = "test-insecure-control")]
             Self::Plain(http2) => map
-                .next(http2, staging)
+                .next_in_place(http2, staging)
                 .await
                 .map_err(|error| plain_transport_failure(ControlStage::MapParsing, error)),
         }
@@ -155,7 +157,7 @@ impl Link<'_> {
     ) -> Result<(), Failure> {
         match self {
             Self::Secure(http2) => {
-                tailfeather::control::transport::send_endpoint_update(
+                tailfeather::control::transport::send_endpoint_update_in_place(
                     http2, map, staging, authority, body,
                 )
                 .await
@@ -163,7 +165,7 @@ impl Link<'_> {
             }
             #[cfg(feature = "test-insecure-control")]
             Self::Plain(http2) => {
-                tailfeather::control::transport::send_endpoint_update(
+                tailfeather::control::transport::send_endpoint_update_in_place(
                     http2, map, staging, authority, body,
                 )
                 .await
@@ -644,6 +646,10 @@ async fn bootstrap<'a>(
         );
         node.prefer_derp(region)
             .map_err(|_| Failure::protocol(ControlStage::Stun))?;
+        // Nothing has been read since the lease was seeded. Carry the local
+        // home into it, since a document the publication drains is parsed
+        // on top of this lease and is the next map the node adopts.
+        node.seed_staging(staging);
         publish_endpoints(
             &mut link,
             map,
@@ -680,6 +686,7 @@ async fn bootstrap<'a>(
                 "control stage={} state=selected region={region} source=fallback",
                 ControlStage::Stun.as_str()
             );
+            node.seed_staging(staging);
             // A preferred DERP is load-bearing peer reachability metadata, not
             // merely a STUN optimization. If UDP replies are blocked, publish
             // the authenticated fallback together with the LAN candidate so
@@ -699,7 +706,9 @@ async fn bootstrap<'a>(
             .await?;
         }
     }
-    if !map.has_pending_update() {
+    // The lease accumulates documents in place: reseeding it now would
+    // erase a partial document the endpoint publication just started.
+    if !map.has_pending_update() && !map.has_partial_response() {
         node.seed_staging(staging);
     }
 
@@ -1508,7 +1517,7 @@ pub async fn run(
         tx_meta: STUN_TX_META.init([PacketMetadata::EMPTY; STUN_PACKETS]),
         tx: STUN_TX.init([0; STUN_BUFFER]),
     };
-    let staging = STAGING.init(Netmap::new());
+    let staging = LEASE.init(Netmap::new());
     let map = MAP_STREAM.init_with(MapStream::new);
     // Recovery request images live outside the async task frame. In
     // particular, increasing the bounded netmap token storage must not steal

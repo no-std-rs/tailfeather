@@ -1150,16 +1150,28 @@ pub enum MapEvent {
     KeepAlive,
 }
 
-/// Persistent state for one long-lived streaming map response.
+/// Where one map document is accumulated. Lease mode keeps partial state in
+/// a caller-owned working map so the public staging lease is only replaced
+/// by complete snapshots; in-place mode accumulates directly in the caller's
+/// single rotating lease, whose owner must not reseed it mid-document (see
+/// [`MapStream::has_partial_response`]).
+enum Target<'a, const PEERS: usize> {
+    Lease {
+        staging: &'a mut Netmap<PEERS>,
+        working: &'a mut Netmap<PEERS>,
+    },
+    InPlace(&'a mut Netmap<PEERS>),
+}
+
+/// Persistent state for one long-lived streaming map response. The stream
+/// itself retains no netmap: callers own both the staging lease and the
+/// bounded working map a partial document is accumulated into, so each
+/// consumer places that storage where its memory budget requires.
 pub struct MapStream<const PEERS: usize> {
     stream: u32,
     frames: FrameReader,
     parser: Parser<PEERS>,
-    // Partial documents never mutate the public, swappable staging lease.
-    // One bounded working map also permits ACK draining to parse the next
-    // partial response without contaminating an already completed snapshot.
-    working: Netmap<PEERS>,
-    working_started: bool,
+    document_started: bool,
     pending: heapless::Deque<MapEvent, 4>,
     status: Option<u16>,
     ended: bool,
@@ -1181,8 +1193,7 @@ impl<const PEERS: usize> MapStream<PEERS> {
             status: None,
             frames: FrameReader::new(),
             parser: Parser::new(),
-            working: Netmap::new(),
-            working_started: false,
+            document_started: false,
             pending: heapless::Deque::new(),
             ended: false,
         }
@@ -1194,6 +1205,13 @@ impl<const PEERS: usize> MapStream<PEERS> {
     /// A partial response is private and does not reserve the public lease.
     pub fn has_pending_update(&self) -> bool {
         self.pending.iter().any(|event| *event == MapEvent::Applied)
+    }
+
+    /// Whether a map document is partially accumulated. In-place callers
+    /// (see [`Self::next_in_place`]) must not reseed or swap their lease
+    /// while this is true: the parser's progress lives in that lease.
+    pub fn has_partial_response(&self) -> bool {
+        self.document_started
     }
 
     pub async fn start<S, B, C>(
@@ -1230,16 +1248,54 @@ impl<const PEERS: usize> MapStream<PEERS> {
         map.status = None;
         map.frames.finish_response();
         map.parser.reset();
-        map.working_started = false;
+        map.document_started = false;
         map.pending.clear();
         map.ended = false;
         Ok(())
     }
 
+    /// Read the next map event, accumulating each document in `working`
+    /// (seeded from `staging`) and publishing only complete snapshots to
+    /// `staging`. Partial documents never mutate the staging lease, so
+    /// callers may reseed it or drain interleaved responses at any point.
     pub async fn next<S, B, C>(
         &mut self,
         http2: &mut Http2<S, B, C>,
         staging: &mut Netmap<PEERS>,
+        working: &mut Netmap<PEERS>,
+    ) -> Result<MapEvent, Error<S::Error>>
+    where
+        S: Read + Write,
+        B: AsRef<[u8]> + AsMut<[u8]>,
+        C: BorrowMut<Connection>,
+    {
+        self.next_target(http2, Target::Lease { staging, working })
+            .await
+    }
+
+    /// Read the next map event, accumulating each document directly in the
+    /// caller's single rotating lease. The caller must have seeded the lease
+    /// from the active map before the first document and must not reseed or
+    /// swap it while [`Self::has_partial_response`] is true. `Applied` is
+    /// only returned at a document boundary: input after the completed
+    /// document stays unread, so the lease never carries a later partial one.
+    pub async fn next_in_place<S, B, C>(
+        &mut self,
+        http2: &mut Http2<S, B, C>,
+        lease: &mut Netmap<PEERS>,
+    ) -> Result<MapEvent, Error<S::Error>>
+    where
+        S: Read + Write,
+        B: AsRef<[u8]> + AsMut<[u8]>,
+        C: BorrowMut<Connection>,
+    {
+        self.next_target(http2, Target::InPlace(lease)).await
+    }
+
+    async fn next_target<S, B, C>(
+        &mut self,
+        http2: &mut Http2<S, B, C>,
+        mut target: Target<'_, PEERS>,
     ) -> Result<MapEvent, Error<S::Error>>
     where
         S: Read + Write,
@@ -1247,7 +1303,14 @@ impl<const PEERS: usize> MapStream<PEERS> {
         C: BorrowMut<Connection>,
     {
         loop {
-            if let Some(event) = self.pending.pop_front() {
+            // A drained response may have completed one document and begun
+            // the next in an in-place lease. The lease is not a snapshot
+            // until that document finishes too; its Applied then coalesces.
+            let lease_partial = self.document_started && matches!(target, Target::InPlace(_));
+            if let Some(&event) = self.pending.front()
+                && !(lease_partial && event == MapEvent::Applied)
+            {
+                self.pending.pop_front();
                 return Ok(event);
             }
             if self.ended {
@@ -1263,16 +1326,20 @@ impl<const PEERS: usize> MapStream<PEERS> {
             } = input
             {
                 let len = bytes.len();
+                let mut used = len;
                 let mut stream_error = None;
                 if stream == self.stream {
                     if self.status != Some(200) {
                         stream_error = Some(Error::UnexpectedStatus(self.status.unwrap_or(0)));
-                    } else if let Err(error) = self.queue_data(staging, bytes) {
-                        stream_error = Some(error);
+                    } else {
+                        match self.queue_data(&mut target, bytes) {
+                            Ok(queued) => used = queued,
+                            Err(error) => stream_error = Some(error),
+                        }
                     }
-                    self.ended |= end_stream && frame_done;
+                    self.ended |= end_stream && frame_done && used == len;
                 }
-                http2.consume_data(len).await?;
+                http2.consume_data(used).await?;
                 if let Some(error) = stream_error {
                     return Err(error);
                 }
@@ -1296,7 +1363,7 @@ impl<const PEERS: usize> MapStream<PEERS> {
                     &mut replies,
                 )
                 .map_err(Error::Http2)?;
-            let result = self.consume_event(event, parsed_status, staging);
+            let result = self.consume_event(event, parsed_status, &mut target);
             http2.consume(frame_len);
             if reply_len != 0 {
                 http2.send(&replies[..reply_len]).await?;
@@ -1317,6 +1384,22 @@ impl<const PEERS: usize> MapStream<PEERS> {
         &mut self,
         http2: &mut Http2<S, B, C>,
         staging: &mut Netmap<PEERS>,
+        working: &mut Netmap<PEERS>,
+        wanted_stream: u32,
+    ) -> Result<(), Error<S::Error>>
+    where
+        S: Read + Write,
+        B: AsRef<[u8]> + AsMut<[u8]>,
+        C: BorrowMut<Connection>,
+    {
+        self.drain_target(http2, Target::Lease { staging, working }, wanted_stream)
+            .await
+    }
+
+    async fn drain_target<S, B, C>(
+        &mut self,
+        http2: &mut Http2<S, B, C>,
+        mut target: Target<'_, PEERS>,
         wanted_stream: u32,
     ) -> Result<(), Error<S::Error>>
     where
@@ -1337,17 +1420,21 @@ impl<const PEERS: usize> MapStream<PEERS> {
                     return Err(Error::InterleavedStream(stream));
                 }
                 let len = bytes.len();
+                let mut used = len;
                 let mut stream_error = None;
                 if stream == self.stream {
                     if self.status != Some(200) {
                         stream_error = Some(Error::UnexpectedStatus(self.status.unwrap_or(0)));
-                    } else if let Err(error) = self.queue_data(staging, bytes) {
-                        stream_error = Some(error);
+                    } else {
+                        match self.queue_data(&mut target, bytes) {
+                            Ok(queued) => used = queued,
+                            Err(error) => stream_error = Some(error),
+                        }
                     }
-                    self.ended |= end_stream && frame_done;
+                    self.ended |= end_stream && frame_done && used == len;
                 }
                 let finished = stream == wanted_stream && end_stream && frame_done;
-                http2.consume_data(len).await?;
+                http2.consume_data(used).await?;
                 if let Some(error) = stream_error {
                     return Err(error);
                 }
@@ -1425,13 +1512,18 @@ impl<const PEERS: usize> MapStream<PEERS> {
         }
     }
 
+    /// Feed `data` to the current document and return how much of it was
+    /// used. An in-place target stops at a completed document: the bytes
+    /// after it belong to the next document, which must not touch the lease
+    /// before its owner has taken this one, so they stay unconsumed input.
     fn queue_data<E>(
         &mut self,
-        staging: &mut Netmap<PEERS>,
+        target: &mut Target<'_, PEERS>,
         mut data: &[u8],
-    ) -> Result<(), Error<E>> {
+    ) -> Result<usize, Error<E>> {
+        let total = data.len();
         while !data.is_empty() {
-            let (outcome, consumed) = self.consume_data(staging, data)?;
+            let (outcome, consumed) = self.consume_data(target, data)?;
             data = &data[consumed..];
             if let Some(outcome) = outcome {
                 // A single HTTP/2 DATA chunk may contain an arbitrary run of
@@ -1448,13 +1540,35 @@ impl<const PEERS: usize> MapStream<PEERS> {
             if consumed == 0 {
                 return Err(Error::FrameTooLarge);
             }
+            if outcome == Some(MapEvent::Applied) && matches!(target, Target::InPlace(_)) {
+                break;
+            }
         }
-        Ok(())
+        Ok(total - data.len())
+    }
+
+    /// Push one body chunk into `target`; when the document completes,
+    /// finish the parser there and report whether it set the self home.
+    fn feed<E>(
+        &mut self,
+        target: &mut Netmap<PEERS>,
+        bytes: &[u8],
+    ) -> Result<Option<bool>, Error<E>> {
+        self.parser.push(target, bytes).map_err(Error::Netmap)?;
+        if self.frames.is_complete() {
+            self.frames.finish_response();
+            let parser = core::mem::take(&mut self.parser);
+            let server_home = parser.sets_home_derp();
+            self.document_started = false;
+            parser.finish(target).map_err(Error::Netmap)?;
+            return Ok(Some(server_home));
+        }
+        Ok(None)
     }
 
     fn consume_data<E>(
         &mut self,
-        staging: &mut Netmap<PEERS>,
+        target: &mut Target<'_, PEERS>,
         data: &[u8],
     ) -> Result<(Option<MapEvent>, usize), Error<E>> {
         let mut consumed_total = 0;
@@ -1463,30 +1577,31 @@ impl<const PEERS: usize> MapStream<PEERS> {
             let (piece, consumed) = self.frames.next(input).map_err(Error::Netmap)?;
             consumed_total += consumed;
             match piece {
-                crate::netmap::frame::Chunk::Body(bytes) => {
-                    if !self.working_started {
-                        self.working.copy_from(staging);
-                        self.working_started = true;
-                    }
-                    self.parser
-                        .push(&mut self.working, bytes)
-                        .map_err(Error::Netmap)?;
-                    if self.frames.is_complete() {
-                        self.frames.finish_response();
-                        let parser = core::mem::take(&mut self.parser);
-                        let server_home = parser.sets_home_derp();
-                        self.working_started = false;
-                        parser.finish(&mut self.working).map_err(Error::Netmap)?;
-                        // The caller may have selected a home after this
-                        // document began. Inherit that local preference unless
-                        // this authenticated response explicitly replaces it.
-                        if !server_home {
-                            self.working.home_derp = staging.home_derp;
+                crate::netmap::frame::Chunk::Body(bytes) => match target {
+                    Target::Lease { staging, working } => {
+                        if !self.document_started {
+                            working.copy_from(staging);
+                            self.document_started = true;
                         }
-                        staging.copy_from(&self.working);
-                        return Ok((Some(MapEvent::Applied), consumed_total));
+                        if let Some(server_home) = self.feed(working, bytes)? {
+                            // The caller may have selected a home after this
+                            // document began. Inherit that local preference
+                            // unless this authenticated response explicitly
+                            // replaces it.
+                            if !server_home {
+                                working.home_derp = staging.home_derp;
+                            }
+                            staging.copy_from(working);
+                            return Ok((Some(MapEvent::Applied), consumed_total));
+                        }
                     }
-                }
+                    Target::InPlace(lease) => {
+                        self.document_started = true;
+                        if self.feed(lease, bytes)?.is_some() {
+                            return Ok((Some(MapEvent::Applied), consumed_total));
+                        }
+                    }
+                },
                 crate::netmap::frame::Chunk::End => {
                     return Ok((Some(MapEvent::KeepAlive), consumed_total));
                 }
@@ -1508,7 +1623,7 @@ impl<const PEERS: usize> MapStream<PEERS> {
         &mut self,
         event: Event<'_>,
         frame_status: Option<u16>,
-        staging: &mut Netmap<PEERS>,
+        target: &mut Target<'_, PEERS>,
     ) -> Result<(Option<MapEvent>, bool), Error<E>> {
         match event {
             Event::Headers { stream, end_stream } if stream == self.stream => {
@@ -1528,7 +1643,13 @@ impl<const PEERS: usize> MapStream<PEERS> {
                 if self.status != Some(200) {
                     return Err(Error::UnexpectedStatus(self.status.unwrap_or(0)));
                 }
-                self.queue_data(staging, data)?;
+                // Whole-frame DATA dispatch is never chosen by the streamed
+                // readers above, so there is no input to leave a suffix in.
+                let mut rest = data;
+                while !rest.is_empty() {
+                    let used = self.queue_data(target, rest)?;
+                    rest = &rest[used..];
+                }
                 self.ended |= end_stream;
                 return Ok((self.pending.pop_front(), self.ended));
             }
@@ -1547,6 +1668,46 @@ pub async fn send_endpoint_update<S, B, C, const PEERS: usize>(
     http2: &mut Http2<S, B, C>,
     map: &mut MapStream<PEERS>,
     staging: &mut Netmap<PEERS>,
+    working: &mut Netmap<PEERS>,
+    authority: &str,
+    request_body: &[u8],
+) -> Result<(), Error<S::Error>>
+where
+    S: Read + Write,
+    B: AsRef<[u8]> + AsMut<[u8]>,
+    C: BorrowMut<Connection>,
+{
+    send_endpoint_update_target(
+        http2,
+        map,
+        Target::Lease { staging, working },
+        authority,
+        request_body,
+    )
+    .await
+}
+
+/// In-place form of [`send_endpoint_update`] for a single rotating lease;
+/// the same mid-document discipline as [`MapStream::next_in_place`] applies.
+pub async fn send_endpoint_update_in_place<S, B, C, const PEERS: usize>(
+    http2: &mut Http2<S, B, C>,
+    map: &mut MapStream<PEERS>,
+    lease: &mut Netmap<PEERS>,
+    authority: &str,
+    request_body: &[u8],
+) -> Result<(), Error<S::Error>>
+where
+    S: Read + Write,
+    B: AsRef<[u8]> + AsMut<[u8]>,
+    C: BorrowMut<Connection>,
+{
+    send_endpoint_update_target(http2, map, Target::InPlace(lease), authority, request_body).await
+}
+
+async fn send_endpoint_update_target<S, B, C, const PEERS: usize>(
+    http2: &mut Http2<S, B, C>,
+    map: &mut MapStream<PEERS>,
+    target: Target<'_, PEERS>,
     authority: &str,
     request_body: &[u8],
 ) -> Result<(), Error<S::Error>>
@@ -1558,7 +1719,7 @@ where
     let stream = http2
         .send_request("POST", crate::control::map::PATH, authority, request_body)
         .await?;
-    map.drain_response(http2, staging, stream).await?;
+    map.drain_target(http2, target, stream).await?;
     let status = http2.take_status(stream).unwrap_or(0);
     if status != 200 {
         return Err(Error::UnexpectedStatus(status));
@@ -1666,20 +1827,34 @@ mod tests {
             stream: 1,
             frames: FrameReader::new(),
             parser: Parser::new(),
-            working: Netmap::new(),
-            working_started: false,
+            document_started: false,
             pending: heapless::Deque::new(),
             status: Some(200),
             ended: false,
         };
         let mut staging = Netmap::new();
+        let mut working = Netmap::new();
         let bytes = [0u8; 8];
 
-        let (first, consumed) = stream.consume_data::<()>(&mut staging, &bytes).unwrap();
+        let (first, consumed) = stream
+            .consume_data::<()>(
+                &mut Target::Lease {
+                    staging: &mut staging,
+                    working: &mut working,
+                },
+                &bytes,
+            )
+            .unwrap();
         assert_eq!(first, Some(MapEvent::KeepAlive));
         assert_eq!(consumed, 4);
         let (second, consumed) = stream
-            .consume_data::<()>(&mut staging, &bytes[consumed..])
+            .consume_data::<()>(
+                &mut Target::Lease {
+                    staging: &mut staging,
+                    working: &mut working,
+                },
+                &bytes[consumed..],
+            )
             .unwrap();
         assert_eq!(second, Some(MapEvent::KeepAlive));
         assert_eq!(consumed, 4);
@@ -1753,12 +1928,12 @@ mod tests {
             status: None,
             frames: FrameReader::new(),
             parser: Parser::new(),
-            working: Netmap::new(),
-            working_started: false,
+            document_started: false,
             pending: heapless::Deque::new(),
             ended: false,
         };
         let mut netmap = Netmap::new();
+        let mut working = Netmap::new();
         let mut applied = false;
 
         for encoded in fixture.frames {
@@ -1777,7 +1952,14 @@ mod tests {
                 )
                 .unwrap();
             let (outcome, ended) = map
-                .consume_event::<core::convert::Infallible>(event, status, &mut netmap)
+                .consume_event::<core::convert::Infallible>(
+                    event,
+                    status,
+                    &mut Target::Lease {
+                        staging: &mut netmap,
+                        working: &mut working,
+                    },
+                )
                 .unwrap();
             applied |= outcome == Some(MapEvent::Applied);
             assert!(!ended);
@@ -1967,10 +2149,12 @@ mod tests {
             http.stream.pause_at_end = true;
             let mut map = lease_stream::<2>(&mut http);
             let mut staging = lease_netmap::<2>();
+            let mut working = lease_netmap::<2>();
             block_on(send_endpoint_update(
                 &mut http,
                 &mut map,
                 &mut staging,
+                &mut working,
                 "control.example",
                 b"{}",
             ))
@@ -1978,7 +2162,7 @@ mod tests {
             // There is no suffix yet. block_on requires this poll to finish,
             // so waiting for the unrelated next document cannot pass.
             assert_eq!(
-                block_on(map.next(&mut http, &mut staging)).unwrap(),
+                block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
                 MapEvent::Applied
             );
             assert_eq!(staging.responses, 1);
@@ -2018,10 +2202,12 @@ mod tests {
         let mut map = lease_stream::<2>(&mut http);
         let mut active = lease_netmap::<2>();
         let mut staging = lease_netmap::<2>();
+        let mut working = lease_netmap::<2>();
         block_on(send_endpoint_update(
             &mut http,
             &mut map,
             &mut staging,
+            &mut working,
             "control.example",
             b"{}",
         ))
@@ -2032,7 +2218,7 @@ mod tests {
             }
             lease_available_frames(&mut http, &frames, completed + 2);
             assert_eq!(
-                block_on(map.next(&mut http, &mut staging)).unwrap(),
+                block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
                 MapEvent::Applied,
                 "a complete map must remain prompt even when every chunk ends with the next partial document"
             );
@@ -2046,7 +2232,7 @@ mod tests {
             );
         }
         assert_eq!(
-            block_on(map.next(&mut http, &mut staging)).unwrap(),
+            block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
             MapEvent::KeepAlive
         );
     }
@@ -2120,11 +2306,13 @@ mod tests {
             let mut active = lease_netmap::<2>();
             active.home_derp = 17;
             let mut staging = lease_netmap::<2>();
+            let mut working = lease_netmap::<2>();
             staging.copy_from(&active);
             block_on(send_endpoint_update(
                 &mut http,
                 &mut map,
                 &mut staging,
+                &mut working,
                 "control.example",
                 b"{}",
             ))
@@ -2134,7 +2322,7 @@ mod tests {
                 staging.copy_from(&active);
             }
             assert_eq!(
-                block_on(map.next(&mut http, &mut staging)).unwrap(),
+                block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
                 MapEvent::Applied
             );
             assert_eq!(
@@ -2171,9 +2359,10 @@ mod tests {
             ))
             .unwrap();
         let mut staging = lease_netmap::<2>();
+        let mut working = lease_netmap::<2>();
         staging.copy_from(&active);
         {
-            let mut next = core::pin::pin!(map.next(&mut http, &mut staging));
+            let mut next = core::pin::pin!(map.next(&mut http, &mut staging, &mut working));
             assert!(matches!(
                 next.as_mut().poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Pending
@@ -2183,10 +2372,11 @@ mod tests {
             !map.has_pending_update(),
             "private partial parsing must not reserve public staging"
         );
+        assert!(map.has_partial_response());
         staging.copy_from(&active);
         lease_available_frames(&mut http, &frames, 3);
         assert_eq!(
-            block_on(map.next(&mut http, &mut staging)).unwrap(),
+            block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
             MapEvent::Applied
         );
         assert!(staging.peers.get(1).is_some());
@@ -2212,16 +2402,18 @@ mod tests {
         let mut map = lease_stream::<2>(&mut http);
         let mut active = lease_netmap::<2>();
         let mut staging = lease_netmap::<2>();
+        let mut working = lease_netmap::<2>();
         block_on(send_endpoint_update(
             &mut http,
             &mut map,
             &mut staging,
+            &mut working,
             "control.example",
             b"{}",
         ))
         .unwrap();
         assert_eq!(
-            block_on(map.next(&mut http, &mut staging)).unwrap(),
+            block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
             MapEvent::Applied
         );
         core::mem::swap(&mut active, &mut staging);
@@ -2232,7 +2424,7 @@ mod tests {
         );
         staging.copy_from(&active);
         assert_eq!(
-            block_on(map.next(&mut http, &mut staging)).unwrap(),
+            block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
             MapEvent::KeepAlive,
             "the coalesced notification must not be replayed after the caller swaps the completed lease"
         );
@@ -2253,24 +2445,27 @@ mod tests {
         let mut map = lease_stream::<2>(&mut http);
         let active = lease_netmap::<2>();
         let mut staging = lease_netmap::<2>();
+        let mut working = lease_netmap::<2>();
         staging.copy_from(&active);
         block_on(send_endpoint_update(
             &mut http,
             &mut map,
             &mut staging,
+            &mut working,
             "control.example",
             b"{}",
         ))
         .unwrap();
         // The parser consumed an early peer, but partial state is now private.
         assert!(!map.frames.is_complete(), "the suffix must still be unread");
+        assert!(map.has_partial_response());
         // This is the production caller's lease guard, not a reset of the
         // parser. An endpoint ACK must not make an in-progress lease reusable.
         if !map.has_pending_update() {
             staging.copy_from(&active);
         }
         assert_eq!(
-            block_on(map.next(&mut http, &mut staging)).unwrap(),
+            block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
             MapEvent::Applied
         );
         assert!(
@@ -2297,18 +2492,20 @@ mod tests {
         let mut map = lease_stream::<2>(&mut http);
         let mut active = lease_netmap::<2>();
         let mut staging = lease_netmap::<2>();
+        let mut working = lease_netmap::<2>();
         staging.copy_from(&active);
         block_on(send_endpoint_update(
             &mut http,
             &mut map,
             &mut staging,
+            &mut working,
             "control.example",
             b"{}",
         ))
         .unwrap();
         assert!(map.has_pending_update());
         assert_eq!(
-            block_on(map.next(&mut http, &mut staging)).unwrap(),
+            block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
             MapEvent::Applied
         );
         core::mem::swap(&mut active, &mut staging);
@@ -2322,7 +2519,7 @@ mod tests {
             staging.copy_from(&active);
         }
         assert_eq!(
-            block_on(map.next(&mut http, &mut staging)).unwrap(),
+            block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
             MapEvent::Applied
         );
         core::mem::swap(&mut active, &mut staging);
@@ -2332,7 +2529,7 @@ mod tests {
             &["203.0.113.7:5007".parse().unwrap()]
         );
         assert_eq!(
-            block_on(map.next(&mut http, &mut staging)).unwrap(),
+            block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
             MapEvent::KeepAlive,
             "a duplicate Applied event would swap a stale staging lease back into active state"
         );
@@ -2353,10 +2550,12 @@ mod tests {
         let mut map = lease_stream::<2>(&mut http);
         let active = lease_netmap::<2>();
         let mut staging = lease_netmap::<2>();
+        let mut working = lease_netmap::<2>();
         block_on(send_endpoint_update(
             &mut http,
             &mut map,
             &mut staging,
+            &mut working,
             "control.example",
             b"{}",
         ))
@@ -2365,7 +2564,7 @@ mod tests {
             staging.copy_from(&active);
         }
         assert_eq!(
-            block_on(map.next(&mut http, &mut staging)).unwrap(),
+            block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
             MapEvent::Applied
         );
         assert!(
@@ -2631,5 +2830,107 @@ mod tests {
         assert!(core::mem::size_of::<Owned>() >= H2_BUFFER);
         assert!(core::mem::size_of::<Borrowed>() < core::mem::size_of::<Owned>());
         assert_eq!(H2_BUFFER, 2_048);
+    }
+
+    #[test]
+    fn map_in_place_stops_at_each_completed_document_and_leaves_the_next_unread() {
+        let responses: std::vec::Vec<_> = (1..=4)
+            .map(|port| lease_peer_response(7, &std::format!("198.51.100.7:{}", 4000 + port)))
+            .collect();
+        let bodies: std::vec::Vec<_> = responses.iter().map(|r| lease_map_bytes(r)).collect();
+        let splits: std::vec::Vec<_> = responses
+            .iter()
+            .map(|r| 4 + r.find("\"KeepAlive\"").unwrap())
+            .collect();
+        let mut first = bodies[0].clone();
+        first.extend_from_slice(&bodies[1][..splits[1]]);
+        let mut second = bodies[1][splits[1]..].to_vec();
+        second.extend_from_slice(&bodies[2][..splits[2]]);
+        let mut third = bodies[2][splits[2]..].to_vec();
+        third.extend_from_slice(&bodies[3][..splits[3]]);
+        let mut fourth = bodies[3][splits[3]..].to_vec();
+        fourth.extend_from_slice(&[0; 4]);
+        let mut http = lease_http(&[
+            lease_headers(1, false),
+            lease_data(&first),
+            lease_data(&second),
+            lease_data(&third),
+            lease_data(&fourth),
+        ]);
+        let mut map = lease_stream::<2>(&mut http);
+        let mut active = lease_netmap::<2>();
+        let mut lease = lease_netmap::<2>();
+        for completed in 1..=4 {
+            assert_eq!(
+                block_on(map.next_in_place(&mut http, &mut lease)).unwrap(),
+                MapEvent::Applied
+            );
+            assert!(
+                !map.has_partial_response(),
+                "the next document must stay unread until the lease is handed off"
+            );
+            // The firmware node adopts the lease, then reseeds what it returns.
+            core::mem::swap(&mut active, &mut lease);
+            lease.copy_from(&active);
+            assert_eq!(active.responses, completed);
+            assert_eq!(
+                active.peers.get(7).unwrap().endpoints.as_slice(),
+                &[std::format!("198.51.100.7:{}", 4000 + completed)
+                    .parse()
+                    .unwrap()],
+                "Applied exposed peer tokens from the following partial document"
+            );
+        }
+        assert_eq!(
+            block_on(map.next_in_place(&mut http, &mut lease)).unwrap(),
+            MapEvent::KeepAlive
+        );
+    }
+
+    #[test]
+    fn map_in_place_drained_partial_document_defers_the_coalesced_applied() {
+        let response_a = lease_peer_response(7, "198.51.100.7:4007");
+        let response_b = lease_peer_response(7, "203.0.113.7:5007");
+        let split = response_b.find("\"KeepAlive\"").unwrap();
+        let body_b = lease_map_bytes(&response_b);
+        let mut combined = lease_map_bytes(&response_a);
+        combined.extend_from_slice(&body_b[..4 + split]);
+        let mut http = lease_http(&[
+            lease_headers(1, false),
+            lease_data(&combined),
+            lease_headers(3, true),
+            lease_data(&body_b[4 + split..]),
+            lease_data(&[0; 4]),
+        ]);
+        let mut map = lease_stream::<2>(&mut http);
+        let mut lease = lease_netmap::<2>();
+        block_on(send_endpoint_update_in_place(
+            &mut http,
+            &mut map,
+            &mut lease,
+            "control.example",
+            b"{}",
+        ))
+        .unwrap();
+        assert!(map.has_pending_update());
+        assert!(
+            map.has_partial_response(),
+            "the caller's reseed guard must see that B already lives in the lease"
+        );
+        assert_eq!(
+            block_on(map.next_in_place(&mut http, &mut lease)).unwrap(),
+            MapEvent::Applied
+        );
+        assert!(!map.has_partial_response());
+        assert_eq!(lease.responses, 2, "A and B coalesce into one snapshot");
+        assert_eq!(
+            lease.peers.get(7).unwrap().endpoints.as_slice(),
+            &["203.0.113.7:5007".parse().unwrap()]
+        );
+        assert_eq!(
+            block_on(map.next_in_place(&mut http, &mut lease)).unwrap(),
+            MapEvent::KeepAlive,
+            "the coalesced Applied must not be replayed"
+        );
     }
 }

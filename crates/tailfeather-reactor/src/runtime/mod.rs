@@ -195,6 +195,9 @@ pub struct Buffers<const PEERS: usize> {
     pub control: LinkBuffers,
     pub relays: [LinkBuffers; 2],
     pub staging: tailfeather::netmap::Netmap<PEERS>,
+    /// Private accumulation for one in-flight map document; kept beside the
+    /// staging lease so neither becomes part of the control future.
+    pub map_working: tailfeather::netmap::Netmap<PEERS>,
 }
 impl<const PEERS: usize> Buffers<PEERS> {
     pub fn new() -> Self {
@@ -202,6 +205,7 @@ impl<const PEERS: usize> Buffers<PEERS> {
             control: LinkBuffers::new(),
             relays: [const { LinkBuffers::new() }; 2],
             staging: tailfeather::netmap::Netmap::new(),
+            map_working: tailfeather::netmap::Netmap::new(),
         }
     }
 }
@@ -466,7 +470,13 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
         let [first, second] = &mut buffers.relays;
         use embassy_futures::select::{Either5, select5};
         let result = match select5(
-            control::run(self, &reactor, &mut buffers.control, &mut buffers.staging),
+            control::run(
+                self,
+                &reactor,
+                &mut buffers.control,
+                &mut buffers.staging,
+                &mut buffers.map_working,
+            ),
             self.packets(device, &reactor),
             derp::worker(self, &reactor, &self.slots[0], first),
             derp::worker(self, &reactor, &self.slots[1], second),

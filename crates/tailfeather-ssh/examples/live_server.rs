@@ -297,6 +297,7 @@ fn control_session<
     ))
     .unwrap();
     let mut staging = Netmap::new();
+    let mut working = Netmap::new();
     let mut discovered = false;
     let publisher = Publisher {
         authority: authority.to_owned(),
@@ -308,7 +309,7 @@ fn control_session<
     };
     std::thread::spawn(move || publish_updates(publisher, underlay.publications));
     loop {
-        let event = blocking(stream.next(&mut http2, &mut staging)).unwrap();
+        let event = blocking(stream.next(&mut http2, &mut staging, &mut working)).unwrap();
         if event != transport::MapEvent::Applied {
             continue;
         }
@@ -340,6 +341,7 @@ fn control_session<
                 &mut http2,
                 &mut stream,
                 &mut staging,
+                &mut working,
                 authority,
                 body,
             ))
