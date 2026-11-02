@@ -93,11 +93,13 @@ enum Context {
 #[derive(Default, Clone)]
 pub struct Netmap<const PEERS: usize = MAX_PEERS> {
     pub peers: PeerTable<PEERS>,
-    /// The control map named more peers than this target retains.
+    /// The control map named more peers than this target retains, or named a
+    /// peer whose addresses or allowed IPs exceed the per-peer bounds.
     ///
     /// Selection is deterministic: a full snapshot keeps the first `PEERS`
-    /// non-self records in server order. This lets memory-constrained targets
-    /// remain connected to control instead of rejecting the entire map.
+    /// non-self records in server order, skipping oversized records. This lets
+    /// memory-constrained targets remain connected to control instead of
+    /// rejecting the entire map.
     pub peers_truncated: bool,
     pub derp: DerpMap,
     /// The tailnet's DNS configuration, minus the unbounded `Routes` map.
@@ -227,6 +229,10 @@ struct Pending {
     /// Set when a patch mentioned `Endpoints`, so an empty list can be told
     /// apart from an absent one.
     endpoints_present: bool,
+    /// The record named more addresses or allowed IPs than a peer retains.
+    /// Those lists decide routing and source checks, so a partial copy is not
+    /// kept: the peer is omitted instead of failing the whole map.
+    oversized: Option<CapacityError>,
     #[cfg(feature = "peer-names")]
     name: heapless::String<{ crate::netmap::MAX_PEER_NAME }>,
     #[cfg(feature = "peer-names")]
@@ -252,6 +258,7 @@ impl Pending {
             approved_ipv6_default: false,
             endpoints: heapless::Vec::new(),
             endpoints_present: false,
+            oversized: None,
             #[cfg(feature = "peer-names")]
             name: heapless::String::new(),
             #[cfg(feature = "peer-names")]
@@ -637,6 +644,12 @@ impl State {
         // peer of itself: a handshake with its own key, which cannot complete,
         // retried forever.
         if netmap.node_key == Some(node_key) {
+            // This node's own routes are not one peer among many: keep the
+            // strict bound rather than act on a partial self record.
+            if let Some(category) = self.pending.oversized {
+                self.fail(Error::Full(category));
+                return;
+            }
             if !self.self_routes_seen {
                 Self::replace_self_routes(
                     netmap,
@@ -644,6 +657,20 @@ impl State {
                     self.pending.approved_ipv4_default,
                     self.pending.approved_ipv6_default,
                 );
+            }
+            return;
+        }
+        if let Some(category) = self.pending.oversized {
+            if netmap.node_key.is_none() {
+                // Without our own key this record may be a delayed self record
+                // carrying route approval, which must not be silently lost.
+                self.fail(Error::Full(category));
+            } else {
+                // Partial address or allowed-IP lists would misstate what the
+                // peer may send and receive. Forget any older record for the
+                // same id too, since control has just said it is stale.
+                netmap.peers.remove(self.pending.id);
+                netmap.peers_truncated = true;
             }
             return;
         }
@@ -875,7 +902,9 @@ impl State {
                     if let Some(cidr) = Cidr4::from_cidr(cidr)
                         && self.pending.addresses.push(cidr).is_err()
                     {
-                        self.fail(Error::Full(CapacityError::Addresses));
+                        self.pending
+                            .oversized
+                            .get_or_insert(CapacityError::Addresses);
                     }
                 }
                 Err(_) => self.fail(Error::MalformedField(MalformedField::Address)),
@@ -899,7 +928,9 @@ impl State {
                     if let Some(cidr) = Cidr4::from_cidr(cidr)
                         && self.pending.allowed_ips.push(cidr).is_err()
                     {
-                        self.fail(Error::Full(CapacityError::AllowedIps));
+                        self.pending
+                            .oversized
+                            .get_or_insert(CapacityError::AllowedIps);
                     }
                 }
                 Err(_) => self.fail(Error::MalformedField(MalformedField::AllowedIp)),
@@ -932,10 +963,8 @@ impl State {
                 // An endpoint that does not parse is one path lost, not a
                 // broken netmap: the server is entitled to advertise address
                 // families this node cannot use.
-                if let Ok(core::net::SocketAddr::V4(endpoint)) = value.parse()
-                    && self.pending.endpoints.push(endpoint).is_err()
-                {
-                    self.fail(Error::Full(CapacityError::Endpoints));
+                if let Ok(core::net::SocketAddr::V4(endpoint)) = value.parse() {
+                    retain_endpoint(&mut self.pending.endpoints, endpoint);
                 }
             }
             Context::FilterSources => match Network::parse(value) {
@@ -1196,6 +1225,31 @@ fn display_name(value: &str) -> heapless::String<{ crate::netmap::MAX_PEER_NAME 
         }
     }
     name
+}
+
+/// Keep a bounded set of a peer's candidate paths rather than reject the map.
+///
+/// Tailscale clients list port-mapped and STUN-derived addresses before local
+/// interface addresses, so server order is kept, duplicates are collapsed, and
+/// later candidates are dropped once the list is full. The one exception is
+/// IPv4 link-local, which is reachable only on the same segment: a later
+/// routable candidate takes the place of the last retained link-local one.
+/// A dropped candidate costs at most a direct path; the peer stays reachable
+/// through DERP.
+fn retain_endpoint(
+    endpoints: &mut heapless::Vec<core::net::SocketAddrV4, { crate::netmap::MAX_ENDPOINTS }>,
+    endpoint: core::net::SocketAddrV4,
+) {
+    if endpoints.contains(&endpoint) {
+        return;
+    }
+    if endpoints.push(endpoint).is_ok() || endpoint.ip().is_link_local() {
+        return;
+    }
+    if let Some(index) = endpoints.iter().rposition(|kept| kept.ip().is_link_local()) {
+        endpoints.remove(index);
+        let _ = endpoints.push(endpoint);
+    }
 }
 
 /// Feeds bytes in and updates a [`Netmap`].
