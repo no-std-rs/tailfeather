@@ -817,258 +817,265 @@ async fn discover_home<P: Network, S: State, const PEERS: usize, const A: usize>
 mod tests {
     use super::*;
     use core::task::{Context, Waker};
-    use std::{boxed::Box, collections::VecDeque, string::String as Text, vec::Vec as List};
+    /// Session scheduling against the std-only runtime fixtures.
+    #[cfg(feature = "std")]
+    mod session {
+        use super::*;
+        use std::{boxed::Box, collections::VecDeque, string::String as Text, vec::Vec as List};
 
-    /// A control session after map start: map events and endpoint updates are
-    /// scripted, and every operation is logged in order.
-    struct ScriptedMaps<'a> {
-        staging: Box<tailfeather::netmap::Netmap<2>>,
-        events: &'a RefCell<VecDeque<MapEvent>>,
-        log: &'a RefCell<List<Text>>,
-    }
+        /// A control session after map start: map events and endpoint updates are
+        /// scripted, and every operation is logged in order.
+        struct ScriptedMaps<'a> {
+            staging: Box<tailfeather::netmap::Netmap<2>>,
+            events: &'a RefCell<VecDeque<MapEvent>>,
+            log: &'a RefCell<List<Text>>,
+        }
 
-    impl MapTransport<2> for ScriptedMaps<'_> {
-        fn has_pending_update(&self) -> bool {
-            false
-        }
-        fn staging(&mut self) -> &mut tailfeather::netmap::Netmap<2> {
-            &mut self.staging
-        }
-        async fn wait_input(&mut self) -> Result<(), Error> {
-            core::future::poll_fn(|_| {
-                if self.events.borrow().is_empty() {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Ok(()))
+        impl MapTransport<2> for ScriptedMaps<'_> {
+            fn has_pending_update(&self) -> bool {
+                false
+            }
+            fn staging(&mut self) -> &mut tailfeather::netmap::Netmap<2> {
+                &mut self.staging
+            }
+            async fn wait_input(&mut self) -> Result<(), Error> {
+                core::future::poll_fn(|_| {
+                    if self.events.borrow().is_empty() {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(()))
+                    }
+                })
+                .await
+            }
+            async fn next(&mut self) -> Result<MapEvent, Error> {
+                let event = core::future::poll_fn(|_| match self.events.borrow_mut().pop_front() {
+                    Some(event) => Poll::Ready(event),
+                    None => Poll::Pending,
+                })
+                .await;
+                if event == MapEvent::Applied {
+                    self.staging.addresses.clear();
+                    self.staging
+                        .addresses
+                        .push(tailfeather::netmap::Cidr::parse("100.64.0.1/32").unwrap())
+                        .unwrap();
                 }
-            })
-            .await
-        }
-        async fn next(&mut self) -> Result<MapEvent, Error> {
-            let event = core::future::poll_fn(|_| match self.events.borrow_mut().pop_front() {
-                Some(event) => Poll::Ready(event),
-                None => Poll::Pending,
-            })
-            .await;
-            if event == MapEvent::Applied {
-                self.staging.addresses.clear();
-                self.staging
-                    .addresses
-                    .push(tailfeather::netmap::Cidr::parse("100.64.0.1/32").unwrap())
-                    .unwrap();
+                self.log.borrow_mut().push(std::format!("map {event:?}"));
+                Ok(event)
             }
-            self.log.borrow_mut().push(std::format!("map {event:?}"));
-            Ok(event)
+            async fn update(&mut self, request: &[u8]) -> Result<(), Error> {
+                let request = core::str::from_utf8(request).unwrap();
+                let start = request.find("\"Endpoints\":").unwrap();
+                let end = start + request[start..].find(']').unwrap() + 1;
+                self.log
+                    .borrow_mut()
+                    .push(std::format!("publish {}", &request[start..end]));
+                Ok(())
+            }
         }
-        async fn update(&mut self, request: &[u8]) -> Result<(), Error> {
-            let request = core::str::from_utf8(request).unwrap();
-            let start = request.find("\"Endpoints\":").unwrap();
-            let end = start + request[start..].find(']').unwrap() + 1;
-            self.log
-                .borrow_mut()
-                .push(std::format!("publish {}", &request[start..end]));
-            Ok(())
-        }
-    }
 
-    struct Fixture {
-        clock: Cell<u64>,
-        events: RefCell<VecDeque<MapEvent>>,
-        log: RefCell<List<Text>>,
-        /// Sweep `n` (1-based) starts when first polled and completes once
-        /// `finished >= n`, reporting the current NAT `mapping`.
-        started: Cell<usize>,
-        finished: Cell<usize>,
-        mapping: Cell<u16>,
-    }
-
-    impl Fixture {
-        fn log(&self) -> List<Text> {
-            self.log.borrow().clone()
+        struct Fixture {
+            clock: Cell<u64>,
+            events: RefCell<VecDeque<MapEvent>>,
+            log: RefCell<List<Text>>,
+            /// Sweep `n` (1-based) starts when first polled and completes once
+            /// `finished >= n`, reporting the current NAT `mapping`.
+            started: Cell<usize>,
+            finished: Cell<usize>,
+            mapping: Cell<u16>,
         }
-        fn map_events(&self) -> usize {
-            self.log()
-                .iter()
-                .filter(|entry| entry.starts_with("map"))
-                .count()
-        }
-    }
 
-    /// Run `test` against [`follow`] after the stream's initial map, with no
-    /// further map events unless the test queues them.
-    fn with_session(
-        test: impl FnOnce(&mut dyn FnMut() -> Poll<Result<(), Error>>, &Fixture) + Send + 'static,
-    ) {
-        std::thread::Builder::new()
-            .stack_size(32 * 1024 * 1024)
-            .spawn(move || {
-                use super::super::tests::{MemoryState, Offline, config};
-                use tailfeather::keys::Identity;
-                let network = Offline(Cell::new(0), RefCell::new(List::new()));
-                let state = MemoryState::default();
-                let mut config = config();
-                config.relay_only = false;
-                let authority = Authority::parse(config.control_url, false)
-                    .unwrap()
-                    .digest();
-                let mut node = Box::new(Node::<2>::factory_reset_for_authority(
-                    Identity::generate(&mut crate::native::OsRng),
-                    1,
-                    authority,
-                ));
-                let generation = match node.poll(0).unwrap().unwrap() {
-                    NodeAction::PersistState(state) => state.generation(),
-                    _ => unreachable!(),
-                };
-                node.persistence_result(generation, true).unwrap();
-                let identity = node.identity().clone();
-                let runtime =
-                    Runtime::<_, _, 2, 8>::new(config, &mut node, &network, &state).unwrap();
-                let reactor = Reactor::with_clock(&network);
-                let fixture = Fixture {
-                    clock: Cell::new(0),
-                    events: RefCell::new(VecDeque::from([MapEvent::Applied])),
-                    log: RefCell::new(List::new()),
-                    started: Cell::new(0),
-                    finished: Cell::new(0),
-                    mapping: Cell::new(45_000),
-                };
-                let mut maps = ScriptedMaps {
-                    staging: Box::new(tailfeather::netmap::Netmap::new()),
-                    events: &fixture.events,
-                    log: &fixture.log,
-                };
-                let (public, disco) = (identity.node.public(), identity.disco.public());
-                let mut body = [0; 2048];
-                let sweep = || {
-                    let (runtime, fixture) = (&runtime, &fixture);
-                    async move {
-                        fixture.started.set(fixture.started.get() + 1);
-                        let sweep = fixture.started.get();
-                        core::future::poll_fn(|_| {
-                            if fixture.finished.get() >= sweep {
-                                Poll::Ready(())
-                            } else {
-                                Poll::Pending
-                            }
-                        })
-                        .await;
-                        let mut candidates = Vec::new();
-                        let mapped =
-                            SocketAddrV4::new(Ipv4Addr::new(198, 18, 0, 3), fixture.mapping.get());
-                        candidates.push(mapped).unwrap();
-                        runtime.candidates(candidates);
-                        0
-                    }
-                };
-                let mut session = core::pin::pin!(follow(
-                    &runtime, &reactor, &mut maps, sweep, &public, &disco, &mut body
-                ));
-                let mut context = Context::from_waker(Waker::noop());
-                // Poll past cooperative yields until the session blocks.
-                let mut poll = || {
-                    network.0.set(fixture.clock.get());
-                    for _ in 0..16 {
-                        if let Poll::Ready(result) = session.as_mut().poll(&mut context) {
-                            return Poll::Ready(result);
+        impl Fixture {
+            fn log(&self) -> List<Text> {
+                self.log.borrow().clone()
+            }
+            fn map_events(&self) -> usize {
+                self.log()
+                    .iter()
+                    .filter(|entry| entry.starts_with("map"))
+                    .count()
+            }
+        }
+
+        /// Run `test` against [`follow`] after the stream's initial map, with no
+        /// further map events unless the test queues them.
+        fn with_session(
+            test: impl FnOnce(&mut dyn FnMut() -> Poll<Result<(), Error>>, &Fixture) + Send + 'static,
+        ) {
+            std::thread::Builder::new()
+                .stack_size(32 * 1024 * 1024)
+                .spawn(move || {
+                    use crate::runtime::tests::{MemoryState, Offline, config};
+                    use tailfeather::keys::Identity;
+                    let network = Offline(Cell::new(0), RefCell::new(List::new()));
+                    let state = MemoryState::default();
+                    let mut config = config();
+                    config.relay_only = false;
+                    let authority = Authority::parse(config.control_url, false)
+                        .unwrap()
+                        .digest();
+                    let mut node = Box::new(Node::<2>::factory_reset_for_authority(
+                        Identity::generate(&mut crate::native::OsRng),
+                        1,
+                        authority,
+                    ));
+                    let generation = match node.poll(0).unwrap().unwrap() {
+                        NodeAction::PersistState(state) => state.generation(),
+                        _ => unreachable!(),
+                    };
+                    node.persistence_result(generation, true).unwrap();
+                    let identity = node.identity().clone();
+                    let runtime =
+                        Runtime::<_, _, 2, 8>::new(config, &mut node, &network, &state).unwrap();
+                    let reactor = Reactor::with_clock(&network);
+                    let fixture = Fixture {
+                        clock: Cell::new(0),
+                        events: RefCell::new(VecDeque::from([MapEvent::Applied])),
+                        log: RefCell::new(List::new()),
+                        started: Cell::new(0),
+                        finished: Cell::new(0),
+                        mapping: Cell::new(45_000),
+                    };
+                    let mut maps = ScriptedMaps {
+                        staging: Box::new(tailfeather::netmap::Netmap::new()),
+                        events: &fixture.events,
+                        log: &fixture.log,
+                    };
+                    let (public, disco) = (identity.node.public(), identity.disco.public());
+                    let mut body = [0; 2048];
+                    let sweep = || {
+                        let (runtime, fixture) = (&runtime, &fixture);
+                        async move {
+                            fixture.started.set(fixture.started.get() + 1);
+                            let sweep = fixture.started.get();
+                            core::future::poll_fn(|_| {
+                                if fixture.finished.get() >= sweep {
+                                    Poll::Ready(())
+                                } else {
+                                    Poll::Pending
+                                }
+                            })
+                            .await;
+                            let mut candidates = Vec::new();
+                            let mapped = SocketAddrV4::new(
+                                Ipv4Addr::new(198, 18, 0, 3),
+                                fixture.mapping.get(),
+                            );
+                            candidates.push(mapped).unwrap();
+                            runtime.candidates(candidates);
+                            0
                         }
-                    }
-                    Poll::Pending
-                };
-                test(&mut poll, &fixture);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
+                    };
+                    let mut session = core::pin::pin!(follow(
+                        &runtime, &reactor, &mut maps, sweep, &public, &disco, &mut body
+                    ));
+                    let mut context = Context::from_waker(Waker::noop());
+                    // Poll past cooperative yields until the session blocks.
+                    let mut poll = || {
+                        network.0.set(fixture.clock.get());
+                        for _ in 0..16 {
+                            if let Poll::Ready(result) = session.as_mut().poll(&mut context) {
+                                return Poll::Ready(result);
+                            }
+                        }
+                        Poll::Pending
+                    };
+                    test(&mut poll, &fixture);
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        }
 
-    #[test]
-    fn a_sweep_completing_during_a_quiet_map_read_is_published_without_a_map_event() {
-        with_session(|poll, fixture| {
-            assert!(poll().is_pending());
-            // The initial map's fallback endpoints are published first; only
-            // then does the sweep start, beside a quiet pending map read.
-            assert_eq!(fixture.log(), ["map Applied", "publish \"Endpoints\":[]"]);
-            assert_eq!(fixture.started.get(), 1);
-            fixture.finished.set(1);
-            assert!(poll().is_pending());
-            assert_eq!(
-                fixture.log(),
-                [
-                    "map Applied",
-                    "publish \"Endpoints\":[]",
-                    "publish \"Endpoints\":[\"198.18.0.3:45000\"]"
-                ],
-                "the completed sweep must be published while the map stream is quiet"
-            );
-        });
-    }
-
-    #[test]
-    fn a_re_sweep_starts_at_its_deadline_without_a_map_event() {
-        with_session(|poll, fixture| {
-            fixture.finished.set(1);
-            assert!(poll().is_pending());
-            assert_eq!(fixture.started.get(), 1);
-            // The NAT mapping changes after the first sweep.
-            fixture.mapping.set(46_000);
-            fixture.clock.set(RESWEEP_MS - 1);
-            assert!(poll().is_pending());
-            assert_eq!(fixture.started.get(), 1);
-            fixture.clock.set(RESWEEP_MS);
-            assert!(poll().is_pending());
-            assert_eq!(
-                fixture.started.get(),
-                2,
-                "the re-sweep must start at its deadline, not at the next map event"
-            );
-            fixture.finished.set(2);
-            assert!(poll().is_pending());
-            assert_eq!(
-                fixture.log().last().unwrap(),
-                "publish \"Endpoints\":[\"198.18.0.3:46000\"]"
-            );
-            assert_eq!(fixture.map_events(), 1);
-        });
-    }
-
-    #[test]
-    fn queued_map_input_is_applied_before_a_completed_sweep_is_published() {
-        with_session(|poll, fixture| {
-            assert!(poll().is_pending());
-            fixture.events.borrow_mut().push_back(MapEvent::Applied);
-            fixture.finished.set(1);
-            assert!(poll().is_pending());
-            assert_eq!(
-                fixture.log()[2..],
-                [
-                    "map Applied",
-                    "publish \"Endpoints\":[\"198.18.0.3:45000\"]"
-                ]
-            );
-        });
-    }
-
-    #[test]
-    fn interrupted_quiet_reads_do_not_extend_map_liveness() {
-        with_session(|poll, fixture| {
-            // Sweeps complete at once with an unchanged mapping, so repeated
-            // re-sweeps interrupt the quiet map read without publishing.
-            fixture.finished.set(usize::MAX);
-            assert!(poll().is_pending());
-            let publications = fixture.log().len();
-            for now in (RESWEEP_MS..MAP_LIVENESS_MS).step_by(10_000) {
-                fixture.clock.set(now);
+        #[test]
+        fn a_sweep_completing_during_a_quiet_map_read_is_published_without_a_map_event() {
+            with_session(|poll, fixture| {
                 assert!(poll().is_pending());
-            }
-            assert!(fixture.started.get() >= 3);
-            fixture.clock.set(MAP_LIVENESS_MS - 1);
-            assert!(poll().is_pending());
-            fixture.clock.set(MAP_LIVENESS_MS);
-            assert_eq!(poll(), Poll::Ready(Err("map timeout")));
-            assert_eq!(fixture.log().len(), publications);
-            assert_eq!(fixture.map_events(), 1);
-        });
+                // The initial map's fallback endpoints are published first; only
+                // then does the sweep start, beside a quiet pending map read.
+                assert_eq!(fixture.log(), ["map Applied", "publish \"Endpoints\":[]"]);
+                assert_eq!(fixture.started.get(), 1);
+                fixture.finished.set(1);
+                assert!(poll().is_pending());
+                assert_eq!(
+                    fixture.log(),
+                    [
+                        "map Applied",
+                        "publish \"Endpoints\":[]",
+                        "publish \"Endpoints\":[\"198.18.0.3:45000\"]"
+                    ],
+                    "the completed sweep must be published while the map stream is quiet"
+                );
+            });
+        }
+
+        #[test]
+        fn a_re_sweep_starts_at_its_deadline_without_a_map_event() {
+            with_session(|poll, fixture| {
+                fixture.finished.set(1);
+                assert!(poll().is_pending());
+                assert_eq!(fixture.started.get(), 1);
+                // The NAT mapping changes after the first sweep.
+                fixture.mapping.set(46_000);
+                fixture.clock.set(RESWEEP_MS - 1);
+                assert!(poll().is_pending());
+                assert_eq!(fixture.started.get(), 1);
+                fixture.clock.set(RESWEEP_MS);
+                assert!(poll().is_pending());
+                assert_eq!(
+                    fixture.started.get(),
+                    2,
+                    "the re-sweep must start at its deadline, not at the next map event"
+                );
+                fixture.finished.set(2);
+                assert!(poll().is_pending());
+                assert_eq!(
+                    fixture.log().last().unwrap(),
+                    "publish \"Endpoints\":[\"198.18.0.3:46000\"]"
+                );
+                assert_eq!(fixture.map_events(), 1);
+            });
+        }
+
+        #[test]
+        fn queued_map_input_is_applied_before_a_completed_sweep_is_published() {
+            with_session(|poll, fixture| {
+                assert!(poll().is_pending());
+                fixture.events.borrow_mut().push_back(MapEvent::Applied);
+                fixture.finished.set(1);
+                assert!(poll().is_pending());
+                assert_eq!(
+                    fixture.log()[2..],
+                    [
+                        "map Applied",
+                        "publish \"Endpoints\":[\"198.18.0.3:45000\"]"
+                    ]
+                );
+            });
+        }
+
+        #[test]
+        fn interrupted_quiet_reads_do_not_extend_map_liveness() {
+            with_session(|poll, fixture| {
+                // Sweeps complete at once with an unchanged mapping, so repeated
+                // re-sweeps interrupt the quiet map read without publishing.
+                fixture.finished.set(usize::MAX);
+                assert!(poll().is_pending());
+                let publications = fixture.log().len();
+                for now in (RESWEEP_MS..MAP_LIVENESS_MS).step_by(10_000) {
+                    fixture.clock.set(now);
+                    assert!(poll().is_pending());
+                }
+                assert!(fixture.started.get() >= 3);
+                fixture.clock.set(MAP_LIVENESS_MS - 1);
+                assert!(poll().is_pending());
+                fixture.clock.set(MAP_LIVENESS_MS);
+                assert_eq!(poll(), Poll::Ready(Err("map timeout")));
+                assert_eq!(fixture.log().len(), publications);
+                assert_eq!(fixture.map_events(), 1);
+            });
+        }
     }
 
     #[test]
