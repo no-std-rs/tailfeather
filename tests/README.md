@@ -17,6 +17,10 @@ capabilities. It preflights KVM, TUN, namespaces, veth, and kernel WireGuard;
 starts pinned Headscale, a TLS front, and pinned `tailscaled` on a real TUN;
 compares every conformance status with `expectations/lab.json`; and exercises
 example-responder, harness-responder, and harness-initiator WireGuard modes.
+`lab/reactor-rebind.sh` puts the shared reactor runtime and a stock
+`tailscaled` behind separate filtering NATs, changes the reactor node's public
+UDP mapping mid-session, and requires the stock client to reach the new port
+directly within 40 seconds, below Headscale's map keepalive interval.
 Diagnostics are printed on every failure and the guest plus host state is
 removed on exit.
 

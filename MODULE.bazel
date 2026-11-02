@@ -115,7 +115,11 @@ crate.from_cargo(
     name = "reactor_deps",
     cargo_lock = "//crates/tailfeather-reactor:Cargo.lock",
     cargo_toml = "//crates/tailfeather-reactor:Cargo.toml",
-    platform_triples = ["x86_64-unknown-linux-gnu"],
+    platform_triples = [
+        "x86_64-unknown-linux-gnu",
+        # The static lab node runs in the privileged lab's Alpine guest.
+        "x86_64-unknown-linux-musl",
+    ],
 )
 crate.annotation(
     crate = "tailfeather-reactor",
@@ -187,6 +191,12 @@ http_file(name = "apk_iproute2_ss", downloaded_file_path = "iproute2-ss-6.11.0-r
 http_file(name = "apk_iptables", downloaded_file_path = "iptables-1.8.11-r1.apk", sha256 = "659b088f780c9dca88b70587f87f6aa24582ca75008986b5913220b67e3cebef", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/iptables-1.8.11-r1.apk"])
 http_file(name = "apk_libcap2", downloaded_file_path = "libcap2-2.78-r0.apk", sha256 = "a2160f94232206985c3656fe4108bb7b25cf56cfda83b8488791b225cc6e7ed1", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libcap2-2.78-r0.apk"])
 http_file(name = "apk_libelf", downloaded_file_path = "libelf-0.191-r0.apk", sha256 = "6f98ef2df0544da22d910bc93fdb8eb50654ac822dd9d25f3a39ba8acde6c649", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libelf-0.191-r0.apk"])
+http_file(name = "apk_conntrack_tools", downloaded_file_path = "conntrack-tools-1.4.8-r0.apk", sha256 = "c4fbd3c0947a2656b4a6c807396e3b3abc318ba42112d53a20845142e3bfce6d", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/conntrack-tools-1.4.8-r0.apk"])
+http_file(name = "apk_libnetfilter_conntrack", downloaded_file_path = "libnetfilter_conntrack-1.0.9-r3.apk", sha256 = "7081252c236310d953661f8cc8a8f14be6f81c9c85a47f57d07b624170f6d0d4", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libnetfilter_conntrack-1.0.9-r3.apk"])
+http_file(name = "apk_libnetfilter_cthelper", downloaded_file_path = "libnetfilter_cthelper-1.0.1-r2.apk", sha256 = "1eee9c70524359bf2e0f6178bc096cd154b6a8460d52906fca39c9145cceb3e9", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libnetfilter_cthelper-1.0.1-r2.apk"])
+http_file(name = "apk_libnetfilter_cttimeout", downloaded_file_path = "libnetfilter_cttimeout-1.0.1-r2.apk", sha256 = "f5763226a49e3b652c6f575e95c1d69e98ce4128aed8f7731e903a0ab658a836", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libnetfilter_cttimeout-1.0.1-r2.apk"])
+http_file(name = "apk_libnetfilter_queue", downloaded_file_path = "libnetfilter_queue-1.0.5-r2.apk", sha256 = "a20f6132c56a5a02e20a2431118712a1ce9e296f54e56cae2551ce90ab67d95f", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libnetfilter_queue-1.0.5-r2.apk"])
+http_file(name = "apk_libnfnetlink", downloaded_file_path = "libnfnetlink-1.0.2-r3.apk", sha256 = "7b1b8468d42e5249cd1b038e5538e778328c8e57eb3c9037a96177539110c658", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libnfnetlink-1.0.2-r3.apk"])
 http_file(name = "apk_libmnl", downloaded_file_path = "libmnl-1.0.5-r2.apk", sha256 = "0de58a7968c96825f7ad1205ae0d18dd4d96c37db9dca31fee4727f6b08bc308", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libmnl-1.0.5-r2.apk"])
 http_file(name = "apk_libnftnl", downloaded_file_path = "libnftnl-1.2.8-r0.apk", sha256 = "de4048171138081548e581221d1b4642f07a6a638681b5db481b0edd54ba51b2", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libnftnl-1.2.8-r0.apk"])
 http_file(name = "apk_libxtables", downloaded_file_path = "libxtables-1.8.11-r1.apk", sha256 = "7bf83828c8c1c0b7b08aff38fdd2d11829fa77c7a750e6224b0b30fae0aecc0e", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/libxtables-1.8.11-r1.apk"])

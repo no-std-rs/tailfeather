@@ -46,6 +46,19 @@ rust_test(
     deps = [":tailfeather_reactor"] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
 )
 
+# One shared-runtime node for the privileged lab's NAT rebinding scenario.
+rust_binary(
+    name = "lab_node_static",
+    testonly = True,
+    srcs = ["examples/lab_node.rs"],
+    aliases = aliases(),
+    crate_name = "lab_node",
+    crate_root = "examples/lab_node.rs",
+    edition = "2024",
+    platform = "//platforms:x86_64_linux_musl",
+    deps = [":tailfeather_reactor"] + all_crate_deps(normal = True),
+)
+
 rust_binary(
     name = "throughput",
     srcs = ["benches/throughput.rs", "benches/throughput/mesh.rs"],

@@ -177,5 +177,9 @@ for mode in nat udp-blocked hard-nat; do
         /opt/lab/ssh-server /opt/lab/headscale.yaml "$mode" >"$STATE/ssh-network-$mode.log" 2>&1
 done
 
+echo "guest-controller: running shared-runtime NAT rebinding acceptance"
+timeout 300 bash /opt/lab/reactor-rebind.sh /opt/lab/headscale /opt/lab/tailscale /opt/lab/tailscaled \
+    /opt/lab/reactor-node /opt/lab/headscale.yaml /usr/sbin/conntrack >"$STATE/reactor-rebind.log" 2>&1
+
 trap - EXIT HUP INT TERM
 diagnostics

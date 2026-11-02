@@ -37,6 +37,7 @@ sh_test(
 
 APK_FILES = [
     "@apk_bash//file",
+    "@apk_conntrack_tools//file",
     "@apk_ethtool//file",
     "@apk_iproute2_minimal//file",
     "@apk_iproute2_ss//file",
@@ -45,6 +46,11 @@ APK_FILES = [
     "@apk_libcrypto3//file",
     "@apk_libelf//file",
     "@apk_libmnl//file",
+    "@apk_libnetfilter_conntrack//file",
+    "@apk_libnetfilter_cthelper//file",
+    "@apk_libnetfilter_cttimeout//file",
+    "@apk_libnetfilter_queue//file",
+    "@apk_libnfnetlink//file",
     "@apk_libnftnl//file",
     "@apk_libxtables//file",
     "@apk_libncursesw//file",
@@ -77,6 +83,8 @@ sh_test(
         "--harness=$(rootpath //harness:harness)",
         "--ssh-server=$(rootpath //crates/tailfeather-ssh:live_server_static)",
         "--ssh-network=$(rootpath :ssh-network.sh)",
+        "--reactor-node=$(rootpath //crates/tailfeather-reactor:lab_node_static)",
+        "--reactor-rebind=$(rootpath :reactor-rebind.sh)",
         "--responder=$(rootpath //crates/wirefeather:responder_static)",
         "--interop=$(rootpath //scripts:interop-wireguard.sh)",
         "--nostd-interop=$(rootpath //scripts:nostd-interop.sh)",
@@ -92,6 +100,8 @@ sh_test(
         "//harness:harness",
         "//crates/tailfeather-ssh:live_server_static",
         "ssh-network.sh",
+        "reactor-rebind.sh",
+        "//crates/tailfeather-reactor:lab_node_static",
         "//scripts:interop-wireguard.sh",
         "//scripts:nostd-interop.sh",
         "//scripts:libkrunfw_networking",
@@ -112,6 +122,7 @@ sh_test(
         "no-remote",
     ],
     # Inner budgets: conformance 360s, WireGuard 120s, no-std 180s,
-    # SSH scenarios 980s, plus setup. The VM caps the total at 1800s.
+    # SSH scenarios 980s, reactor rebinding 300s, plus setup. The VM caps the
+    # total at 2400s.
     timeout = "eternal",
 )

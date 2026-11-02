@@ -930,6 +930,22 @@ where
         self.statuses.get(stream)
     }
 
+    /// Wait until decrypted HTTP/2 input is buffered, without consuming it.
+    ///
+    /// Unlike request and map operations, which also write flow-control and
+    /// PING/SETTINGS acknowledgements, this only reads. Partial Noise record
+    /// progress is retained in the connection, so dropping this future loses
+    /// nothing provided the underlying stream's reads are cancellation-safe.
+    pub async fn wait_readable(&mut self) -> Result<(), Error<S::Error>> {
+        while self.filled == 0
+            && self.plaintext_start == self.plaintext_end
+            && self.data.is_none_or(|data| data.remaining != 0)
+        {
+            self.fill().await?;
+        }
+        Ok(())
+    }
+
     async fn send(&mut self, mut plaintext: &[u8]) -> Result<(), Error<S::Error>> {
         let mut record = [0; noise::MAX_MESSAGE];
         while !plaintext.is_empty() {
@@ -1212,6 +1228,27 @@ impl<const PEERS: usize> MapStream<PEERS> {
     /// while this is true: the parser's progress lives in that lease.
     pub fn has_partial_response(&self) -> bool {
         self.document_started
+    }
+
+    /// Wait until [`Self::next`] has a queued event or buffered input to
+    /// process. This never consumes input, parses, or writes, so a caller may
+    /// drop it to do other work on the connection and later call `next`
+    /// without losing progress, provided the underlying stream's reads are
+    /// cancellation-safe. `next` itself is not cancellation-safe: it writes
+    /// HTTP/2 acknowledgements and flow-control updates while reading.
+    pub async fn wait_input<S, B, C>(
+        &self,
+        http2: &mut Http2<S, B, C>,
+    ) -> Result<(), Error<S::Error>>
+    where
+        S: Read + Write,
+        B: AsRef<[u8]> + AsMut<[u8]>,
+        C: BorrowMut<Connection>,
+    {
+        if !self.pending.is_empty() || self.ended {
+            return Ok(());
+        }
+        http2.wait_readable().await
     }
 
     pub async fn start<S, B, C>(
@@ -2383,6 +2420,60 @@ mod tests {
         assert!(
             staging.peers.get(7).is_some(),
             "dropping next and reseeding public staging must not lose private peer tokens"
+        );
+    }
+
+    #[test]
+    fn map_lease_wait_input_is_read_only_and_cancellation_safe() {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        let mut context = Context::from_waker(Waker::noop());
+        let frames = [lease_headers(1, false), lease_data(&[0; 4])];
+        let mut http = lease_http(&frames);
+        lease_available_frames(&mut http, &frames, 1);
+        let mut map = lease_stream::<2>(&mut http);
+        let mut staging = lease_netmap::<2>();
+        let mut working = lease_netmap::<2>();
+        // Consume the response headers; the stream is then quiet.
+        {
+            let mut next = core::pin::pin!(map.next(&mut http, &mut staging, &mut working));
+            assert!(next.as_mut().poll(&mut context).is_pending());
+        }
+        let written = http.stream.written.len();
+        {
+            let mut wait = core::pin::pin!(map.wait_input(&mut http));
+            assert!(wait.as_mut().poll(&mut context).is_pending());
+        }
+        // Expose one byte of the keepalive's encrypted record header, so the
+        // dropped wait owns partial Noise record progress.
+        http.stream.available = http.stream.available.map(|limit| limit + 1);
+        {
+            let mut wait = core::pin::pin!(map.wait_input(&mut http));
+            assert!(wait.as_mut().poll(&mut context).is_pending());
+        }
+        lease_available_frames(&mut http, &frames, 2);
+        {
+            let mut wait = core::pin::pin!(map.wait_input(&mut http));
+            assert!(matches!(
+                wait.as_mut().poll(&mut context),
+                Poll::Ready(Ok(()))
+            ));
+        }
+        // Buffered input stays ready until `next` consumes it.
+        assert!(matches!(
+            core::pin::pin!(map.wait_input(&mut http))
+                .as_mut()
+                .poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            http.stream.written.len(),
+            written,
+            "waiting for map input must never write"
+        );
+        assert_eq!(
+            block_on(map.next(&mut http, &mut staging, &mut working)).unwrap(),
+            MapEvent::KeepAlive
         );
     }
 
