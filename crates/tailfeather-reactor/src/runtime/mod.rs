@@ -26,6 +26,7 @@ use tailfeather::{ControlCommand, ControlEvent, DerpCommand, Node, NodeAction, P
 
 mod control;
 mod derp;
+mod read_ahead;
 
 pub type Error = &'static str;
 
@@ -813,7 +814,7 @@ impl<P: Network, S: State, const PEERS: usize, const A: usize> PacketIo
 mod tests {
     use super::*;
 
-    struct PendingStream;
+    pub(super) struct PendingStream;
     impl embedded_io_async::ErrorType for PendingStream {
         type Error = core::convert::Infallible;
     }
@@ -837,7 +838,10 @@ mod tests {
             (Self, Self)
         }
     }
-    struct Offline(Cell<u64>, RefCell<std::vec::Vec<SocketAddrV4>>);
+    pub(super) struct Offline(
+        pub(super) Cell<u64>,
+        pub(super) RefCell<std::vec::Vec<SocketAddrV4>>,
+    );
     impl Clock for Offline {
         fn now_millis(&self) -> u64 {
             self.0.get()
@@ -899,7 +903,7 @@ mod tests {
         }
     }
     #[derive(Default)]
-    struct MemoryState {
+    pub(super) struct MemoryState {
         identities: Cell<usize>,
         timestamps: Cell<usize>,
     }
@@ -919,7 +923,7 @@ mod tests {
             Ok(())
         }
     }
-    fn config() -> Config<'static> {
+    pub(super) fn config() -> Config<'static> {
         Config {
             control_url: "https://control.invalid",
             hostname: "fixture",

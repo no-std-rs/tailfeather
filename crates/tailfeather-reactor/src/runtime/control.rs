@@ -247,6 +247,14 @@ fn apply_map<P: Network, S: State, const PEERS: usize, const A: usize>(
     Ok(())
 }
 
+/// Read-ahead for the control connection; bounds one adapter read.
+const CONTROL_READ_AHEAD: usize = 512;
+/// The long-poll is abandoned after this long without a map event or an
+/// acknowledged endpoint update. Server keepalives arrive well within it.
+const MAP_LIVENESS_MS: u64 = 90_000;
+/// A completed STUN sweep is repeated after this long, map events or not.
+const RESWEEP_MS: u64 = 30_000;
+
 async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
     runtime: &Runtime<'_, P, S, PEERS, A>,
     reactor: &Reactor<&P>,
@@ -285,7 +293,7 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
             .map_err(|_| "key fetch deadline")?
             .map_err(|_| "key fetch")?
     };
-    let stream = reactor
+    let mut stream = reactor
         .timeout(
             35_000,
             runtime.network.connect(
@@ -298,11 +306,41 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
         )
         .await
         .map_err(|_| "control TLS deadline")??;
+    // The session drops its map read whenever discovery needs the
+    // connection. Adapter reads need not be cancellation-safe, so one
+    // persistent read feeds every protocol read for the connection's life.
+    let (mut reader, writer) = stream.split();
+    let ahead = read_ahead::ReadAhead::<CONTROL_READ_AHEAD>::new();
+    let pipe = read_ahead::Pipe {
+        ahead: &ahead,
+        writer,
+    };
+    match select(
+        control(runtime, reactor, &host, &key, pipe, staging, working),
+        ahead.pump(&mut reader),
+    )
+    .await
+    {
+        Either::First(result) => result,
+        Either::Second(never) => match never {},
+    }
+}
+
+async fn control<P: Network, S: State, T: Read + Write, const PEERS: usize, const A: usize>(
+    runtime: &Runtime<'_, P, S, PEERS, A>,
+    reactor: &Reactor<&P>,
+    host: &str,
+    key: &tailfeather::keys::MachinePublic,
+    stream: T,
+    staging: &mut tailfeather::netmap::Netmap<PEERS>,
+    working: &mut tailfeather::netmap::Netmap<PEERS>,
+) -> Result<(), Error> {
+    let config = &runtime.config;
     let identity = runtime.node.borrow().identity().clone();
     let noise = reactor
         .timeout(
             20_000,
-            transport::establish(stream, &host, &identity, &key, &mut runtime.network.rng()),
+            transport::establish(stream, host, &identity, key, &mut runtime.network.rng()),
         )
         .await
         .map_err(|_| "control Noise deadline")?
@@ -351,7 +389,7 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
             http.request(
                 "POST",
                 tailfeather::control::register::PATH,
-                &host,
+                host,
                 &body[..len],
                 &mut response,
             ),
@@ -408,48 +446,223 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
     reactor
         .timeout(
             30_000,
-            MapStream::start_in(&mut maps, &mut http, &host, request),
+            MapStream::start_in(&mut maps, &mut http, host, request),
         )
         .await
         .map_err(|_| "map start deadline")?
         .map_err(|_| "map start")?;
+    let mut transport = Http2Maps {
+        http: &mut http,
+        maps: &mut maps,
+        staging,
+        working,
+        host,
+    };
+    follow(
+        runtime,
+        reactor,
+        &mut transport,
+        || discover_home(runtime, reactor),
+        &public,
+        &disco,
+        &mut body[..],
+    )
+    .await
+}
+
+/// The map and endpoint operations of one established control session.
+#[allow(async_fn_in_trait)]
+trait MapTransport<const PEERS: usize> {
+    /// See [`MapStream::has_pending_update`].
+    fn has_pending_update(&self) -> bool;
+    fn staging(&mut self) -> &mut tailfeather::netmap::Netmap<PEERS>;
+    /// Wait for map input without consuming it or writing. Cancellation-safe.
+    async fn wait_input(&mut self) -> Result<(), Error>;
+    /// Read the next map event. Not cancellation-safe.
+    async fn next(&mut self) -> Result<MapEvent, Error>;
+    /// Send one non-streaming endpoint update. Not cancellation-safe.
+    async fn update(&mut self, request: &[u8]) -> Result<(), Error>;
+}
+
+struct Http2Maps<'a, T, const PEERS: usize> {
+    http: &'a mut transport::Http2<T>,
+    maps: &'a mut MapStream<PEERS>,
+    staging: &'a mut tailfeather::netmap::Netmap<PEERS>,
+    working: &'a mut tailfeather::netmap::Netmap<PEERS>,
+    host: &'a str,
+}
+
+impl<T: Read + Write, const PEERS: usize> MapTransport<PEERS> for Http2Maps<'_, T, PEERS> {
+    fn has_pending_update(&self) -> bool {
+        self.maps.has_pending_update()
+    }
+    fn staging(&mut self) -> &mut tailfeather::netmap::Netmap<PEERS> {
+        self.staging
+    }
+    async fn wait_input(&mut self) -> Result<(), Error> {
+        self.maps.wait_input(self.http).await.map_err(map_error)
+    }
+    async fn next(&mut self) -> Result<MapEvent, Error> {
+        self.maps
+            .next(self.http, self.staging, self.working)
+            .await
+            .map_err(map_error)
+    }
+    async fn update(&mut self, request: &[u8]) -> Result<(), Error> {
+        transport::send_endpoint_update(
+            self.http,
+            self.maps,
+            self.staging,
+            self.working,
+            self.host,
+            request,
+        )
+        .await
+        .map_err(map_error)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Wake {
+    /// Map input is buffered or queued.
+    Input,
+    /// The sweep completed while the map stream was quiet.
+    Discovered,
+    /// The re-sweep deadline passed while the map stream was quiet.
+    Resweep,
+}
+
+/// Wait on a quiet map stream until input arrives, the sweep completes, or the
+/// re-sweep deadline passes. Only the cancellation-safe input wait is
+/// dropped; no map event is consumed and nothing is written here.
+async fn wait_map<C: Clock, T: MapTransport<PEERS>, D: Future, const PEERS: usize>(
+    reactor: &Reactor<C>,
+    maps: &mut T,
+    mut discovery: Pin<&mut D>,
+    completed: &mut Option<D::Output>,
+    resweep_at: Option<u64>,
+    dead_at: u64,
+) -> Result<Wake, Error> {
+    let mut input = core::pin::pin!(maps.wait_input());
+    let mut resweep = core::pin::pin!(async {
+        match resweep_at {
+            Some(at) => reactor.sleep_until(at).await,
+            None => core::future::pending().await,
+        }
+    });
+    let mut dead = core::pin::pin!(reactor.sleep_until(dead_at));
+    core::future::poll_fn(|cx| {
+        let discovered = completed.is_none()
+            && match discovery.as_mut().poll(cx) {
+                Poll::Ready(result) => {
+                    *completed = Some(result);
+                    true
+                }
+                Poll::Pending => false,
+            };
+        // Queued or buffered map input wins: a newer staged map must be
+        // applied before anything is published from the active one.
+        if let Poll::Ready(result) = input.as_mut().poll(cx) {
+            return Poll::Ready(result.map(|()| Wake::Input));
+        }
+        if discovered {
+            return Poll::Ready(Ok(Wake::Discovered));
+        }
+        if resweep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(Wake::Resweep));
+        }
+        if dead.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err("map timeout"));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Follow an established map stream: apply map events, run STUN sweeps and
+/// publish endpoint/home changes as soon as they are known.
+async fn follow<P, S, T, D, const PEERS: usize, const A: usize>(
+    runtime: &Runtime<'_, P, S, PEERS, A>,
+    reactor: &Reactor<&P>,
+    maps: &mut T,
+    mut sweep: impl FnMut() -> D,
+    public: &tailfeather::keys::NodePublic,
+    disco: &tailfeather::keys::DiscoPublic,
+    body: &mut [u8],
+) -> Result<(), Error>
+where
+    P: Network,
+    S: State,
+    T: MapTransport<PEERS>,
+    D: Future<Output = u16>,
+{
+    let config = &runtime.config;
     let mut home = 0;
     let mut published_home = None;
     let mut published_generation = 0;
     let mut bootstrapped = false;
+    // Interrupting a quiet read for discovery does not extend map liveness.
+    let mut alive_at = reactor.clock_millis();
     loop {
-        // One sweep remains pinned across both map reads and endpoint writes.
-        // Its body is not polled until the initial map's fallback home/local
+        // One sweep remains pinned across map reads and endpoint writes. Its
+        // body is not polled until the initial map's fallback home/local
         // endpoints have been published successfully.
-        let mut discovery = core::pin::pin!(async {
-            let measured = discover_home(runtime, reactor).await;
+        let sweep = sweep();
+        let mut discovery = core::pin::pin!(async move {
+            let measured = sweep.await;
             (measured, reactor.clock_millis())
         });
         let mut completed = None;
         loop {
-            if !maps.has_pending_update() {
-                runtime.node.borrow().seed_staging(staging);
-            }
-            let event = drive_http(
-                reactor.timeout(90_000, maps.next(&mut http, staging, working)),
-                discovery.as_mut(),
-                &mut completed,
-                bootstrapped,
-            )
-            .await
-            .map_err(|_| "map timeout")?
-            .map_err(map_error)?;
-            apply_map(runtime, staging, event)?;
-            if maps.has_pending_update() {
-                // A queued keepalive can precede an already parsed Applied
-                // event. Consume it before selecting/publishing from the old
-                // active map, preserving the uncommitted staging lease.
-                crate::exec::yield_now().await;
-                continue;
-            }
-            if !bootstrapped && !matches!(event, MapEvent::Applied) {
-                crate::exec::yield_now().await;
-                continue;
+            let wake = if bootstrapped {
+                let resweep_at = completed
+                    .as_ref()
+                    .map(|(_, at): &(u16, u64)| at.saturating_add(RESWEEP_MS));
+                wait_map(
+                    reactor,
+                    maps,
+                    discovery.as_mut(),
+                    &mut completed,
+                    resweep_at,
+                    alive_at.saturating_add(MAP_LIVENESS_MS),
+                )
+                .await?
+            } else {
+                Wake::Input
+            };
+            match wake {
+                Wake::Resweep => break,
+                // Input was neither buffered nor queued, so no newer map is
+                // staged: the active map is a coherent snapshot to publish from.
+                Wake::Discovered => debug_assert!(!maps.has_pending_update()),
+                Wake::Input => {
+                    if !maps.has_pending_update() {
+                        runtime.node.borrow().seed_staging(maps.staging());
+                    }
+                    // Input has arrived, so the read normally completes
+                    // promptly; a partial document keeps the full deadline.
+                    let event = drive_http(
+                        reactor.timeout(MAP_LIVENESS_MS, maps.next()),
+                        discovery.as_mut(),
+                        &mut completed,
+                        bootstrapped,
+                    )
+                    .await
+                    .map_err(|_| "map timeout")??;
+                    alive_at = reactor.clock_millis();
+                    apply_map(runtime, maps.staging(), event)?;
+                    if maps.has_pending_update() {
+                        // A queued keepalive can precede an already parsed
+                        // Applied event. Consume it before selecting/publishing
+                        // from the old active map, preserving the staging lease.
+                        crate::exec::yield_now().await;
+                        continue;
+                    }
+                    if !bootstrapped && !matches!(event, MapEvent::Applied) {
+                        crate::exec::yield_now().await;
+                        continue;
+                    }
+                }
             }
 
             loop {
@@ -468,8 +681,8 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
                     let refs: Vec<&str, 8> = texts.iter().map(|text| text.as_str()).collect();
                     let request = MapRequest {
                         version: tailfeather::control::CAPABILITY_VERSION,
-                        node_key: &public,
-                        disco_key: &disco,
+                        node_key: public,
+                        disco_key: disco,
                         hostinfo: hostinfo(config, home, home == 0),
                         stream: false,
                         omit_peers: true,
@@ -480,23 +693,18 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
                         .write(&mut body[..])
                         .map_err(|_| "endpoint request size")?;
                     if !maps.has_pending_update() {
-                        runtime.node.borrow().seed_staging(staging);
+                        runtime.node.borrow().seed_staging(maps.staging());
                     }
                     let was_complete = completed.is_some();
                     drive_http(
-                        reactor.timeout(
-                            30_000,
-                            transport::send_endpoint_update(
-                                &mut http, &mut maps, staging, working, &host, request,
-                            ),
-                        ),
+                        reactor.timeout(30_000, maps.update(request)),
                         discovery.as_mut(),
                         &mut completed,
                         bootstrapped,
                     )
                     .await
-                    .map_err(|_| "endpoint update deadline")?
-                    .map_err(map_error)?;
+                    .map_err(|_| "endpoint update deadline")??;
+                    alive_at = reactor.clock_millis();
                     // Discovery may have changed candidates while the old snapshot
                     // was being sent. Acknowledge only the generation actually sent.
                     published_home = Some(home);
@@ -516,13 +724,10 @@ async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
             }
             if completed
                 .as_ref()
-                .is_some_and(|(_, at)| reactor.clock_millis() >= at.saturating_add(30_000))
+                .is_some_and(|(_, at)| reactor.clock_millis() >= at.saturating_add(RESWEEP_MS))
             {
                 break;
             }
-            // Completion during a quiet pending map read does not cancel that
-            // read to publish new endpoints. Publication waits for an HTTP/map
-            // boundary (or the existing deadline abandons the whole session).
             crate::exec::yield_now().await;
         }
     }
@@ -612,6 +817,259 @@ async fn discover_home<P: Network, S: State, const PEERS: usize, const A: usize>
 mod tests {
     use super::*;
     use core::task::{Context, Waker};
+    use std::{boxed::Box, collections::VecDeque, string::String as Text, vec::Vec as List};
+
+    /// A control session after map start: map events and endpoint updates are
+    /// scripted, and every operation is logged in order.
+    struct ScriptedMaps<'a> {
+        staging: Box<tailfeather::netmap::Netmap<2>>,
+        events: &'a RefCell<VecDeque<MapEvent>>,
+        log: &'a RefCell<List<Text>>,
+    }
+
+    impl MapTransport<2> for ScriptedMaps<'_> {
+        fn has_pending_update(&self) -> bool {
+            false
+        }
+        fn staging(&mut self) -> &mut tailfeather::netmap::Netmap<2> {
+            &mut self.staging
+        }
+        async fn wait_input(&mut self) -> Result<(), Error> {
+            core::future::poll_fn(|_| {
+                if self.events.borrow().is_empty() {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            })
+            .await
+        }
+        async fn next(&mut self) -> Result<MapEvent, Error> {
+            let event = core::future::poll_fn(|_| match self.events.borrow_mut().pop_front() {
+                Some(event) => Poll::Ready(event),
+                None => Poll::Pending,
+            })
+            .await;
+            if event == MapEvent::Applied {
+                self.staging.addresses.clear();
+                self.staging
+                    .addresses
+                    .push(tailfeather::netmap::Cidr::parse("100.64.0.1/32").unwrap())
+                    .unwrap();
+            }
+            self.log.borrow_mut().push(std::format!("map {event:?}"));
+            Ok(event)
+        }
+        async fn update(&mut self, request: &[u8]) -> Result<(), Error> {
+            let request = core::str::from_utf8(request).unwrap();
+            let start = request.find("\"Endpoints\":").unwrap();
+            let end = start + request[start..].find(']').unwrap() + 1;
+            self.log
+                .borrow_mut()
+                .push(std::format!("publish {}", &request[start..end]));
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        clock: Cell<u64>,
+        events: RefCell<VecDeque<MapEvent>>,
+        log: RefCell<List<Text>>,
+        /// Sweep `n` (1-based) starts when first polled and completes once
+        /// `finished >= n`, reporting the current NAT `mapping`.
+        started: Cell<usize>,
+        finished: Cell<usize>,
+        mapping: Cell<u16>,
+    }
+
+    impl Fixture {
+        fn log(&self) -> List<Text> {
+            self.log.borrow().clone()
+        }
+        fn map_events(&self) -> usize {
+            self.log()
+                .iter()
+                .filter(|entry| entry.starts_with("map"))
+                .count()
+        }
+    }
+
+    /// Run `test` against [`follow`] after the stream's initial map, with no
+    /// further map events unless the test queues them.
+    fn with_session(
+        test: impl FnOnce(&mut dyn FnMut() -> Poll<Result<(), Error>>, &Fixture) + Send + 'static,
+    ) {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                use super::super::tests::{MemoryState, Offline, config};
+                use tailfeather::keys::Identity;
+                let network = Offline(Cell::new(0), RefCell::new(List::new()));
+                let state = MemoryState::default();
+                let mut config = config();
+                config.relay_only = false;
+                let authority = Authority::parse(config.control_url, false)
+                    .unwrap()
+                    .digest();
+                let mut node = Box::new(Node::<2>::factory_reset_for_authority(
+                    Identity::generate(&mut crate::native::OsRng),
+                    1,
+                    authority,
+                ));
+                let generation = match node.poll(0).unwrap().unwrap() {
+                    NodeAction::PersistState(state) => state.generation(),
+                    _ => unreachable!(),
+                };
+                node.persistence_result(generation, true).unwrap();
+                let identity = node.identity().clone();
+                let runtime =
+                    Runtime::<_, _, 2, 8>::new(config, &mut node, &network, &state).unwrap();
+                let reactor = Reactor::with_clock(&network);
+                let fixture = Fixture {
+                    clock: Cell::new(0),
+                    events: RefCell::new(VecDeque::from([MapEvent::Applied])),
+                    log: RefCell::new(List::new()),
+                    started: Cell::new(0),
+                    finished: Cell::new(0),
+                    mapping: Cell::new(45_000),
+                };
+                let mut maps = ScriptedMaps {
+                    staging: Box::new(tailfeather::netmap::Netmap::new()),
+                    events: &fixture.events,
+                    log: &fixture.log,
+                };
+                let (public, disco) = (identity.node.public(), identity.disco.public());
+                let mut body = [0; 2048];
+                let sweep = || {
+                    let (runtime, fixture) = (&runtime, &fixture);
+                    async move {
+                        fixture.started.set(fixture.started.get() + 1);
+                        let sweep = fixture.started.get();
+                        core::future::poll_fn(|_| {
+                            if fixture.finished.get() >= sweep {
+                                Poll::Ready(())
+                            } else {
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                        let mut candidates = Vec::new();
+                        let mapped =
+                            SocketAddrV4::new(Ipv4Addr::new(198, 18, 0, 3), fixture.mapping.get());
+                        candidates.push(mapped).unwrap();
+                        runtime.candidates(candidates);
+                        0
+                    }
+                };
+                let mut session = core::pin::pin!(follow(
+                    &runtime, &reactor, &mut maps, sweep, &public, &disco, &mut body
+                ));
+                let mut context = Context::from_waker(Waker::noop());
+                // Poll past cooperative yields until the session blocks.
+                let mut poll = || {
+                    network.0.set(fixture.clock.get());
+                    for _ in 0..16 {
+                        if let Poll::Ready(result) = session.as_mut().poll(&mut context) {
+                            return Poll::Ready(result);
+                        }
+                    }
+                    Poll::Pending
+                };
+                test(&mut poll, &fixture);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_sweep_completing_during_a_quiet_map_read_is_published_without_a_map_event() {
+        with_session(|poll, fixture| {
+            assert!(poll().is_pending());
+            // The initial map's fallback endpoints are published first; only
+            // then does the sweep start, beside a quiet pending map read.
+            assert_eq!(fixture.log(), ["map Applied", "publish \"Endpoints\":[]"]);
+            assert_eq!(fixture.started.get(), 1);
+            fixture.finished.set(1);
+            assert!(poll().is_pending());
+            assert_eq!(
+                fixture.log(),
+                [
+                    "map Applied",
+                    "publish \"Endpoints\":[]",
+                    "publish \"Endpoints\":[\"198.18.0.3:45000\"]"
+                ],
+                "the completed sweep must be published while the map stream is quiet"
+            );
+        });
+    }
+
+    #[test]
+    fn a_re_sweep_starts_at_its_deadline_without_a_map_event() {
+        with_session(|poll, fixture| {
+            fixture.finished.set(1);
+            assert!(poll().is_pending());
+            assert_eq!(fixture.started.get(), 1);
+            // The NAT mapping changes after the first sweep.
+            fixture.mapping.set(46_000);
+            fixture.clock.set(RESWEEP_MS - 1);
+            assert!(poll().is_pending());
+            assert_eq!(fixture.started.get(), 1);
+            fixture.clock.set(RESWEEP_MS);
+            assert!(poll().is_pending());
+            assert_eq!(
+                fixture.started.get(),
+                2,
+                "the re-sweep must start at its deadline, not at the next map event"
+            );
+            fixture.finished.set(2);
+            assert!(poll().is_pending());
+            assert_eq!(
+                fixture.log().last().unwrap(),
+                "publish \"Endpoints\":[\"198.18.0.3:46000\"]"
+            );
+            assert_eq!(fixture.map_events(), 1);
+        });
+    }
+
+    #[test]
+    fn queued_map_input_is_applied_before_a_completed_sweep_is_published() {
+        with_session(|poll, fixture| {
+            assert!(poll().is_pending());
+            fixture.events.borrow_mut().push_back(MapEvent::Applied);
+            fixture.finished.set(1);
+            assert!(poll().is_pending());
+            assert_eq!(
+                fixture.log()[2..],
+                [
+                    "map Applied",
+                    "publish \"Endpoints\":[\"198.18.0.3:45000\"]"
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn interrupted_quiet_reads_do_not_extend_map_liveness() {
+        with_session(|poll, fixture| {
+            // Sweeps complete at once with an unchanged mapping, so repeated
+            // re-sweeps interrupt the quiet map read without publishing.
+            fixture.finished.set(usize::MAX);
+            assert!(poll().is_pending());
+            let publications = fixture.log().len();
+            for now in (RESWEEP_MS..MAP_LIVENESS_MS).step_by(10_000) {
+                fixture.clock.set(now);
+                assert!(poll().is_pending());
+            }
+            assert!(fixture.started.get() >= 3);
+            fixture.clock.set(MAP_LIVENESS_MS - 1);
+            assert!(poll().is_pending());
+            fixture.clock.set(MAP_LIVENESS_MS);
+            assert_eq!(poll(), Poll::Ready(Err("map timeout")));
+            assert_eq!(fixture.log().len(), publications);
+            assert_eq!(fixture.map_events(), 1);
+        });
+    }
 
     #[test]
     fn bootstrap_http_completes_before_discovery_is_polled() {

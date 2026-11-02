@@ -73,3 +73,7 @@ wirefeather = { path = "../wirefeather" }
 [[example]]
 name = "cpu"
 required-features = ["std"]
+
+[[example]]
+name = "lab_node"
+required-features = ["std"]
