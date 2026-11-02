@@ -75,13 +75,13 @@ pub const MAX_ALLOWED_IPS: usize = 8;
 ///
 /// Ordinary clients advertise more than eight: a STUN address, a port mapping,
 /// and one per interface, which on a Linux host with container or CI bridges
-/// is already a dozen. Sixteen covers those at 48 bytes per list over the old
-/// bound of eight: 1.5 KiB per `Netmap<32>`, and 4.5 KiB per `Node<32>`, which
-/// also keeps two path lists per peer. That leaves `Node<32>` inside its
-/// 64 KiB device budget; twenty-four would not.
+/// reaches ten. Each extra slot costs 6 bytes in three lists per peer (the
+/// map's record and the node's two path lists), so twelve adds 2.25 KiB to
+/// `Node<32>` and keeps it inside its 64 KiB device budget with `peer-names`
+/// and `ssh-policy` both enabled; fourteen would not.
 /// Longer lists are truncated, never rejected: a dropped candidate costs at
 /// most one direct path, and the peer stays reachable through DERP.
-pub const MAX_ENDPOINTS: usize = 16;
+pub const MAX_ENDPOINTS: usize = 12;
 
 /// Hosted publishes several dozen regions. The map retains two usable relays
 /// per region, while [`crate::Node`] limits live sessions separately.
