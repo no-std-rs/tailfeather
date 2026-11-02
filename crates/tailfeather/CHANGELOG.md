@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.1](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.2.0...tailfeather-v0.2.1) (2026-11-02)
+
+
+### Bug Fixes
+
+* **runtime:** publish NAT rebinding endpoints without waiting for a map event ([#33](https://github.com/no-std-rs/tailfeather/issues/33)) ([8615364](https://github.com/no-std-rs/tailfeather/commit/86153642beeb6079fb9c4c7d13060830f0bcb507))
+* **netmap:** bound per-peer lists instead of rejecting the whole map ([#32](https://github.com/no-std-rs/tailfeather/issues/32)) ([0fe1410](https://github.com/no-std-rs/tailfeather/commit/0fe1410b883c51a22e045b6f848356971bcf2ef0))
+* **runtime:** preserve map progress and relay packet order ([#30](https://github.com/no-std-rs/tailfeather/issues/30)) ([c8f7ad9](https://github.com/no-std-rs/tailfeather/commit/c8f7ad964c96ec175b00cab6a4a7aa0671f9de5f))
+
 ## [0.2.0](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.1.0...tailfeather-v0.2.0) (2026-10-26)
 
 
