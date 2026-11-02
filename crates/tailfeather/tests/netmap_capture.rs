@@ -721,6 +721,193 @@ fn peers_changed_does_not_evict_a_retained_peer_when_full() {
     assert!(netmap.peers_truncated);
 }
 
+const OWN_KEY: &str = "nodekey:f4dfaca7341906ffa704d7e529ad63aba59b6616ebea8c9ebbc6c84bb814ed4d";
+const PEER_KEYS: [&str; 2] = [
+    "nodekey:8e07760a26199478b22a13636eeca585330878b24f673b0a25d658e0bbfb7c79",
+    "nodekey:1552a65976f79439979be043fd4707a4626379a87b59d69123e6416a1a678a4d",
+];
+
+fn try_apply(netmap: &mut Netmap<32>, document: &str) -> Result<(), tailfeather::netmap::Error> {
+    let mut parser = Parser::<32>::new();
+    for piece in document.as_bytes().chunks(13) {
+        parser.push(netmap, piece)?;
+    }
+    parser.finish(netmap)
+}
+
+fn json_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("\"{item}\""))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn endpoints(peer: &tailfeather::netmap::Peer) -> Vec<String> {
+    peer.endpoints.iter().map(|e| e.to_string()).collect()
+}
+
+/// A peer advertising more candidate paths than the bound is an ordinary
+/// Linux host with container bridges, not a malformed map. Rejecting the map
+/// for it cut off every other peer too.
+#[test]
+fn a_peer_with_more_endpoints_than_the_bound_keeps_a_prefix_and_the_map() {
+    let max = tailfeather::netmap::MAX_ENDPOINTS;
+    let many: Vec<String> = (0..max + 6)
+        .map(|i| format!("10.0.{i}.1:41641"))
+        .chain(["[2001:db8::1]:41641".to_string()])
+        .collect();
+    let document = format!(
+        r#"{{"Node":{{"Key":"{OWN_KEY}"}},"Peers":[
+            {{"ID":1,"Key":"{a}","Addresses":["100.64.0.1/32"],"Endpoints":[{many}]}},
+            {{"ID":2,"Key":"{b}","Addresses":["100.64.0.2/32"],"Endpoints":["192.0.2.2:41641"]}}
+        ]}}"#,
+        a = PEER_KEYS[0],
+        b = PEER_KEYS[1],
+        many = json_list(&many),
+    );
+    let mut netmap = Netmap::<32>::new();
+    try_apply(&mut netmap, &document).expect("one long endpoint list must not reject the map");
+
+    assert_eq!(netmap.peers.len(), 2);
+    assert!(!netmap.peers_truncated, "no peer was omitted");
+    let first = netmap.peers.get(1).unwrap();
+    assert_eq!(
+        endpoints(first),
+        many[..max].to_vec(),
+        "server order is kept"
+    );
+    assert_eq!(
+        first.tailscale_ipv4(),
+        Some(std::net::Ipv4Addr::new(100, 64, 0, 1))
+    );
+    assert_eq!(endpoints(netmap.peers.get(2).unwrap()), ["192.0.2.2:41641"]);
+
+    // A patch carrying the same long list is bounded the same way.
+    let patch = format!(
+        r#"{{"PeersChangedPatch":[{{"NodeID":2,"Endpoints":[{many}]}}]}}"#,
+        many = json_list(&many),
+    );
+    try_apply(&mut netmap, &patch).expect("a long patch must not reject the map");
+    assert_eq!(
+        endpoints(netmap.peers.get(2).unwrap()),
+        many[..max].to_vec()
+    );
+    assert_eq!(
+        endpoints(netmap.peers.get(1).unwrap()),
+        many[..max].to_vec()
+    );
+}
+
+#[test]
+fn a_full_endpoint_list_prefers_routable_candidates_over_link_local() {
+    let max = tailfeather::netmap::MAX_ENDPOINTS;
+    let mut advertised = vec![
+        "198.51.100.7:41641".to_string(),
+        "169.254.1.1:41641".to_string(),
+        "198.51.100.7:41641".to_string(),
+    ];
+    advertised.extend((0..max).map(|i| format!("10.1.{i}.1:41641")));
+    advertised.push("169.254.2.2:41641".to_string());
+    let document = format!(
+        r#"{{"Node":{{"Key":"{OWN_KEY}"}},"Peers":[{{"ID":1,"Key":"{a}","Endpoints":[{list}]}}]}}"#,
+        a = PEER_KEYS[0],
+        list = json_list(&advertised),
+    );
+    let mut netmap = Netmap::<32>::new();
+    try_apply(&mut netmap, &document).unwrap();
+
+    let kept = endpoints(netmap.peers.get(1).unwrap());
+    let mut expected = vec!["198.51.100.7:41641".to_string()];
+    expected.extend((0..max - 1).map(|i| format!("10.1.{i}.1:41641")));
+    assert_eq!(
+        kept, expected,
+        "duplicates collapse, the link-local slot goes to a routable path, order is kept"
+    );
+}
+
+/// Allowed IPs decide routing and source checks, so a partial list is not
+/// kept. Omitting just that peer leaves the rest of the tailnet usable.
+#[test]
+fn a_peer_with_too_many_allowed_ips_is_omitted_rather_than_the_map() {
+    let max = tailfeather::netmap::MAX_ALLOWED_IPS;
+    let routes: Vec<String> = (0..=max).map(|i| format!("10.2.{i}.0/24")).collect();
+    let addresses: Vec<String> = (0..=tailfeather::netmap::MAX_ADDRESSES)
+        .map(|i| format!("100.64.1.{i}/32"))
+        .collect();
+    for (field, list) in [("AllowedIPs", &routes), ("Addresses", &addresses)] {
+        let mut netmap = Netmap::<32>::new();
+        let full = format!(
+            r#"{{"Node":{{"Key":"{OWN_KEY}"}},"Peers":[
+                {{"ID":1,"Key":"{a}","{field}":[{list}]}},
+                {{"ID":2,"Key":"{b}","AllowedIPs":["100.64.0.2/32"]}}
+            ]}}"#,
+            a = PEER_KEYS[0],
+            b = PEER_KEYS[1],
+            list = json_list(list),
+        );
+        try_apply(&mut netmap, &full).expect("one oversized peer must not reject the map");
+        assert_eq!(
+            netmap.peers.iter().map(|peer| peer.id).collect::<Vec<_>>(),
+            [2],
+            "{field}"
+        );
+        assert!(netmap.peers_truncated, "{field}");
+
+        // A later full snapshot within bounds restores it and clears the flag.
+        try_apply(
+            &mut netmap,
+            &format!(
+                r#"{{"Peers":[{{"ID":1,"Key":"{a}"}},{{"ID":2,"Key":"{b}"}}]}}"#,
+                a = PEER_KEYS[0],
+                b = PEER_KEYS[1],
+            ),
+        )
+        .unwrap();
+        assert_eq!(netmap.peers.len(), 2);
+        assert!(!netmap.peers_truncated);
+
+        // An oversized replacement forgets the stale record instead of
+        // keeping routes control has just replaced.
+        try_apply(
+            &mut netmap,
+            &format!(
+                r#"{{"PeersChanged":[{{"ID":1,"Key":"{a}","{field}":[{list}]}}]}}"#,
+                a = PEER_KEYS[0],
+                list = json_list(list),
+            ),
+        )
+        .unwrap();
+        assert!(netmap.peers.get(1).is_none(), "{field}");
+        assert!(netmap.peers.get(2).is_some(), "{field}");
+        assert!(netmap.peers_truncated, "{field}");
+    }
+}
+
+/// This node's own record is not one peer among many: acting on a partial
+/// self route list could misstate what control approved, so it still fails,
+/// as does a record that cannot yet be told apart from a delayed self record.
+#[test]
+fn an_oversized_self_or_unidentified_record_still_rejects_the_map() {
+    let max = tailfeather::netmap::MAX_ALLOWED_IPS;
+    let routes: Vec<String> = (0..=max).map(|i| format!("10.3.{i}.0/24")).collect();
+    let expected = Err(tailfeather::netmap::Error::Full(
+        tailfeather::netmap::CapacityError::AllowedIps,
+    ));
+    let own = format!(
+        r#"{{"Node":{{"Key":"{OWN_KEY}"}},"PeersChanged":[{{"ID":9,"Key":"{OWN_KEY}","AllowedIPs":[{list}]}}]}}"#,
+        list = json_list(&routes),
+    );
+    assert_eq!(try_apply(&mut Netmap::<32>::new(), &own), expected);
+
+    let unidentified = format!(
+        r#"{{"PeersChanged":[{{"ID":9,"Key":"{a}","AllowedIPs":[{list}]}}]}}"#,
+        a = PEER_KEYS[0],
+        list = json_list(&routes),
+    );
+    assert_eq!(try_apply(&mut Netmap::<32>::new(), &unidentified), expected);
+}
+
 /// A peer's IPv6 subnets are parsed and then dropped, while the self record
 /// keeps both families. The device routes IPv4 only, and peer storage is the
 /// part of the staged map that scales with the tailnet. IPv6 host ownership

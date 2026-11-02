@@ -57,15 +57,31 @@ pub use scanner::{Scanner, Token};
 pub const MAX_PEERS: usize = 32;
 
 /// Addresses assigned to one node: normally one IPv4 and one IPv6.
+///
+/// A peer naming more IPv4 addresses is omitted from the map (and
+/// [`Netmap::peers_truncated`] set) rather than kept with a partial list.
 pub const MAX_ADDRESSES: usize = 4;
 pub const MAX_PRIMARY_ROUTES: usize = 8;
 
 /// Subnets a peer will accept traffic for. More than its own addresses, because
 /// a subnet router or exit node advertises others.
+///
+/// These drive routing and source checks, so a peer naming more IPv4 subnets
+/// is omitted from the map (and [`Netmap::peers_truncated`] set) rather than
+/// kept with a partial list. The rest of the map is unaffected.
 pub const MAX_ALLOWED_IPS: usize = 8;
 
-/// Candidate paths to one peer.
-pub const MAX_ENDPOINTS: usize = 8;
+/// Candidate IPv4 paths retained for one peer.
+///
+/// Ordinary clients advertise more than eight: a STUN address, a port mapping,
+/// and one per interface, which on a Linux host with container or CI bridges
+/// is already a dozen. Sixteen covers those at 48 bytes per list over the old
+/// bound of eight: 1.5 KiB per `Netmap<32>`, and 4.5 KiB per `Node<32>`, which
+/// also keeps two path lists per peer. That leaves `Node<32>` inside its
+/// 64 KiB device budget; twenty-four would not.
+/// Longer lists are truncated, never rejected: a dropped candidate costs at
+/// most one direct path, and the peer stays reachable through DERP.
+pub const MAX_ENDPOINTS: usize = 16;
 
 /// Hosted publishes several dozen regions. The map retains two usable relays
 /// per region, while [`crate::Node`] limits live sessions separately.
@@ -107,6 +123,8 @@ pub enum CapacityError {
     Routes,
     Addresses,
     AllowedIps,
+    /// No longer produced by the parser: over-long endpoint lists are
+    /// truncated to [`MAX_ENDPOINTS`]. Kept so matching code still compiles.
     Endpoints,
     PacketPolicy,
     String,
