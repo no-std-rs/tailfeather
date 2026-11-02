@@ -639,10 +639,13 @@ where
                     if !maps.has_pending_update() {
                         runtime.node.borrow().seed_staging(maps.staging());
                     }
-                    // Input has arrived, so the read normally completes
-                    // promptly; a partial document keeps the full deadline.
+                    // Input (a partial document, a PING) is not a map event:
+                    // the read keeps the session's absolute liveness deadline.
+                    let remaining = alive_at
+                        .saturating_add(MAP_LIVENESS_MS)
+                        .saturating_sub(reactor.clock_millis());
                     let event = drive_http(
-                        reactor.timeout(MAP_LIVENESS_MS, maps.next()),
+                        reactor.timeout(remaining, maps.next()),
                         discovery.as_mut(),
                         &mut completed,
                         bootstrapped,
@@ -828,6 +831,9 @@ mod tests {
         struct ScriptedMaps<'a> {
             staging: Box<tailfeather::netmap::Netmap<2>>,
             events: &'a RefCell<VecDeque<MapEvent>>,
+            /// Input that never completes a map event (a PING, a stalled
+            /// partial document).
+            unfinished: &'a Cell<bool>,
             log: &'a RefCell<List<Text>>,
         }
 
@@ -840,7 +846,7 @@ mod tests {
             }
             async fn wait_input(&mut self) -> Result<(), Error> {
                 core::future::poll_fn(|_| {
-                    if self.events.borrow().is_empty() {
+                    if self.events.borrow().is_empty() && !self.unfinished.get() {
                         Poll::Pending
                     } else {
                         Poll::Ready(Ok(()))
@@ -884,6 +890,7 @@ mod tests {
             started: Cell<usize>,
             finished: Cell<usize>,
             mapping: Cell<u16>,
+            unfinished: Cell<bool>,
         }
 
         impl Fixture {
@@ -936,10 +943,12 @@ mod tests {
                         started: Cell::new(0),
                         finished: Cell::new(0),
                         mapping: Cell::new(45_000),
+                        unfinished: Cell::new(false),
                     };
                     let mut maps = ScriptedMaps {
                         staging: Box::new(tailfeather::netmap::Netmap::new()),
                         events: &fixture.events,
+                        unfinished: &fixture.unfinished,
                         log: &fixture.log,
                     };
                     let (public, disco) = (identity.node.public(), identity.disco.public());
@@ -1074,6 +1083,20 @@ mod tests {
                 assert_eq!(poll(), Poll::Ready(Err("map timeout")));
                 assert_eq!(fixture.log().len(), publications);
                 assert_eq!(fixture.map_events(), 1);
+            });
+        }
+
+        #[test]
+        fn input_without_a_map_event_keeps_the_absolute_liveness_deadline() {
+            with_session(|poll, fixture| {
+                assert!(poll().is_pending());
+                fixture.clock.set(MAP_LIVENESS_MS - 10_000);
+                fixture.unfinished.set(true);
+                assert!(poll().is_pending());
+                fixture.clock.set(MAP_LIVENESS_MS - 1);
+                assert!(poll().is_pending());
+                fixture.clock.set(MAP_LIVENESS_MS);
+                assert_eq!(poll(), Poll::Ready(Err("map timeout")));
             });
         }
     }
