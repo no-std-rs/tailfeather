@@ -171,6 +171,8 @@ impl Default for FilterRule {
 struct FilterSet {
     name: String<MAX_FILTER_SET_NAME>,
     id: u8,
+    /// Rules of this set were dropped for not fitting.
+    truncated: bool,
 }
 
 /// An interned range needs no address-family tag: this pool stores only IPv6.
@@ -193,6 +195,12 @@ pub struct PacketPolicy {
     sets: Vec<FilterSet, MAX_FILTER_SETS>,
     rules: Vec<StoredRule, MAX_FILTER_RULES>,
     valid: bool,
+    /// Sets whose rules could not be stored at all (no free set slot). Their
+    /// earlier rules are gone; the marker clears when the set is replaced
+    /// or deleted.
+    unstored: Vec<String<MAX_FILTER_SET_NAME>, MAX_FILTER_SETS>,
+    /// Truncation that cannot be tied to a set (an unreadable set name, or
+    /// more unstored sets than are tracked). Clears only with the policy.
     truncated: bool,
     v6_networks: [V6Range; MAX_V6_NETWORKS],
     v6_occupied: [u32; MAX_V6_NETWORKS.div_ceil(32)],
@@ -203,6 +211,7 @@ impl PacketPolicy {
         Self {
             sets: Vec::new(),
             rules: Vec::new(),
+            unstored: Vec::new(),
             truncated: false,
             valid: false,
             v6_networks: [V6Range::EMPTY; MAX_V6_NETWORKS],
@@ -218,10 +227,32 @@ impl PacketPolicy {
     /// Every rule only allows traffic, so a dropped rule denies what it would
     /// have allowed; nothing is permitted that control did not grant.
     pub fn truncated(&self) -> bool {
-        self.truncated
+        self.truncated || !self.unstored.is_empty() || self.sets.iter().any(|set| set.truncated)
     }
 
-    pub(crate) fn mark_truncated(&mut self) {
+    /// Record that rules of `set` were dropped. Cleared when that set is
+    /// next replaced or deleted, so a later complete update is not reported
+    /// as incomplete.
+    pub(crate) fn mark_truncated(&mut self, set: &str) {
+        if let Some(entry) = self
+            .sets
+            .iter_mut()
+            .find(|entry| entry.name.as_str() == set)
+        {
+            entry.truncated = true;
+            return;
+        }
+        if self.unstored.iter().any(|name| name.as_str() == set) {
+            return;
+        }
+        match String::try_from(set) {
+            Ok(name) if self.unstored.push(name.clone()).is_ok() => {}
+            _ => self.truncated = true,
+        }
+    }
+
+    /// Record truncation not attributable to a nameable set.
+    pub(crate) fn mark_truncated_unnamed(&mut self) {
         self.truncated = true;
     }
 
@@ -247,6 +278,7 @@ impl PacketPolicy {
                 .expect("equal packet-filter rule capacities");
         }
         self.valid = source.valid;
+        self.unstored.clone_from(&source.unstored);
         self.truncated = source.truncated;
         self.v6_networks = source.v6_networks;
         self.v6_occupied = source.v6_occupied;
@@ -267,6 +299,7 @@ impl PacketPolicy {
                 name: String::try_from(name)
                     .map_err(|_| Error::Full(CapacityError::PacketPolicy))?,
                 id,
+                truncated: false,
             })
             .map_err(|_| Error::Full(CapacityError::PacketPolicy))?;
         self.valid = true;
@@ -283,6 +316,7 @@ impl PacketPolicy {
             self.rules.retain(|rule| rule.set != id);
         }
         self.sets.retain(|set| set.name.as_str() != name);
+        self.unstored.retain(|unstored| unstored.as_str() != name);
         self.collect_networks();
         self.valid = true;
     }
@@ -293,6 +327,7 @@ impl PacketPolicy {
         self.v6_networks.fill(V6Range::EMPTY);
         self.v6_occupied.fill(0);
         self.valid = true;
+        self.unstored.clear();
         self.truncated = false;
     }
 

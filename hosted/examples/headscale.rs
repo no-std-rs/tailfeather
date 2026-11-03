@@ -43,13 +43,18 @@ fn main() {
             tokio::time::timeout(Duration::from_secs(60),async {
                 while !root.join("rejected").exists(){tokio::time::sleep(Duration::from_millis(20)).await;}
             }).await.unwrap();
-            let _listener=server.listen(2223).await.unwrap();
+            let mut probe_listener=server.listen(2223).await.unwrap();
             // The oversized rule is gone, so the client is denied, while the
-            // server keeps its tailnet address throughout.
+            // server keeps its tailnet address throughout. Probes that still
+            // connect (before the new policy lands) are accepted and closed,
+            // so a full backlog cannot pass for a denial.
             tokio::time::timeout(Duration::from_secs(30),async {
                 loop {
                     let attempt=tokio::time::timeout(Duration::from_secs(2),client.connect(server_ip,2223)).await;
-                    if !matches!(attempt,Ok(Ok(_))){break;}
+                    let Ok(Ok(stream))=attempt else {break};
+                    let accepted=tokio::time::timeout(Duration::from_secs(5),probe_listener.accept()).await;
+                    drop(stream);
+                    drop(accepted);
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }).await.unwrap();

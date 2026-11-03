@@ -546,7 +546,7 @@ impl State {
                 match netmap.packet_filter.replace_set("base") {
                     Ok(()) => {}
                     Err(Error::Full(_)) => {
-                        netmap.packet_filter.mark_truncated();
+                        netmap.packet_filter.mark_truncated("base");
                         self.filter.skip_set = true;
                     }
                     Err(error) => self.fail(error),
@@ -564,14 +564,16 @@ impl State {
                             // The set's earlier rules are already gone; its
                             // new ones are dropped, which only denies.
                             Err(Error::Full(_)) => {
-                                netmap.packet_filter.mark_truncated();
+                                netmap
+                                    .packet_filter
+                                    .mark_truncated(self.filter.set.as_str());
                                 self.filter.skip_set = true;
                             }
                             Err(error) => self.fail(error),
                         }
                     }
                     Err(_) => {
-                        netmap.packet_filter.mark_truncated();
+                        netmap.packet_filter.mark_truncated_unnamed();
                         self.filter.skip_set = true;
                     }
                 }
@@ -691,7 +693,9 @@ impl State {
             }
             Context::FilterRuleObject => {
                 if self.filter.skip_set || self.filter.rule_overflow {
-                    netmap.packet_filter.mark_truncated();
+                    netmap
+                        .packet_filter
+                        .mark_truncated(self.filter.set.as_str());
                 } else if !self.filter.rule.is_well_formed() {
                     self.fail(Error::MalformedField(MalformedField::PacketRule));
                 } else {
@@ -700,7 +704,11 @@ impl State {
                         core::mem::take(&mut self.filter.rule),
                     ) {
                         Ok(()) => {}
-                        Err(Error::Full(_)) => netmap.packet_filter.mark_truncated(),
+                        Err(Error::Full(_)) => {
+                            netmap
+                                .packet_filter
+                                .mark_truncated(self.filter.set.as_str());
+                        }
                         Err(error) => self.fail(error),
                     }
                 }
@@ -1363,7 +1371,9 @@ impl State {
             }
             // A rule too large to read at all.
             Context::PacketFilterArray | Context::FilterSetArray => {
-                netmap.packet_filter.mark_truncated();
+                netmap
+                    .packet_filter
+                    .mark_truncated(self.filter.set.as_str());
             }
             // A named set that cannot be read cannot replace the set's
             // earlier rules, which would then linger; and this node's own
@@ -1402,6 +1412,7 @@ impl State {
             // that relay. Unknown relay fields stay ignored.
             Context::DerpNode if matches!(self.key.as_str(), "HostName" | "CertName") => {
                 self.region.node_flags |= 4;
+                netmap.derp.mark_truncated();
             }
             // Anything else is unread, advisory, or only shortens what the
             // node knows (a peer without a parseable key is not retained).

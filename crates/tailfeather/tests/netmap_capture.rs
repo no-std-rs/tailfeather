@@ -1410,3 +1410,27 @@ fn an_oversized_self_key_replaces_the_old_one_like_an_unparseable_one() {
     }
     assert!(netmap.node_key.is_none());
 }
+
+#[test]
+fn acl_truncation_clears_once_a_complete_policy_replaces_it() {
+    let allow = |port: u16| {
+        format!(
+            r#"{{"SrcIPs":["*"],"DstPorts":[{{"IP":"*","Ports":{{"First":{port},"Last":{port}}}}}]}}"#
+        )
+    };
+    let mut netmap = Netmap::<32>::new();
+    let oversized: Vec<String> = (0..100).map(allow).collect();
+    let documents = [
+        format!(r#"{{"PacketFilter":[{}]}}"#, oversized.join(",")),
+        format!(r#"{{"PacketFilter":[{}]}}"#, allow(22)),
+    ];
+    let mut flags = Vec::new();
+    for document in &documents {
+        let mut parser = Parser::<32>::new();
+        parser.push(&mut netmap, document.as_bytes()).unwrap();
+        parser.finish(&mut netmap).unwrap();
+        flags.push(netmap.packet_filter.truncated());
+    }
+    assert_eq!(flags, vec![true, false]);
+    assert_eq!(netmap.packet_filter.rule_count(), 1);
+}
