@@ -1339,3 +1339,32 @@ fn a_changed_peer_with_an_unreadable_key_is_forgotten() {
     assert!(netmap.peers.is_empty(), "stale keys were kept");
     assert!(netmap.peers_truncated);
 }
+
+#[test]
+fn oversized_unknown_acl_members_and_endpoint_patches_are_handled_like_short_ones() {
+    let blob = "q".repeat(10 * 1024);
+    let mut netmap = Netmap::<32>::new();
+    let documents = [
+        format!(
+            r#"{{"Node":{{"Key":"{RANKED_SELF}"}},"Peers":[{{"ID":4,"Key":"{}","Endpoints":["192.0.2.1:41641"]}}],"PacketFilter":[{{"SrcIPs":["*"],"FutureField":"{blob}","DstPorts":[{{"IP":"*","Bits":"{blob}","Ports":{{"First":22,"Last":22,"Note":"{blob}"}}}}]}}]}}"#,
+            RANKED_KEYS[0]
+        ),
+        format!(r#"{{"PeersChangedPatch":[{{"NodeID":4,"Endpoints":["{blob}"]}}]}}"#),
+    ];
+    for document in &documents {
+        let mut parser = Parser::<32>::new();
+        parser.push(&mut netmap, document.as_bytes()).unwrap();
+        parser.finish(&mut netmap).unwrap();
+    }
+    assert_eq!(
+        netmap.packet_filter.rule_count(),
+        1,
+        "unknown members are ignored"
+    );
+    assert!(!netmap.packet_filter.truncated());
+    let peer = netmap.peers.get(4).unwrap();
+    assert!(
+        peer.endpoints.is_empty(),
+        "the patch replaced the stale endpoint"
+    );
+}

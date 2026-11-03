@@ -829,10 +829,16 @@ impl State {
             return peer;
         }
         let worst = worst.clone();
-        netmap.peers.remove(worst.id);
-        // Cannot fail: a slot was just freed.
-        let _ = netmap.peers.upsert(peer);
-        worst
+        // Overwrite the displaced peer in place: reusing its slot needs no
+        // allocation, so a heap-backed table that is out of memory cannot
+        // lose both peers.
+        match netmap.peers.get_mut(worst.id) {
+            Some(slot) => {
+                *slot = peer;
+                worst
+            }
+            None => peer,
+        }
     }
 
     fn rank(peer: &Peer) -> (bool, core::cmp::Reverse<u64>) {
@@ -1326,12 +1332,28 @@ impl State {
             // A partial rule could widen it (an empty protocol list means
             // every protocol), so the whole rule is dropped. Rules only allow
             // traffic, so a dropped rule can only deny.
+            // Unknown, forward-compatible members are ignored at any size, as
+            // they are when short.
             Context::FilterRuleObject
-            | Context::FilterSources
-            | Context::FilterDestinations
-            | Context::FilterDestinationObject
-            | Context::FilterPortsObject
-            | Context::FilterProtocols => self.filter.rule_overflow = true,
+                if matches!(self.key.as_str(), "SrcIPs" | "DstPorts" | "IPProto") =>
+            {
+                self.filter.rule_overflow = true;
+            }
+            Context::FilterDestinationObject if matches!(self.key.as_str(), "IP" | "Ports") => {
+                self.filter.rule_overflow = true;
+            }
+            Context::FilterPortsObject if matches!(self.key.as_str(), "First" | "Last") => {
+                self.filter.rule_overflow = true;
+            }
+            Context::FilterSources | Context::FilterDestinations | Context::FilterProtocols => {
+                self.filter.rule_overflow = true;
+            }
+            // An endpoint that cannot be read is one path lost, as for any
+            // unparseable endpoint; the list was still sent and replaces the
+            // old one.
+            Context::PeerEndpoints | Context::PatchEndpoints => {
+                self.pending.endpoints_present = true;
+            }
             // A rule too large to read at all.
             Context::PacketFilterArray | Context::FilterSetArray => {
                 netmap.packet_filter.mark_truncated();
