@@ -698,14 +698,41 @@ impl State {
         }
         if let Err(error) = netmap.peers.upsert(peer.clone()) {
             if error == Error::Full(CapacityError::Peers) {
-                if netmap.node_key.is_none() && self.deferred_peer.is_none() {
-                    self.deferred_peer = Some(peer);
+                if netmap.node_key.is_none() {
+                    // This may be the self record, which reconciliation
+                    // removes; it must not displace a real peer.
+                    if self.deferred_peer.is_none() {
+                        self.deferred_peer = Some(peer);
+                    } else {
+                        netmap.peers_truncated = true;
+                    }
                 } else {
-                    netmap.peers_truncated = true;
+                    Self::insert_ranked(netmap, peer);
                 }
             } else {
                 self.fail(error);
             }
+        }
+    }
+
+    /// Insert into a full peer table, keeping the highest-ranked peers.
+    ///
+    /// Control does not promise a stable peer order, so keeping whichever
+    /// peers arrived first would retain a different subset after each full
+    /// map and tear down tunnels to the peers that fell out. Ranking makes the
+    /// retained set independent of arrival order: online peers first, then
+    /// the lowest node id.
+    fn insert_ranked<const PEERS: usize>(netmap: &mut Netmap<PEERS>, peer: Peer) {
+        netmap.peers_truncated = true;
+        let rank = |peer: &Peer| (peer.online(), core::cmp::Reverse(peer.id));
+        let Some(worst) = netmap.peers.iter().min_by_key(|peer| rank(peer)) else {
+            return;
+        };
+        if rank(&peer) > rank(worst) {
+            let worst = worst.id;
+            netmap.peers.remove(worst);
+            // Cannot fail: a slot was just freed.
+            let _ = netmap.peers.upsert(peer);
         }
     }
 
@@ -742,11 +769,10 @@ impl State {
         for id in ours {
             netmap.peers.remove(id);
         }
-        if netmap.peers.len() < PEERS
-            && let Some(peer) = self.deferred_peer.take()
-            && netmap.peers.upsert(peer).is_err()
+        if let Some(peer) = self.deferred_peer.take()
+            && netmap.peers.upsert(peer.clone()).is_err()
         {
-            netmap.peers_truncated = true;
+            Self::insert_ranked(netmap, peer);
         }
     }
 
