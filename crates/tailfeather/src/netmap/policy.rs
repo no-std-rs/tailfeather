@@ -195,10 +195,12 @@ pub struct PacketPolicy {
     sets: Vec<FilterSet, MAX_FILTER_SETS>,
     rules: Vec<StoredRule, MAX_FILTER_RULES>,
     valid: bool,
-    /// Sets whose rules could not be stored at all (no free set slot). Their
-    /// earlier rules are gone; the marker clears when the set is replaced
-    /// or deleted.
-    unstored: Vec<String<MAX_FILTER_SET_NAME>, MAX_FILTER_SETS>,
+    /// Sets whose rules could not be stored at all (no free set slot), by a
+    /// hash of their name: whole names would cost firmware RAM it does not
+    /// have. Their earlier rules are gone; the marker clears when the set is
+    /// replaced or deleted. A collision only keeps this advisory flag set
+    /// longer; it never changes which rules apply.
+    unstored: Vec<u32, MAX_FILTER_SETS>,
     /// Truncation that cannot be tied to a set (an unreadable set name, or
     /// more unstored sets than are tracked). Clears only with the policy.
     truncated: bool,
@@ -242,12 +244,9 @@ impl PacketPolicy {
             entry.truncated = true;
             return;
         }
-        if self.unstored.iter().any(|name| name.as_str() == set) {
-            return;
-        }
-        match String::try_from(set) {
-            Ok(name) if self.unstored.push(name.clone()).is_ok() => {}
-            _ => self.truncated = true,
+        let name = set_name_hash(set);
+        if !self.unstored.contains(&name) && self.unstored.push(name).is_err() {
+            self.truncated = true;
         }
     }
 
@@ -316,7 +315,8 @@ impl PacketPolicy {
             self.rules.retain(|rule| rule.set != id);
         }
         self.sets.retain(|set| set.name.as_str() != name);
-        self.unstored.retain(|unstored| unstored.as_str() != name);
+        let hash = set_name_hash(name);
+        self.unstored.retain(|unstored| *unstored != hash);
         self.collect_networks();
         self.valid = true;
     }
@@ -552,6 +552,13 @@ impl Default for PacketPolicy {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// FNV-1a over a filter-set name.
+fn set_name_hash(name: &str) -> u32 {
+    name.bytes().fold(0x811c_9dc5, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    })
 }
 
 #[cfg(test)]
