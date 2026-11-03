@@ -377,7 +377,7 @@ impl PacketPolicy {
     /// the highest id when that fits, otherwise the lowest gap. Only the
     /// fixed table (or a heap table that exhausted `SetId`) needs the gap.
     fn free_set_id(&self) -> Option<SetId> {
-        if self.sets.len() >= MAX_FILTER_SETS {
+        if self.sets.is_full() {
             return None;
         }
         let next = match self.sets.iter().map(|set| set.id).max() {
@@ -409,17 +409,17 @@ impl PacketPolicy {
     }
 
     pub fn delete_set(&mut self, name: &str) {
-        if let Some(id) = self
-            .sets
-            .iter()
-            .find(|set| set.name.as_str() == name)
-            .map(|set| set.id)
-        {
+        if let Some(index) = self.sets.iter().position(|set| set.name.as_str() == name) {
+            let id = self.sets.remove(index).id;
+            let rules = self.rules.len();
             self.rules.retain(|rule| rule.set != id);
+            // Only removed rules can leave ranges unreferenced; replacing a
+            // new set (the common case while a map loads) collects nothing.
+            if self.rules.len() != rules {
+                self.collect_networks();
+            }
         }
-        self.sets.retain(|set| set.name.as_str() != name);
         self.unstored.retain(|unstored| unstored.as_str() != name);
-        self.collect_networks();
         self.valid = true;
     }
 
@@ -436,9 +436,12 @@ impl PacketPolicy {
         if !rule.is_well_formed() {
             return Err(Error::Malformed);
         }
+        // The parser fills one set at a time, and the set being filled was
+        // the last one added, so look there first.
         let set = self
             .sets
             .iter()
+            .rev()
             .find(|entry| entry.name.as_str() == set)
             .map(|entry| entry.id)
             .ok_or(Error::Malformed)?;

@@ -196,11 +196,22 @@ impl DerpMap {
         name: &str,
         pending: &mut [DerpNode],
     ) -> Result<DerpCertName, Error> {
-        if let Some(index) = self
+        // The fixed table is tiny and must not fill with duplicates, so it is
+        // searched in full. A heap table only reuses the latest name (relays
+        // of one region usually share it), keeping a large map linear to
+        // load; a duplicate costs memory, never correctness.
+        #[cfg(not(feature = "alloc"))]
+        let existing = self
             .cert_names
             .iter()
-            .position(|existing| existing.as_str() == name)
-        {
+            .position(|existing| existing.as_str() == name);
+        #[cfg(feature = "alloc")]
+        let existing = self
+            .cert_names
+            .last()
+            .filter(|existing| existing.as_str() == name)
+            .map(|_| self.cert_names.len() - 1);
+        if let Some(index) = existing {
             return Ok(DerpCertName(index as CertIndex));
         }
         let name = heapless::String::try_from(name)
