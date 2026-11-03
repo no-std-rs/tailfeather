@@ -260,7 +260,8 @@ pub fn next_tai64n(last: &mut [u8; 12], unix_ms: u64) -> [u8; 12] {
         next = *last;
         let nanos = u32::from_be_bytes(next[8..].try_into().expect("four bytes")) + 1;
         if nanos >= 1_000_000_000 {
-            let seconds = u64::from_be_bytes(next[..8].try_into().expect("eight bytes")) + 1;
+            let seconds =
+                u64::from_be_bytes(next[..8].try_into().expect("eight bytes")).saturating_add(1);
             next[..8].copy_from_slice(&seconds.to_be_bytes());
             next[8..].copy_from_slice(&0u32.to_be_bytes());
         } else {
@@ -274,6 +275,13 @@ pub fn next_tai64n(last: &mut [u8; 12], unix_ms: u64) -> [u8; 12] {
 /// How far the durable timestamp floor runs ahead of anything emitted, so it
 /// needs rewriting only about once a minute.
 pub const TAI64N_FLOOR_STEP_S: u64 = 60;
+
+/// Whether a floor read from storage is a plausible TAI64 time (within about
+/// a thousand years of the Unix epoch). Anything else is corrupt and ignored.
+pub fn tai64n_floor_is_plausible(floor_seconds: u64) -> bool {
+    const TAI_OFFSET: u64 = (1 << 62) + 10;
+    floor_seconds < TAI_OFFSET + (1 << 35)
+}
 
 /// The initial "last emitted" timestamp for a floor loaded from storage: whole
 /// TAI64 seconds, so every later timestamp is above it even if the clock has
@@ -289,7 +297,7 @@ pub fn tai64n_at_floor(floor_seconds: u64) -> [u8; 12] {
 /// reload can never reuse or go below one a peer has already accepted.
 pub fn tai64n_floor_update(last: &[u8; 12], stored_floor: u64) -> Option<u64> {
     let seconds = u64::from_be_bytes(last[..8].try_into().ok()?);
-    (seconds >= stored_floor).then(|| seconds + TAI64N_FLOOR_STEP_S)
+    (seconds >= stored_floor).then(|| seconds.saturating_add(TAI64N_FLOOR_STEP_S))
 }
 
 /// What trust-on-first-use concludes about a presented SSH host key.

@@ -126,6 +126,7 @@ struct Diagnostics {
     no_route: Counter,
     inbound_rejected: Counter,
     handshakes: Counter,
+    derp_health: Counter,
 }
 
 pub struct State {
@@ -183,6 +184,7 @@ impl Runtime {
         // accepted, so a reload after the clock moved back must not start lower.
         let tai64n_floor = storage_get(TAI64N_FLOOR_KEY)
             .and_then(|text| text.parse::<u64>().ok())
+            .filter(|floor| logic::tai64n_floor_is_plausible(*floor))
             .unwrap_or(0);
         let runtime = Rc::new_cyclic(|weak| Runtime {
             state: RefCell::new(State {
@@ -1287,10 +1289,15 @@ async fn derp_run(
                 return Err(WsError("server restarting".into()));
             }
             crate::derp::Inbound::Health => {
-                let text = String::from_utf8_lossy(&payload).into_owned();
+                // A relay may repeat these; log a bounded, thinning sample so
+                // a chatty relay cannot flood the page's log.
+                let text = String::from_utf8_lossy(&payload);
                 if !text.is_empty() {
+                    let text: String = text.chars().take(200).collect();
                     with(runtime, |state| {
-                        state.log(format!("DERP region {region} health: {text}"))
+                        if let Some(count) = state.diagnostics.derp_health.tick() {
+                            state.log(format!("DERP region {region} health (#{count}): {text}"));
+                        }
                     });
                 }
             }

@@ -133,7 +133,10 @@ enum Input {
 /// A running terminal session, handed to the page.
 #[wasm_bindgen]
 pub struct SshSession {
-    input: mpsc::Sender<Input>,
+    /// One stored sender. `try_send` on a fresh clone always succeeds (each
+    /// clone gets a guaranteed slot), so cloning per call would let input
+    /// queue without bound while the remote is not reading.
+    input: core::cell::RefCell<mpsc::Sender<Input>>,
     abort: AbortHandle,
 }
 
@@ -151,8 +154,10 @@ impl SshSession {
     ) -> Result<crate::forwarding::SshForwardPipe, JsError> {
         use futures::SinkExt;
         let (request, pipe, ready) = crate::forwarding::request(host, port, write, eof, closed)?;
-        self.input
-            .clone()
+        // Forward requests are rare and each waits for its answer, so a
+        // clone (one guaranteed slot per pending request) stays bounded.
+        let mut input = self.input.borrow().clone();
+        input
             .send(Input::Forward(request))
             .await
             .map_err(|_| JsError::new("SSH session closed"))?;
@@ -164,17 +169,19 @@ impl SshSession {
     }
     /// Keystrokes or pasted text for the remote shell.
     pub fn send(&self, data: &[u8]) {
-        let _ = self.input.clone().try_send(Input::Data(data.to_vec()));
+        // A full queue means the remote has stopped reading; input typed
+        // meanwhile is dropped rather than buffered without bound.
+        let _ = self.input.borrow_mut().try_send(Input::Data(data.to_vec()));
     }
 
     pub fn resize(&self, cols: u32, rows: u32) {
-        let _ = self.input.clone().try_send(Input::Resize(cols, rows));
+        let _ = self.input.borrow_mut().try_send(Input::Resize(cols, rows));
     }
 
     pub fn close(&self) {
         // The queue can be full while a write is blocked; a disconnect must
         // not be lost then, so fall back to ending the task outright.
-        if self.input.clone().try_send(Input::Close).is_err() {
+        if self.input.borrow_mut().try_send(Input::Close).is_err() {
             self.abort.abort();
         }
     }
@@ -216,7 +223,7 @@ pub fn start(options: SshOptions, callbacks: SshCallbacks) -> SshSession {
         }
     });
     SshSession {
-        input: sender,
+        input: core::cell::RefCell::new(sender),
         abort,
     }
 }
