@@ -35,8 +35,10 @@ fn main() {
         if resident {
             use tokio::io::{AsyncReadExt,AsyncWriteExt};
             use std::io::Write;
-            // An ACL larger than the policy bound no longer rejects the map:
-            // the rule that does not fit is dropped, which only denies, and
+            // An ACL past the firmware policy bound (513 sources, none of them
+            // the client) replaces the old allow-all policy without rejecting
+            // the map: the hosted heap tables keep it whole, a fixed table
+            // would drop the rule, and either way the client is denied while
             // the node stays registered with its address and peers.
             println!("READY: reject map for resident retry");
             std::io::stdout().flush().unwrap();
@@ -44,8 +46,8 @@ fn main() {
                 while !root.join("rejected").exists(){tokio::time::sleep(Duration::from_millis(20)).await;}
             }).await.unwrap();
             let mut probe_listener=server.listen(2223).await.unwrap();
-            // The oversized rule is gone, so the client is denied, while the
-            // server keeps its tailnet address throughout. Probes that still
+            // The new policy does not admit the client, so it is denied, while
+            // the server keeps its tailnet address throughout. Probes that still
             // connect (before the new policy lands) are accepted and closed,
             // so a full backlog cannot pass for a denial.
             tokio::time::timeout(Duration::from_secs(30),async {
@@ -62,7 +64,7 @@ fn main() {
                 assert_eq!(server.status().address,Some(server_ip));
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            println!("PASS: an oversized ACL drops its rule and keeps the map, address and node");
+            println!("PASS: an ACL past the firmware bound applies and keeps the map, address and node");
             println!("READY: restore resident map");
             std::io::stdout().flush().unwrap();
             tokio::time::timeout(Duration::from_secs(60),async {

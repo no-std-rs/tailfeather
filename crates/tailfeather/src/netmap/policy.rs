@@ -1,28 +1,54 @@
 //! Bounded packet-filter state carried by streaming netmaps.
+//!
+//! Without the `alloc` feature every collection here has a fixed capacity
+//! reserved inline. With it, sets, rules, their sources and destinations,
+//! and interned IPv6 ranges grow on the heap with no configured limit; only
+//! allocation failure drops rules, and it is reported the same way.
 
 use core::net::{IpAddr, Ipv4Addr};
 use core::str::FromStr;
 
 use heapless::{String, Vec};
 
+use crate::BoundedVec;
 use crate::netmap::{CapacityError, Cidr, Error};
 
+#[cfg(not(feature = "alloc"))]
 pub const MAX_FILTER_SETS: usize = 8;
+#[cfg(feature = "alloc")]
+pub const MAX_FILTER_SETS: usize = crate::UNBOUNDED;
 /// Preserve the hosted-policy capacity supported by earlier firmware while
 /// keeping every collection statically bounded.
+#[cfg(not(feature = "alloc"))]
 pub const MAX_FILTER_RULES: usize = 32;
-#[cfg(not(feature = "hosted-policy"))]
+#[cfg(feature = "alloc")]
+pub const MAX_FILTER_RULES: usize = crate::UNBOUNDED;
+#[cfg(all(not(feature = "alloc"), not(feature = "hosted-policy")))]
 pub const MAX_FILTER_SOURCES: usize = 8;
-#[cfg(feature = "hosted-policy")]
+#[cfg(all(not(feature = "alloc"), feature = "hosted-policy"))]
 pub const MAX_FILTER_SOURCES: usize = 512;
-#[cfg(not(feature = "hosted-policy"))]
+#[cfg(feature = "alloc")]
+pub const MAX_FILTER_SOURCES: usize = crate::UNBOUNDED;
+#[cfg(all(not(feature = "alloc"), not(feature = "hosted-policy")))]
 pub const MAX_FILTER_DESTINATIONS: usize = 8;
-#[cfg(feature = "hosted-policy")]
+#[cfg(all(not(feature = "alloc"), feature = "hosted-policy"))]
 pub const MAX_FILTER_DESTINATIONS: usize = 512;
+#[cfg(feature = "alloc")]
+pub const MAX_FILTER_DESTINATIONS: usize = crate::UNBOUNDED;
 pub const MAX_FILTER_PROTOCOLS: usize = 8;
 pub const MAX_FILTER_SET_NAME: usize = 32;
 /// Unstored filter sets tracked by name for truncation reporting.
+#[cfg(not(feature = "alloc"))]
 const MAX_UNSTORED_SETS: usize = 2;
+#[cfg(feature = "alloc")]
+const MAX_UNSTORED_SETS: usize = crate::UNBOUNDED;
+
+/// Which set a stored rule belongs to: one byte on firmware, wider when sets
+/// are unbounded.
+#[cfg(not(feature = "alloc"))]
+type SetId = u8;
+#[cfg(feature = "alloc")]
+type SetId = u32;
 
 /// An inclusive address range. Wildcards match both address families; an
 /// IPv4 default route never implicitly grants access to IPv6 destinations.
@@ -103,17 +129,28 @@ impl Network {
     }
 }
 
-// Existing IPv4 policies keep their eight-byte network storage. At most 32
-// distinct IPv6 ranges are interned separately; overflow rejects the map,
-// never broadens an ACL. Deleting a named set reclaims unreferenced ranges.
-#[cfg(not(feature = "hosted-policy"))]
+// Existing IPv4 policies keep their eight-byte network storage. IPv6 ranges
+// are interned separately (at most 32 without `alloc`); a rule that does not
+// fit is refused, never broadened. Deleting a named set reclaims
+// unreferenced ranges.
+#[cfg(all(not(feature = "alloc"), not(feature = "hosted-policy")))]
 const MAX_V6_NETWORKS: usize = 32;
-#[cfg(feature = "hosted-policy")]
+#[cfg(all(not(feature = "alloc"), feature = "hosted-policy"))]
 const MAX_V6_NETWORKS: usize = 256;
+#[cfg(feature = "alloc")]
+const MAX_V6_NETWORKS: usize = crate::UNBOUNDED;
+/// An IPv4 range when `first <= last`; otherwise a wildcard (`first ==
+/// u32::MAX`) or a handle `first = index + 1` into the IPv6 pool.
 #[derive(Debug, Clone, Copy)]
 struct StoredNetwork {
     first: u32,
     last: u32,
+}
+
+impl StoredNetwork {
+    fn v6_index(self) -> Option<usize> {
+        (self.first > self.last && self.first != u32::MAX).then(|| self.first as usize - 1)
+    }
 }
 #[derive(Debug, Clone)]
 struct StoredDestination {
@@ -123,10 +160,29 @@ struct StoredDestination {
 }
 #[derive(Debug, Clone)]
 struct StoredRule {
-    sources: Vec<StoredNetwork, MAX_FILTER_SOURCES>,
-    destinations: Vec<StoredDestination, MAX_FILTER_DESTINATIONS>,
+    sources: BoundedVec<StoredNetwork, MAX_FILTER_SOURCES>,
+    destinations: BoundedVec<StoredDestination, MAX_FILTER_DESTINATIONS>,
     protocols: Vec<u8, MAX_FILTER_PROTOCOLS, u8>,
-    set: u8,
+    set: SetId,
+}
+
+impl StoredRule {
+    fn try_clone(&self) -> Option<Self> {
+        Some(Self {
+            sources: self.sources.try_clone()?,
+            destinations: self.destinations.try_clone()?,
+            protocols: self.protocols.clone(),
+            set: self.set,
+        })
+    }
+
+    fn networks_mut(&mut self) -> impl Iterator<Item = &mut StoredNetwork> {
+        self.sources.iter_mut().chain(
+            self.destinations
+                .iter_mut()
+                .map(|destination| &mut destination.network),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,8 +194,8 @@ pub struct Destination {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterRule {
-    pub sources: Vec<Network, MAX_FILTER_SOURCES>,
-    pub destinations: Vec<Destination, MAX_FILTER_DESTINATIONS>,
+    pub sources: BoundedVec<Network, MAX_FILTER_SOURCES>,
+    pub destinations: BoundedVec<Destination, MAX_FILTER_DESTINATIONS>,
     /// Empty means any IP protocol, matching tailcfg semantics.
     pub protocols: Vec<u8, MAX_FILTER_PROTOCOLS>,
 }
@@ -147,8 +203,8 @@ pub struct FilterRule {
 impl FilterRule {
     pub const fn new() -> Self {
         Self {
-            sources: Vec::new(),
-            destinations: Vec::new(),
+            sources: BoundedVec::new(),
+            destinations: BoundedVec::new(),
             protocols: Vec::new(),
         }
     }
@@ -172,7 +228,7 @@ impl Default for FilterRule {
 #[derive(Debug, Clone)]
 struct FilterSet {
     name: String<MAX_FILTER_SET_NAME>,
-    id: u8,
+    id: SetId,
     /// Rules of this set were dropped for not fitting.
     truncated: bool,
 }
@@ -184,42 +240,35 @@ struct V6Range {
     last: [u8; 16],
 }
 
-impl V6Range {
-    const EMPTY: Self = Self {
-        first: [0; 16],
-        last: [0; 16],
-    };
-}
-
 /// Incremental named filter sets with one global rule bound.
 #[derive(Debug, Clone)]
 pub struct PacketPolicy {
-    sets: Vec<FilterSet, MAX_FILTER_SETS>,
-    rules: Vec<StoredRule, MAX_FILTER_RULES>,
+    sets: BoundedVec<FilterSet, MAX_FILTER_SETS>,
+    rules: BoundedVec<StoredRule, MAX_FILTER_RULES>,
     valid: bool,
     /// Sets whose rules could not be stored at all (no free set slot). Their
     /// earlier rules are gone; the marker clears when the set is replaced or
     /// deleted. Only a few names are kept (firmware RAM is tight); beyond
     /// that the policy-wide `truncated` marker is set instead, which errs
     /// towards reporting truncation, never towards hiding it.
-    unstored: Vec<String<MAX_FILTER_SET_NAME>, MAX_UNSTORED_SETS>,
+    unstored: BoundedVec<String<MAX_FILTER_SET_NAME>, MAX_UNSTORED_SETS>,
     /// Truncation that cannot be tied to a set (an unreadable set name, or
     /// more unstored sets than are tracked). Clears only with the policy.
     truncated: bool,
-    v6_networks: [V6Range; MAX_V6_NETWORKS],
-    v6_occupied: [u32; MAX_V6_NETWORKS.div_ceil(32)],
+    /// Interned IPv6 ranges, referenced by index from stored rules. Kept
+    /// dense: collecting unreferenced ranges compacts it and renumbers.
+    v6_networks: BoundedVec<V6Range, MAX_V6_NETWORKS>,
 }
 
 impl PacketPolicy {
     pub const fn new() -> Self {
         Self {
-            sets: Vec::new(),
-            rules: Vec::new(),
-            unstored: Vec::new(),
+            sets: BoundedVec::new(),
+            rules: BoundedVec::new(),
+            unstored: BoundedVec::new(),
             truncated: false,
             valid: false,
-            v6_networks: [V6Range::EMPTY; MAX_V6_NETWORKS],
-            v6_occupied: [0; MAX_V6_NETWORKS.div_ceil(32)],
+            v6_networks: BoundedVec::new(),
         }
     }
 
@@ -268,24 +317,38 @@ impl PacketPolicy {
         self.rules.len()
     }
 
+    /// Copy `source` into this policy. Without `alloc` both have the same
+    /// capacity and this always succeeds. With `alloc`, rules the allocator
+    /// cannot hold are dropped and the copy reports truncation. Dropping only
+    /// denies; if the sets or the IPv6 pool cannot be copied, no rules are,
+    /// so no rule can end up attached to the wrong set or range.
     pub(crate) fn copy_from(&mut self, source: &Self) {
-        self.sets.clear();
-        for set in &source.sets {
-            self.sets
-                .push(set.clone())
-                .expect("equal packet-filter set capacities");
-        }
-        self.rules.clear();
-        for rule in &source.rules {
-            self.rules
-                .push(rule.clone())
-                .expect("equal packet-filter rule capacities");
-        }
+        self.clear();
         self.valid = source.valid;
-        self.unstored.clone_from(&source.unstored);
         self.truncated = source.truncated;
-        self.v6_networks = source.v6_networks;
-        self.v6_occupied = source.v6_occupied;
+        match source.unstored.try_clone() {
+            Some(unstored) => self.unstored = unstored,
+            None => self.truncated = true,
+        }
+        let (Some(sets), Some(v6_networks)) =
+            (source.sets.try_clone(), source.v6_networks.try_clone())
+        else {
+            self.truncated = true;
+            return;
+        };
+        self.sets = sets;
+        self.v6_networks = v6_networks;
+        let _ = self.rules.try_reserve_total(source.rules.len());
+        for rule in source.rules.iter() {
+            let Some(rule) = rule.try_clone() else {
+                self.truncated = true;
+                break;
+            };
+            if self.rules.push(rule).is_err() {
+                self.truncated = true;
+                break;
+            }
+        }
     }
 
     pub fn mark_present(&mut self) {
@@ -295,8 +358,8 @@ impl PacketPolicy {
     pub fn replace_set(&mut self, name: &str) -> Result<(), Error> {
         self.valid_name(name)?;
         self.delete_set(name);
-        let id = (0..MAX_FILTER_SETS as u8)
-            .find(|candidate| self.sets.iter().all(|set| set.id != *candidate))
+        let id = self
+            .free_set_id()
             .ok_or(Error::Full(CapacityError::PacketPolicy))?;
         self.sets
             .push(FilterSet {
@@ -310,26 +373,60 @@ impl PacketPolicy {
         Ok(())
     }
 
-    pub fn delete_set(&mut self, name: &str) {
-        if let Some(id) = self
-            .sets
-            .iter()
-            .find(|set| set.name.as_str() == name)
-            .map(|set| set.id)
-        {
-            self.rules.retain(|rule| rule.set != id);
+    /// An id no stored set uses, found in one pass over the sets: one past
+    /// the highest id when that fits, otherwise the lowest gap. Only the
+    /// fixed table (or a heap table that exhausted `SetId`) needs the gap.
+    fn free_set_id(&self) -> Option<SetId> {
+        if self.sets.is_full() {
+            return None;
         }
-        self.sets.retain(|set| set.name.as_str() != name);
+        let next = match self.sets.iter().map(|set| set.id).max() {
+            None => Some(0),
+            Some(highest) => highest.checked_add(1),
+        };
+        if let Some(next) = next.filter(|&next| (next as usize) < MAX_FILTER_SETS) {
+            return Some(next);
+        }
+        // Fewer sets than ids, so a gap exists. Mark the ids in use and
+        // take the first free one; ids past the set count cannot be the
+        // first gap, so a bitmap of `len + 1` bits suffices.
+        let mut used = BoundedVec::<bool, MAX_FILTER_SETS>::new();
+        let slots = self.sets.len() + 1;
+        if !used.try_reserve_total(slots) {
+            return None;
+        }
+        for _ in 0..slots {
+            let _ = used.push(false);
+        }
+        for set in self.sets.iter() {
+            if let Some(slot) = used.get_mut(set.id as usize) {
+                *slot = true;
+            }
+        }
+        used.iter()
+            .position(|used| !used)
+            .and_then(|index| SetId::try_from(index).ok())
+    }
+
+    pub fn delete_set(&mut self, name: &str) {
+        if let Some(index) = self.sets.iter().position(|set| set.name.as_str() == name) {
+            let id = self.sets.remove(index).id;
+            let rules = self.rules.len();
+            self.rules.retain(|rule| rule.set != id);
+            // Only removed rules can leave ranges unreferenced; replacing a
+            // new set (the common case while a map loads) collects nothing.
+            if self.rules.len() != rules {
+                self.collect_networks();
+            }
+        }
         self.unstored.retain(|unstored| unstored.as_str() != name);
-        self.collect_networks();
         self.valid = true;
     }
 
     pub fn clear(&mut self) {
         self.sets.clear();
         self.rules.clear();
-        self.v6_networks.fill(V6Range::EMPTY);
-        self.v6_occupied.fill(0);
+        self.v6_networks.clear();
         self.valid = true;
         self.unstored.clear();
         self.truncated = false;
@@ -339,16 +436,19 @@ impl PacketPolicy {
         if !rule.is_well_formed() {
             return Err(Error::Malformed);
         }
+        // The parser fills one set at a time, and the set being filled was
+        // the last one added, so look there first.
         let set = self
             .sets
             .iter()
+            .rev()
             .find(|entry| entry.name.as_str() == set)
             .map(|entry| entry.id)
             .ok_or(Error::Malformed)?;
         let result = (|| {
             let mut compact = StoredRule {
-                sources: Vec::new(),
-                destinations: Vec::new(),
+                sources: BoundedVec::new(),
+                destinations: BoundedVec::new(),
                 protocols: rule.protocols.cast_len_type(),
                 set,
             };
@@ -389,12 +489,27 @@ impl PacketPolicy {
             Network::V4 { first, last } if first <= last => Ok(StoredNetwork { first, last }),
             Network::V6 { first, last } if first <= last => {
                 let range = V6Range { first, last };
-                let index = (0..MAX_V6_NETWORKS)
-                    .find(|&index| self.v6_used(index) && self.v6_networks[index] == range)
-                    .or_else(|| (0..MAX_V6_NETWORKS).find(|&index| !self.v6_used(index)))
-                    .ok_or(Error::Full(CapacityError::PacketPolicy))?;
-                self.v6_networks[index] = range;
-                self.v6_occupied[index / 32] |= 1 << (index % 32);
+                // The fixed pool is small, so sharing a range between rules
+                // is worth a scan; a heap pool just grows, which keeps large
+                // policies linear to load.
+                #[cfg(not(feature = "alloc"))]
+                let existing = self.v6_networks.iter().position(|stored| *stored == range);
+                #[cfg(feature = "alloc")]
+                let existing = None;
+                let index = match existing {
+                    Some(index) => index,
+                    None => {
+                        // Handles are `index + 1` and must stay below the
+                        // wildcard's `u32::MAX`.
+                        if self.v6_networks.len() >= (u32::MAX - 1) as usize {
+                            return Err(Error::Full(CapacityError::PacketPolicy));
+                        }
+                        self.v6_networks
+                            .push(range)
+                            .map_err(|_| Error::Full(CapacityError::PacketPolicy))?;
+                        self.v6_networks.len() - 1
+                    }
+                };
                 Ok(StoredNetwork {
                     first: index as u32 + 1,
                     last: 0,
@@ -412,31 +527,47 @@ impl PacketPolicy {
         } else if stored.first == u32::MAX {
             Some(Network::Any)
         } else {
-            let index = stored.first as usize - 1;
-            self.v6_networks
-                .get(index)
-                .filter(|_| self.v6_used(index))
-                .map(|range| Network::V6 {
-                    first: range.first,
-                    last: range.last,
-                })
+            let index = stored.v6_index()?;
+            self.v6_networks.get(index).map(|range| Network::V6 {
+                first: range.first,
+                last: range.last,
+            })
         }
     }
-    fn v6_used(&self, index: usize) -> bool {
-        self.v6_occupied[index / 32] & (1 << (index % 32)) != 0
-    }
+    /// Drop interned IPv6 ranges no stored rule refers to, compacting the
+    /// pool and renumbering the references that remain. If the renumbering
+    /// table cannot be allocated, the unreferenced ranges stay until the
+    /// next collection; they are unreachable, so this only costs memory.
     fn collect_networks(&mut self) {
-        for index in 0..MAX_V6_NETWORKS {
-            let used = self.rules.iter().any(|stored| {
-                stored
-                    .sources
-                    .iter()
-                    .chain(stored.destinations.iter().map(|d| &d.network))
-                    .any(|network| network.first == index as u32 + 1 && network.last == 0)
-            });
-            if !used {
-                self.v6_networks[index] = V6Range::EMPTY;
-                self.v6_occupied[index / 32] &= !(1 << (index % 32));
+        let Self {
+            rules, v6_networks, ..
+        } = self;
+        // For each pool index, the new handle (`new index + 1`), or zero if
+        // no rule refers to it.
+        let mut handles = BoundedVec::<u32, MAX_V6_NETWORKS>::new();
+        if !handles.try_reserve_total(v6_networks.len()) {
+            return;
+        }
+        for _ in 0..v6_networks.len() {
+            let _ = handles.push(0);
+        }
+        for network in rules.iter_mut().flat_map(StoredRule::networks_mut) {
+            if let Some(slot) = network.v6_index().and_then(|index| handles.get_mut(index)) {
+                *slot = 1;
+            }
+        }
+        let mut kept = 0;
+        for index in 0..v6_networks.len() {
+            if handles[index] != 0 {
+                v6_networks[kept] = v6_networks[index];
+                kept += 1;
+                handles[index] = kept as u32;
+            }
+        }
+        v6_networks.truncate(kept);
+        for network in rules.iter_mut().flat_map(StoredRule::networks_mut) {
+            if let Some(&handle) = network.v6_index().and_then(|index| handles.get(index)) {
+                network.first = handle;
             }
         }
     }
@@ -641,13 +772,13 @@ mod tests {
         assert!(!copied.allows_ip("::1".parse().unwrap(), destination, 6, 443));
         copied.delete_set("zero");
         assert!(!copied.allows_ip(source, destination, 6, 443));
-        assert!(copied.v6_occupied.iter().all(|word| *word == 0));
+        assert!(copied.v6_networks.is_empty());
     }
 
     #[test]
     fn replacing_named_sets_reclaims_interned_ipv6_networks() {
         let mut policy = PacketPolicy::new();
-        for index in 0..MAX_V6_NETWORKS * 2 {
+        for index in 0..64 {
             policy.replace_set("rotating").unwrap();
             let mut rule = any_rule();
             rule.sources.clear();
@@ -656,17 +787,11 @@ mod tests {
             write!(&mut text, "2001:db8::{index:x}").unwrap();
             rule.sources.push(Network::parse(&text).unwrap()).unwrap();
             policy.push_rule("rotating", rule).unwrap();
-            assert_eq!(
-                policy
-                    .v6_occupied
-                    .iter()
-                    .map(|word| word.count_ones())
-                    .sum::<u32>(),
-                1
-            );
+            assert_eq!(policy.v6_networks.len(), 1);
         }
     }
 
+    #[cfg(not(feature = "alloc"))]
     #[test]
     fn ipv6_pool_overflow_preserves_existing_grants_and_rejects_new_ones() {
         let mut policy = PacketPolicy::new();
@@ -707,6 +832,102 @@ mod tests {
             6,
             443
         ));
+    }
+
+    fn v6_rule(sources: &[&str]) -> FilterRule {
+        let mut rule = any_rule();
+        rule.sources.clear();
+        for source in sources {
+            rule.sources.push(Network::parse(source).unwrap()).unwrap();
+        }
+        rule
+    }
+
+    #[test]
+    fn collecting_ipv6_ranges_renumbers_the_rules_that_remain() {
+        let mut policy = PacketPolicy::new();
+        policy.replace_set("first").unwrap();
+        policy
+            .push_rule("first", v6_rule(&["2001:db8::1", "2001:db8::2"]))
+            .unwrap();
+        policy.replace_set("second").unwrap();
+        policy
+            .push_rule("second", v6_rule(&["2001:db8::3", "2001:db8::/120"]))
+            .unwrap();
+        assert_eq!(policy.v6_networks.len(), 4);
+        policy.delete_set("first");
+        // The second set's ranges moved to the front of the pool; its rule
+        // must follow them, not inherit the deleted set's ranges.
+        assert_eq!(policy.v6_networks.len(), 2);
+        let destination = "2001:db8::ffff".parse().unwrap();
+        let allows = |policy: &PacketPolicy, source: &str| {
+            policy.allows_ip(source.parse().unwrap(), destination, 6, 443)
+        };
+        assert!(allows(&policy, "2001:db8::3"));
+        assert!(allows(&policy, "2001:db8::80"));
+        assert!(!allows(&policy, "2001:db8::1:0"));
+        // A range interned after compaction does not alias a live one.
+        policy.replace_set("third").unwrap();
+        policy
+            .push_rule("third", v6_rule(&["2001:db9::1"]))
+            .unwrap();
+        assert!(allows(&policy, "2001:db9::1"));
+        assert!(allows(&policy, "2001:db8::3"));
+        assert!(!allows(&policy, "2001:db9::2"));
+        policy.delete_set("second");
+        assert!(allows(&policy, "2001:db9::1"));
+        assert!(!allows(&policy, "2001:db8::3"));
+        assert_eq!(policy.v6_networks.len(), 1);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn a_heap_policy_holds_large_tailnets_without_truncating() {
+        use core::fmt::Write as _;
+        let mut policy = PacketPolicy::new();
+        for set in 0..300 {
+            let mut name = String::<8>::new();
+            write!(name, "s{set}").unwrap();
+            policy.replace_set(&name).unwrap();
+            let mut rule = any_rule();
+            rule.sources.clear();
+            for host in 0..20u32 {
+                rule.sources
+                    .push(Network::V4 {
+                        first: 0x6440_0000 + set * 64 + host,
+                        last: 0x6440_0000 + set * 64 + host,
+                    })
+                    .unwrap();
+                let mut text = String::<48>::new();
+                write!(text, "fd7a:115c:a1e0::{set:x}:{host:x}").unwrap();
+                rule.sources.push(Network::parse(&text).unwrap()).unwrap();
+            }
+            policy.push_rule(&name, rule).unwrap();
+        }
+        assert_eq!(policy.set_count(), 300);
+        assert_eq!(policy.rule_count(), 300);
+        assert_eq!(policy.v6_networks.len(), 300 * 20);
+        assert!(!policy.truncated());
+        let mut copy = PacketPolicy::new();
+        copy.copy_from(&policy);
+        assert!(!copy.truncated());
+        let destination = "fd7a:115c:a1e0::1".parse().unwrap();
+        assert!(copy.allows_ip(
+            "fd7a:115c:a1e0::12b:13".parse().unwrap(),
+            destination,
+            6,
+            22
+        ));
+        assert!(!copy.allows_ip("fd7a:115c:a1e0::12c:0".parse().unwrap(), destination, 6, 22));
+        copy.delete_set("s0");
+        assert_eq!(copy.v6_networks.len(), 299 * 20);
+        assert!(copy.allows_ip(
+            "fd7a:115c:a1e0::12b:13".parse().unwrap(),
+            destination,
+            6,
+            22
+        ));
+        assert!(!copy.allows_ip("fd7a:115c:a1e0::0:1".parse().unwrap(), destination, 6, 22));
     }
 
     #[test]
@@ -750,6 +971,36 @@ mod tests {
         assert!(policy.is_valid());
     }
 
+    #[test]
+    fn set_ids_are_reused_after_deletion_without_colliding() {
+        use core::fmt::Write as _;
+        let mut policy = PacketPolicy::new();
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for name in names {
+            policy.replace_set(name).unwrap();
+            policy.push_rule(name, any_rule()).unwrap();
+        }
+        // Free a middle id and the highest; new sets must not share ids
+        // with surviving sets, or deleting one would delete the other's rules.
+        policy.delete_set("c");
+        policy.delete_set("h");
+        for index in 0..2 {
+            let mut name = String::<8>::new();
+            write!(name, "n{index}").unwrap();
+            policy.replace_set(&name).unwrap();
+            policy.push_rule(&name, any_rule()).unwrap();
+        }
+        let mut ids: std::vec::Vec<_> = policy.sets.iter().map(|set| set.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 8);
+        assert_eq!(policy.rule_count(), 8);
+        policy.delete_set("n0");
+        policy.delete_set("n1");
+        assert_eq!(policy.rule_count(), 6);
+    }
+
+    #[cfg(not(feature = "alloc"))]
     #[test]
     fn bounds_are_errors_not_truncation() {
         let mut policy = PacketPolicy::new();

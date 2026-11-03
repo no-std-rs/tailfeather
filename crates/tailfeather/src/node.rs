@@ -2116,7 +2116,23 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hosted-policy")]
+    #[cfg(feature = "alloc")]
+    fn heap_policy_and_derp_tables_are_not_reserved_inline() {
+        use crate::netmap::{DerpMap, PacketPolicy};
+        assert!(
+            core::mem::size_of::<PacketPolicy>() <= 256,
+            "PacketPolicy is {} bytes",
+            core::mem::size_of::<PacketPolicy>()
+        );
+        assert!(
+            core::mem::size_of::<DerpMap>() <= 128,
+            "DerpMap is {} bytes",
+            core::mem::size_of::<DerpMap>()
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "hosted-policy", not(feature = "alloc")))]
     fn hosted_policy_node_fits_host_budget() {
         use crate::netmap::policy::{
             MAX_FILTER_DESTINATIONS, MAX_FILTER_RULES, MAX_FILTER_SOURCES,
@@ -2340,7 +2356,7 @@ mod tests {
             .derp
             .intern_cert_name("certificate.example", &mut [])
             .unwrap();
-        let mut nodes = heapless::Vec::new();
+        let mut nodes = crate::BoundedVec::new();
         nodes
             .push(crate::netmap::DerpNode {
                 host_name: heapless::String::try_from("derp.example").unwrap(),
@@ -3098,7 +3114,7 @@ mod tests {
 
     fn a_peers_advertised_home_outranks_the_first_map_region_fixture() {
         fn region(id: u16) -> crate::netmap::DerpRegion {
-            let mut nodes = heapless::Vec::new();
+            let mut nodes = crate::BoundedVec::new();
             nodes
                 .push(crate::netmap::DerpNode {
                     host_name: heapless::String::try_from("derp.example").unwrap(),
@@ -3175,7 +3191,7 @@ mod tests {
             stun_port: 3478,
         };
         relay.mark_insecure_for_tests();
-        let mut nodes = heapless::Vec::new();
+        let mut nodes = crate::BoundedVec::new();
         nodes.push(relay).unwrap();
         map.derp
             .insert(crate::netmap::DerpRegion {
@@ -3211,7 +3227,7 @@ mod tests {
 
     fn only_home_and_active_peer_derp_are_kept_connected_fixture() {
         fn region(id: u16) -> crate::netmap::DerpRegion {
-            let mut nodes = heapless::Vec::new();
+            let mut nodes = crate::BoundedVec::new();
             nodes
                 .push(crate::netmap::DerpNode {
                     host_name: heapless::String::try_from("derp.example").unwrap(),
@@ -3453,7 +3469,7 @@ mod tests {
 
     fn failed_home_derp_does_not_block_the_peer_region_fixture() {
         fn region(id: u16) -> crate::netmap::DerpRegion {
-            let mut nodes = heapless::Vec::new();
+            let mut nodes = crate::BoundedVec::new();
             nodes
                 .push(crate::netmap::DerpNode {
                     host_name: heapless::String::try_from("derp.example").unwrap(),
@@ -3516,7 +3532,7 @@ mod tests {
 
     fn removing_a_peer_clears_its_queued_derp_packet_when_the_region_stays_fixture() {
         fn region(id: u16) -> crate::netmap::DerpRegion {
-            let mut nodes = heapless::Vec::new();
+            let mut nodes = crate::BoundedVec::new();
             nodes
                 .push(crate::netmap::DerpNode {
                     host_name: heapless::String::try_from("derp.example").unwrap(),
@@ -3587,7 +3603,7 @@ mod tests {
     }
 
     fn relay_region(id: u16) -> crate::netmap::DerpRegion {
-        let mut nodes = heapless::Vec::new();
+        let mut nodes = crate::BoundedVec::new();
         nodes
             .push(crate::netmap::DerpNode {
                 host_name: heapless::String::try_from("derp.example").unwrap(),

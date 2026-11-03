@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 tailfeather-reactor = { path = "../crates/tailfeather-reactor", features = ["std", "accelerated-crypto"] }
-tailfeather = { path = "../crates/tailfeather", features = ["peer-names", "hosted-policy"] }
+tailfeather = { path = "../crates/tailfeather", features = ["peer-names", "hosted-policy", "alloc"] }
 wirefeather = { path = "../crates/wirefeather" }
 critical-section = { version = "1.2", features = ["std"] }
 embedded-io-async = { version = "0.7", features = ["std"] }

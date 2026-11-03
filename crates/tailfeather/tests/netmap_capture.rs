@@ -448,11 +448,19 @@ fn derp_regions_keep_two_relay_capable_nodes_and_skip_stun_only_entries() {
         4096,
     );
     let region = netmap.derp.region(9).unwrap();
-    assert_eq!(region.nodes.len(), 2);
+    // A heap map keeps every relay-capable node.
+    assert_eq!(
+        region.nodes.len(),
+        if cfg!(feature = "alloc") { 3 } else { 2 }
+    );
     assert_eq!(region.nodes[0].host_name.as_str(), "primary.example");
     assert!(region.nodes[0].insecure_for_tests());
     assert_eq!(region.nodes[1].host_name.as_str(), "backup.example");
     assert!(!region.nodes[1].insecure_for_tests());
+    if cfg!(feature = "alloc") {
+        assert_eq!(region.nodes[2].host_name.as_str(), "extra.example");
+    }
+    assert!(region.nodes.iter().all(|node| node.port != 0));
 }
 
 #[test]
@@ -531,9 +539,24 @@ fn discarded_derp_backups_do_not_consume_certificate_name_capacity() {
         11,
     );
     let region = netmap.derp.region(9).unwrap();
-    assert_eq!(region.nodes.len(), 2);
-    assert_eq!(netmap.derp.cert_name(&region.nodes[0]), "cert-one.example");
-    assert_eq!(netmap.derp.cert_name(&region.nodes[1]), "cert-two.example");
+    let expected: &[&str] = if cfg!(feature = "alloc") {
+        &[
+            "cert-one.example",
+            "cert-two.example",
+            "cert-three.example",
+            "cert-four.example",
+            "cert-five.example",
+        ]
+    } else {
+        &["cert-one.example", "cert-two.example"]
+    };
+    let names: Vec<&str> = region
+        .nodes
+        .iter()
+        .map(|node| netmap.derp.cert_name(node))
+        .collect();
+    assert_eq!(names, expected);
+    assert!(!netmap.derp.truncated());
 }
 
 #[test]
@@ -545,11 +568,21 @@ fn a_stun_only_node_is_retained_when_relays_offer_no_stun_endpoint() {
         32,
     );
     let region = netmap.derp.region(9).unwrap();
-    assert_eq!(region.nodes.len(), 2);
-    assert_eq!(region.nodes[0].host_name.as_str(), "relay.example");
-    assert_eq!(region.nodes[1].host_name.as_str(), "stun.example");
-    assert_eq!(region.nodes[1].port, 0);
-    assert_eq!(region.nodes[1].stun_port, 3478);
+    // The fixed table gives the backup relay's slot to the STUN host; a heap
+    // map has room for both.
+    let hosts: Vec<&str> = region
+        .nodes
+        .iter()
+        .map(|node| node.host_name.as_str())
+        .collect();
+    if cfg!(feature = "alloc") {
+        assert_eq!(hosts, ["relay.example", "backup.example", "stun.example"]);
+    } else {
+        assert_eq!(hosts, ["relay.example", "stun.example"]);
+    }
+    let stun = region.nodes.last().unwrap();
+    assert_eq!(stun.port, 0);
+    assert_eq!(stun.stun_port, 3478);
 }
 
 /// The scratch buffer is the only memory that scales with the document, and it
@@ -1196,11 +1229,16 @@ fn packet_filter_overflow_drops_whole_rules_and_keeps_the_rest() {
     let policy = &netmap.packet_filter;
     assert!(policy.is_valid());
     assert!(policy.truncated());
-    // The oversized and over-long rules are dropped; the rest fill the table.
-    assert_eq!(
-        policy.rule_count(),
-        tailfeather::netmap::policy::MAX_FILTER_RULES
-    );
+    if cfg!(feature = "alloc") {
+        // Only the rule with an oversized string is dropped: 43 rules, 42 kept.
+        assert_eq!(policy.rule_count(), rules.len() - 1);
+    } else {
+        // The oversized and over-long rules are dropped; the rest fill the table.
+        assert_eq!(
+            policy.rule_count(),
+            tailfeather::netmap::policy::MAX_FILTER_RULES
+        );
+    }
 }
 
 #[test]
@@ -1225,10 +1263,13 @@ fn a_large_derp_map_keeps_the_lowest_regions_and_skips_unusable_relays() {
     assert!(netmap.derp.truncated());
     let mut ids: Vec<u16> = netmap.derp.iter().map(|region| region.id).collect();
     ids.sort_unstable();
-    assert_eq!(
-        ids,
-        (1..=tailfeather::netmap::MAX_DERP_REGIONS as u16).collect::<Vec<_>>()
-    );
+    // A heap map keeps all 60 regions; the fixed one keeps the lowest ids.
+    let kept = if cfg!(feature = "alloc") {
+        60
+    } else {
+        tailfeather::netmap::MAX_DERP_REGIONS as u16
+    };
+    assert_eq!(ids, (1..=kept).collect::<Vec<_>>());
     assert!(netmap.derp.region(3).unwrap().nodes.is_empty());
     assert_eq!(netmap.derp.region(4).unwrap().nodes.len(), 1);
     assert!(netmap.derp.region(4).unwrap().code.starts_with("r4-"));
@@ -1419,7 +1460,13 @@ fn acl_truncation_clears_once_a_complete_policy_replaces_it() {
         )
     };
     let mut netmap = Netmap::<32>::new();
-    let oversized: Vec<String> = (0..100).map(allow).collect();
+    // Too many rules for the fixed table, and one with a source no build
+    // keeps, so both builds drop rules.
+    let mut oversized: Vec<String> = (0..100).map(allow).collect();
+    oversized.push(format!(
+        r#"{{"SrcIPs":["{}"],"DstPorts":[{{"IP":"*","Ports":{{"First":1,"Last":1}}}}]}}"#,
+        "1".repeat(10 * 1024)
+    ));
     let documents = [
         format!(r#"{{"PacketFilter":[{}]}}"#, oversized.join(",")),
         format!(r#"{{"PacketFilter":[{}]}}"#, allow(22)),

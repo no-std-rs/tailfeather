@@ -51,6 +51,9 @@ pub use node::{
     Transport,
 };
 pub use wirefeather as tunnel;
+/// Bounded storage for netmap collections: inline without `alloc`, growing on
+/// the heap (fallibly) with it.
+pub use wirefeather::peer_vec::BoundedVec;
 /// A `PEERS` bound with no limit: tables grow while memory allows. Requires
 /// the `alloc` feature.
 pub use wirefeather::peer_vec::UNBOUNDED;

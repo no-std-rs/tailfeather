@@ -1338,7 +1338,7 @@ mod tests {
             id: 23,
             code: String::new(),
             no_measure_no_home: false,
-            nodes: Vec::new(),
+            nodes: tailfeather::BoundedVec::new(),
         };
         region.nodes.push(relay).unwrap();
         map.derp.insert(region.clone()).unwrap();

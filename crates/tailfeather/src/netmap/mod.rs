@@ -85,9 +85,19 @@ pub const MAX_ENDPOINTS: usize = 12;
 
 /// Hosted publishes several dozen regions. The map retains two usable relays
 /// per region, while [`crate::Node`] limits live sessions separately.
+///
+/// With the `alloc` feature the map grows on the heap instead, with no
+/// configured limit; only allocation failure truncates it.
+#[cfg(not(feature = "alloc"))]
 pub const MAX_DERP_REGIONS: usize = 40;
-/// A primary and one failover relay are retained for each region.
+#[cfg(feature = "alloc")]
+pub const MAX_DERP_REGIONS: usize = crate::UNBOUNDED;
+/// A primary and one failover relay are retained for each region; with
+/// `alloc`, every usable relay is.
+#[cfg(not(feature = "alloc"))]
 pub const MAX_DERP_NODES: usize = 2;
+#[cfg(feature = "alloc")]
+pub const MAX_DERP_NODES: usize = crate::UNBOUNDED;
 /// DERP DNS names retained by the embedded map. This keeps the capacity that
 /// previous releases accepted, including custom relay hostnames.
 pub const MAX_DERP_HOSTNAME: usize = 64;
@@ -114,6 +124,11 @@ pub const MAX_DNS_NAME: usize = 64;
 /// length. The longest string in the captured map is a 73-character node name.
 /// Maximum decoded JSON string in a streamed netmap. Hosted policy payloads
 /// can exceed one KiB even when the retained peer/DERP fields are short.
+///
+/// This stays fixed with the `alloc` feature: every field the parser reads
+/// (keys, addresses, host names, filter entries) is far shorter, so only
+/// skipped fields such as signatures and `CapMap` values ever exceed it, and
+/// buffering them would cost memory for data that is thrown away.
 pub const MAX_STRING: usize = 2 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
