@@ -81,6 +81,7 @@ impl DerpRegion {
 pub struct DerpMap {
     regions: heapless::Vec<DerpRegion, MAX_DERP_REGIONS>,
     cert_names: heapless::Vec<heapless::String<MAX_DERP_HOSTNAME>, MAX_DERP_CERT_NAMES>,
+    truncated: bool,
 }
 
 impl DerpMap {
@@ -88,7 +89,19 @@ impl DerpMap {
         Self {
             regions: heapless::Vec::new(),
             cert_names: heapless::Vec::new(),
+            truncated: false,
         }
+    }
+
+    /// Control named more regions (or relays) than this map retains. The
+    /// lowest region ids are kept, so the subset does not depend on the
+    /// order control lists them in.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub(crate) fn mark_truncated(&mut self) {
+        self.truncated = true;
     }
 
     pub fn len(&self) -> usize {
@@ -106,6 +119,7 @@ impl DerpMap {
     pub(crate) fn copy_from(&mut self, source: &Self) {
         self.regions.clear();
         self.cert_names.clear();
+        self.truncated = source.truncated;
         for name in source.cert_names.iter() {
             self.cert_names
                 .push(name.clone())
@@ -160,9 +174,27 @@ impl DerpMap {
             .map_err(|_| Error::Full(CapacityError::DerpRegions))
     }
 
+    /// Insert into a possibly full map, keeping the lowest region ids and
+    /// recording that the map was truncated.
+    pub(crate) fn insert_bounded(&mut self, region: DerpRegion) {
+        let Err(_) = self.insert(region.clone()) else {
+            return;
+        };
+        self.truncated = true;
+        if let Some(highest) = self
+            .regions
+            .iter_mut()
+            .max_by_key(|existing| existing.id)
+            .filter(|existing| existing.id > region.id)
+        {
+            *highest = region;
+        }
+    }
+
     pub fn clear(&mut self) {
         self.regions.clear();
         self.cert_names.clear();
+        self.truncated = false;
     }
 }
 

@@ -285,12 +285,18 @@ struct PendingRegion {
     node_cert: heapless::String<{ crate::netmap::MAX_DERP_HOSTNAME }>,
     node_port: u16,
     node_stun: u16,
-    /// Bit zero is STUNOnly; bit one is InsecureForTests.
+    /// Bit zero is STUNOnly; bit one is InsecureForTests; bit two marks a
+    /// relay whose host or certificate name did not fit, which is skipped.
     node_flags: u8,
 }
 
 struct PendingFilter {
     set: heapless::String<{ crate::netmap::policy::MAX_FILTER_SET_NAME }>,
+    /// The current set could not be stored, so its rules are dropped.
+    skip_set: bool,
+    /// The current rule outgrew a bound and is dropped whole: rules only
+    /// allow traffic, so dropping one can only deny.
+    rule_overflow: bool,
     rule: FilterRule,
     destination_network: Option<Network>,
     first_port: Option<u16>,
@@ -301,6 +307,8 @@ impl PendingFilter {
     const fn new() -> Self {
         Self {
             set: heapless::String::new(),
+            skip_set: false,
+            rule_overflow: false,
             rule: FilterRule::new(),
             destination_network: None,
             first_port: None,
@@ -310,6 +318,7 @@ impl PendingFilter {
 
     fn reset_rule(&mut self) {
         self.rule = FilterRule::new();
+        self.rule_overflow = false;
     }
 
     fn reset_destination(&mut self) {
@@ -523,21 +532,40 @@ impl State {
                 self.region.node_flags = 0;
             }
             Context::PacketFilterArray => {
-                if let Err(error) = netmap.packet_filter.replace_set("base") {
-                    self.fail(error);
+                self.filter.skip_set = false;
+                match netmap.packet_filter.replace_set("base") {
+                    Ok(()) => {}
+                    Err(Error::Full(_)) => {
+                        netmap.packet_filter.mark_truncated();
+                        self.filter.skip_set = true;
+                    }
+                    Err(error) => self.fail(error),
                 }
                 self.filter.set = heapless::String::try_from("base").unwrap();
             }
             Context::PacketFiltersObject => netmap.packet_filter.mark_present(),
-            Context::FilterSetArray => match heapless::String::try_from(self.key.as_str()) {
-                Ok(name) => {
-                    self.filter.set = name;
-                    if let Err(error) = netmap.packet_filter.replace_set(self.filter.set.as_str()) {
-                        self.fail(error);
+            Context::FilterSetArray => {
+                self.filter.skip_set = false;
+                match heapless::String::try_from(self.key.as_str()) {
+                    Ok(name) => {
+                        self.filter.set = name;
+                        match netmap.packet_filter.replace_set(self.filter.set.as_str()) {
+                            Ok(()) => {}
+                            // The set's earlier rules are already gone; its
+                            // new ones are dropped, which only denies.
+                            Err(Error::Full(_)) => {
+                                netmap.packet_filter.mark_truncated();
+                                self.filter.skip_set = true;
+                            }
+                            Err(error) => self.fail(error),
+                        }
+                    }
+                    Err(_) => {
+                        netmap.packet_filter.mark_truncated();
+                        self.filter.skip_set = true;
                     }
                 }
-                Err(_) => self.fail(Error::Full(CapacityError::PacketPolicy)),
-            },
+            }
             Context::FilterRuleObject => self.filter.reset_rule(),
             Context::FilterDestinationObject => self.filter.reset_destination(),
             _ => {}
@@ -564,7 +592,9 @@ impl State {
                     port: self.region.node_port,
                     stun_port: self.region.node_stun,
                 };
-                if self.region.node_flags & 1 != 0 {
+                if self.region.node_flags & 4 != 0 {
+                    // Unusable relay: dropped, regardless of field order.
+                } else if self.region.node_flags & 1 != 0 {
                     if !node.host_name.is_empty()
                         && node.stun_port != 0
                         && self.region.stun_fallback.is_none()
@@ -580,13 +610,20 @@ impl State {
                     {
                         match netmap.derp.intern_cert_name(self.region.node_cert.as_str()) {
                             Ok(name) => node.cert_name = Some(name),
-                            Err(error) => self.fail(error),
+                            // Without its certificate name the relay cannot be
+                            // verified; skip it rather than the whole map.
+                            Err(_) => {
+                                netmap.derp.mark_truncated();
+                                node.host_name.clear();
+                            }
                         }
                     }
                     if self.region.node_flags & 2 != 0 {
                         node.mark_insecure_for_tests();
                     }
-                    let _ = self.region.nodes.push(node);
+                    if !node.host_name.is_empty() {
+                        let _ = self.region.nodes.push(node);
+                    }
                 }
             }
             Context::DerpRegion => {
@@ -608,9 +645,7 @@ impl State {
                     no_measure_no_home: self.region.no_measure_no_home,
                     nodes: core::mem::take(&mut self.region.nodes),
                 };
-                if let Err(e) = netmap.derp.insert(region) {
-                    self.fail(e);
-                }
+                netmap.derp.insert_bounded(region);
             }
             Context::FilterDestinationObject => {
                 let destination = match (
@@ -634,17 +669,23 @@ impl State {
                     }
                 };
                 if self.filter.rule.destinations.push(destination).is_err() {
-                    self.fail(Error::Full(CapacityError::PacketPolicy));
+                    self.filter.rule_overflow = true;
                 }
             }
             Context::FilterRuleObject => {
-                if !self.filter.rule.is_well_formed() {
+                if self.filter.skip_set || self.filter.rule_overflow {
+                    netmap.packet_filter.mark_truncated();
+                } else if !self.filter.rule.is_well_formed() {
                     self.fail(Error::MalformedField(MalformedField::PacketRule));
-                } else if let Err(error) = netmap.packet_filter.push_rule(
-                    self.filter.set.as_str(),
-                    core::mem::take(&mut self.filter.rule),
-                ) {
-                    self.fail(error);
+                } else {
+                    match netmap.packet_filter.push_rule(
+                        self.filter.set.as_str(),
+                        core::mem::take(&mut self.filter.rule),
+                    ) {
+                        Ok(()) => {}
+                        Err(Error::Full(_)) => netmap.packet_filter.mark_truncated(),
+                        Err(error) => self.fail(error),
+                    }
                 }
             }
             Context::Root => netmap.responses += 1,
@@ -1063,7 +1104,7 @@ impl State {
             Context::FilterSources => match Network::parse(value) {
                 Ok(network) => {
                     if self.filter.rule.sources.push(network).is_err() {
-                        self.fail(Error::Full(CapacityError::PacketPolicy));
+                        self.filter.rule_overflow = true;
                     }
                 }
                 Err(_) => self.fail(Error::MalformedField(MalformedField::PolicySource)),
@@ -1072,17 +1113,32 @@ impl State {
                 Ok(network) => self.filter.destination_network = Some(network),
                 Err(_) => self.fail(Error::MalformedField(MalformedField::PolicyDestination)),
             },
-            Context::DerpRegion if key == "RegionCode" => match heapless::String::try_from(value) {
-                Ok(code) => self.region.code = code,
-                Err(_) => self.fail(Error::Full(CapacityError::String)),
-            },
+            // A display code: keep what fits at a character boundary.
+            Context::DerpRegion if key == "RegionCode" => {
+                self.region.code.clear();
+                for character in value.chars() {
+                    if self.region.code.push(character).is_err() {
+                        break;
+                    }
+                }
+            }
+            // A relay whose name does not fit cannot be dialled or verified:
+            // skip that relay (an empty host is never retained), not the map.
             Context::DerpNode if key == "HostName" => match heapless::String::try_from(value) {
                 Ok(host) => self.region.node_host = host,
-                Err(_) => self.fail(Error::Full(CapacityError::String)),
+                Err(_) => {
+                    self.region.node_flags |= 4;
+                    netmap.derp.mark_truncated();
+                }
             },
             Context::DerpNode if key == "CertName" => match heapless::String::try_from(value) {
                 Ok(host) => self.region.node_cert = host,
-                Err(_) => self.fail(Error::Full(CapacityError::String)),
+                Err(_) => {
+                    // Verifying against the host name instead would accept a
+                    // certificate control did not name, so drop the relay.
+                    self.region.node_flags |= 4;
+                    netmap.derp.mark_truncated();
+                }
             },
             Context::DnsDomains => netmap.dns.push_domain(value),
             Context::DnsResolverObject if key == "Addr" => netmap.dns.push_resolver(value),
@@ -1155,7 +1211,7 @@ impl State {
             Context::FilterProtocols => match u8::try_from(value) {
                 Ok(protocol) => {
                     if self.filter.rule.protocols.push(protocol).is_err() {
-                        self.fail(Error::Full(CapacityError::PacketPolicy));
+                        self.filter.rule_overflow = true;
                     }
                 }
                 Err(_) => self.fail(Error::MalformedField(MalformedField::PolicyProtocol)),
@@ -1219,6 +1275,56 @@ impl State {
 }
 
 impl State {
+    /// A value too large to retain: a string past [`crate::netmap::MAX_STRING`]
+    /// or a container nested past the scanner's depth.
+    ///
+    /// Control sends such values in fields this crate never reads (tailnet-lock
+    /// signatures, capability maps, Hostinfo), and rejecting the whole map for
+    /// them would cut the node off. Where the value would have been retained,
+    /// the narrowest safe loss applies instead.
+    fn on_oversized<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
+        match self.context() {
+            // A partial rule could widen it (an empty protocol list means
+            // every protocol), so the whole rule is dropped. Rules only allow
+            // traffic, so a dropped rule can only deny.
+            Context::FilterRuleObject
+            | Context::FilterSources
+            | Context::FilterDestinations
+            | Context::FilterDestinationObject
+            | Context::FilterPortsObject
+            | Context::FilterProtocols => self.filter.rule_overflow = true,
+            // A rule too large to read at all.
+            Context::PacketFilterArray | Context::FilterSetArray => {
+                netmap.packet_filter.mark_truncated();
+            }
+            // A named set that cannot be read cannot replace the set's
+            // earlier rules, which would then linger; and this node's own
+            // addresses and routes are not optional.
+            Context::PacketFiltersObject | Context::SelfAddresses | Context::SelfPrimaryRoutes => {
+                self.fail(Error::Full(CapacityError::String));
+            }
+            // A partial address or allowed-IP list would misstate what the
+            // peer may send; omit the peer, as for any oversized list.
+            Context::PeerAddresses => {
+                self.pending
+                    .oversized
+                    .get_or_insert(CapacityError::Addresses);
+            }
+            Context::PeerAllowedIps | Context::PeerPrimaryRoutes => {
+                self.pending
+                    .oversized
+                    .get_or_insert(CapacityError::AllowedIps);
+            }
+            // A relay field that did not fit (its certificate name, say)
+            // cannot be replaced by a guess; drop that relay.
+            Context::DerpNode => self.region.node_flags |= 4,
+            // Anything else is unread, advisory, or only shortens what the
+            // node knows (a peer without a parseable key is not retained).
+            _ => {}
+        }
+        self.key.clear();
+    }
+
     fn on_token<const PEERS: usize>(
         &mut self,
         netmap: &mut Netmap<PEERS>,
@@ -1242,6 +1348,7 @@ impl State {
                     | Token::StartArray
                     | Token::Int(_)
                     | Token::OtherNumber
+                    | Token::Oversized
                     | Token::Bool(_) => {
                         self.pending.key_expiry_restricted = Some(true);
                     }
@@ -1285,6 +1392,18 @@ impl State {
             }
             Token::Bool(value) => self.on_bool(netmap, value),
             Token::Null => self.on_null(netmap),
+            Token::OversizedKey => {
+                self.key.clear();
+                if matches!(
+                    self.context(),
+                    Context::DerpRegions | Context::PacketFiltersObject
+                ) {
+                    self.fail(Error::Full(CapacityError::String));
+                } else {
+                    self.key_oversized = true;
+                }
+            }
+            Token::Oversized => self.on_oversized(netmap),
         }
         Ok(())
     }

@@ -153,7 +153,7 @@ fn packet_filter_sets_replace_delete_and_clear_incrementally() {
 }
 
 #[test]
-fn malformed_or_overflowing_packet_filter_rejects_the_staged_map() {
+fn malformed_packet_filter_rejects_the_staged_map_but_overflow_drops_the_rule() {
     fn parse(document: &str) -> Result<(), tailfeather::netmap::Error> {
         let mut netmap = Netmap::<32>::new();
         let mut parser = Parser::<32>::new();
@@ -168,13 +168,17 @@ fn malformed_or_overflowing_packet_filter_rejects_the_staged_map() {
             tailfeather::netmap::MalformedField::PacketDestination
         ))
     );
+    // Keeping the previous map instead would keep a stale policy that may
+    // still allow what control just revoked. The rule that does not fit is
+    // dropped instead, which only denies.
     let protocols = r#"{"PacketFilters":{"base":[{"SrcIPs":["*"],"DstPorts":[{"IP":"*","Ports":{"First":0,"Last":65535}}],"IPProto":[1,2,3,4,5,6,7,8,9]}]}}"#;
-    assert_eq!(
-        parse(protocols),
-        Err(tailfeather::netmap::Error::Full(
-            tailfeather::netmap::CapacityError::PacketPolicy
-        ))
-    );
+    let mut netmap = Netmap::<32>::new();
+    let mut parser = Parser::<32>::new();
+    parser.push(&mut netmap, protocols.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    assert!(netmap.packet_filter.is_valid());
+    assert!(netmap.packet_filter.truncated());
+    assert_eq!(netmap.packet_filter.rule_count(), 0);
 }
 
 #[test]
@@ -1142,6 +1146,90 @@ fn an_unbounded_heap_netmap_keeps_every_peer_of_a_large_tailnet() {
     parser.finish(&mut netmap).unwrap();
     assert_eq!(netmap.peers.len(), 300);
     assert!(!netmap.peers_truncated);
-    // Nothing per-peer is reserved inline.
-    assert!(core::mem::size_of::<Netmap<UNBOUNDED>>() < 32 * 1024);
+    // Nothing per-peer is reserved inline: the bound does not change the size.
+    assert_eq!(
+        core::mem::size_of::<Netmap<UNBOUNDED>>(),
+        core::mem::size_of::<Netmap<1>>()
+    );
+}
+
+#[test]
+fn oversized_unread_fields_do_not_reject_the_map() {
+    let signature = "A".repeat(10 * 1024);
+    let deep = format!("{}1{}", "[".repeat(40), "]".repeat(40));
+    let document = format!(
+        r#"{{"Node":{{"Key":"{RANKED_SELF}","CapMap":{{"x":{deep}}}}},"Peers":[{{"ID":3,"Key":"{}","KeySignature":"{signature}","Hostinfo":{{"Blob":{deep}}}}}]}}"#,
+        RANKED_KEYS[2]
+    );
+    let mut netmap = Netmap::<32>::new();
+    let mut parser = Parser::<32>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    assert_eq!(
+        netmap.peers.iter().map(|peer| peer.id).collect::<Vec<_>>(),
+        vec![3]
+    );
+    assert!(!netmap.peers_truncated);
+}
+
+#[test]
+fn packet_filter_overflow_drops_whole_rules_and_keeps_the_rest() {
+    let allow = |source: &str| {
+        format!(
+            r#"{{"SrcIPs":["{source}"],"DstPorts":[{{"IP":"*","Ports":{{"First":22,"Last":22}}}}]}}"#
+        )
+    };
+    let many_sources: Vec<String> = (1..=600)
+        .map(|i| format!("\"100.64.{}.{}\"", i / 256, i % 256))
+        .collect();
+    let too_many = format!(
+        r#"{{"SrcIPs":[{}],"DstPorts":[{{"IP":"*","Ports":{{"First":80,"Last":80}}}}]}}"#,
+        many_sources.join(",")
+    );
+    let mut rules = vec![allow("100.64.0.1"), allow(&"1".repeat(10 * 1024)), too_many];
+    rules.extend((0..40).map(|i| allow(&format!("100.65.0.{i}"))));
+    let document = format!(r#"{{"PacketFilter":[{}]}}"#, rules.join(","));
+    let mut netmap = Netmap::<32>::new();
+    let mut parser = Parser::<32>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    let policy = &netmap.packet_filter;
+    assert!(policy.is_valid());
+    assert!(policy.truncated());
+    // The oversized and over-long rules are dropped; the rest fill the table.
+    assert_eq!(
+        policy.rule_count(),
+        tailfeather::netmap::policy::MAX_FILTER_RULES
+    );
+}
+
+#[test]
+fn a_large_derp_map_keeps_the_lowest_regions_and_skips_unusable_relays() {
+    let region = |id: u16, cert: &str| {
+        format!(
+            r#""{id}":{{"RegionID":{id},"RegionCode":"r{id}-a-very-long-region-code","Nodes":[{{"Name":"n","RegionID":{id},"HostName":"derp{id}.example","CertName":"{cert}","DERPPort":443}}]}}"#
+        )
+    };
+    let long_cert = "c".repeat(100);
+    // Region 3's certificate name does not fit, so its only relay is dropped.
+    let mut regions: Vec<String> = (1..=60u16)
+        .rev()
+        .map(|id| region(id, if id == 3 { &long_cert } else { "" }))
+        .collect();
+    regions.swap(0, 30);
+    let document = format!(r#"{{"DERPMap":{{"Regions":{{{}}}}}}}"#, regions.join(","));
+    let mut netmap = Netmap::<32>::new();
+    let mut parser = Parser::<32>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    assert!(netmap.derp.truncated());
+    let mut ids: Vec<u16> = netmap.derp.iter().map(|region| region.id).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (1..=tailfeather::netmap::MAX_DERP_REGIONS as u16).collect::<Vec<_>>()
+    );
+    assert!(netmap.derp.region(3).unwrap().nodes.is_empty());
+    assert_eq!(netmap.derp.region(4).unwrap().nodes.len(), 1);
+    assert!(netmap.derp.region(4).unwrap().code.starts_with("r4-"));
 }

@@ -279,6 +279,8 @@ impl Builder {
                 _ => self.bad = true,
             },
             Token::Int(0) if context == Context::Action && self.key == "sessionDuration" => (),
+            // Too large to retain, but inside a subtree the console ignores.
+            Token::Oversized | Token::OversizedKey if context == Context::Ignore => (),
             Token::Null => match (context, self.key.as_str()) {
                 (Context::Policy, "rules")
                 | (

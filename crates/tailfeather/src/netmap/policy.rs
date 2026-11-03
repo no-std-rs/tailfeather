@@ -193,6 +193,7 @@ pub struct PacketPolicy {
     sets: Vec<FilterSet, MAX_FILTER_SETS>,
     rules: Vec<StoredRule, MAX_FILTER_RULES>,
     valid: bool,
+    truncated: bool,
     v6_networks: [V6Range; MAX_V6_NETWORKS],
     v6_occupied: [u32; MAX_V6_NETWORKS.div_ceil(32)],
 }
@@ -202,6 +203,7 @@ impl PacketPolicy {
         Self {
             sets: Vec::new(),
             rules: Vec::new(),
+            truncated: false,
             valid: false,
             v6_networks: [V6Range::EMPTY; MAX_V6_NETWORKS],
             v6_occupied: [0; MAX_V6_NETWORKS.div_ceil(32)],
@@ -210,6 +212,17 @@ impl PacketPolicy {
 
     pub fn is_valid(&self) -> bool {
         self.valid
+    }
+
+    /// Control sent rules this policy could not hold, and they were dropped.
+    /// Every rule only allows traffic, so a dropped rule denies what it would
+    /// have allowed; nothing is permitted that control did not grant.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub(crate) fn mark_truncated(&mut self) {
+        self.truncated = true;
     }
 
     pub fn set_count(&self) -> usize {
@@ -234,6 +247,7 @@ impl PacketPolicy {
                 .expect("equal packet-filter rule capacities");
         }
         self.valid = source.valid;
+        self.truncated = source.truncated;
         self.v6_networks = source.v6_networks;
         self.v6_occupied = source.v6_occupied;
     }
@@ -279,6 +293,7 @@ impl PacketPolicy {
         self.v6_networks.fill(V6Range::EMPTY);
         self.v6_occupied.fill(0);
         self.valid = true;
+        self.truncated = false;
     }
 
     pub fn push_rule(&mut self, set: &str, rule: FilterRule) -> Result<(), Error> {
