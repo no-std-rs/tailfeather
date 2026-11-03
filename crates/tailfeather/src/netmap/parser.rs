@@ -369,7 +369,9 @@ struct DroppedRoutes {
 /// streaming.
 #[derive(Default)]
 struct State {
-    stack: heapless::Vec<Context, 16>,
+    /// One entry per container the scanner reported open, so it can never be
+    /// shallower than the scanner's own stack.
+    stack: heapless::Vec<Context, { crate::netmap::scanner::MAX_DEPTH }>,
     /// The key most recently seen, which names whatever comes next.
     key: heapless::String<64>,
     /// The current member name exceeded the bounded key buffer. Unknown
@@ -980,16 +982,31 @@ impl State {
             },
             Context::SelfAddresses => match Cidr::parse(value) {
                 Ok(cidr) => {
-                    if netmap.addresses.push(cidr).is_err() {
-                        self.fail(Error::Full(CapacityError::Addresses));
+                    // More addresses than fit: keep the first ones, but never
+                    // lose the IPv4 address this node is reached and routed by.
+                    if let Err(cidr) = netmap.addresses.push(cidr)
+                        && cidr.address.is_ipv4()
+                        && !netmap.addresses.iter().any(|kept| kept.address.is_ipv4())
+                        && let Some(last) = netmap.addresses.last_mut()
+                    {
+                        *last = cidr;
                     }
                 }
                 Err(_) => self.fail(Error::MalformedField(MalformedField::Address)),
             },
             Context::SelfPrimaryRoutes => match Cidr::parse(value) {
+                // Extra routes beyond the bound are not served. Default
+                // routes, which make this node an exit, take a subnet's slot.
                 Ok(cidr) => {
-                    if self.primary_route(netmap, cidr).is_err() {
-                        self.fail(Error::Full(CapacityError::Routes));
+                    if self.primary_route(netmap, cidr).is_err()
+                        && cidr.prefix == 0
+                        && let Some(subnet) = netmap
+                            .primary_routes
+                            .iter_mut()
+                            .rev()
+                            .find(|route| route.prefix != 0)
+                    {
+                        *subnet = cidr;
                     }
                 }
                 Err(_) => self.fail(Error::MalformedField(MalformedField::Address)),

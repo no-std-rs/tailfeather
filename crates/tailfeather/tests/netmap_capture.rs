@@ -1233,3 +1233,25 @@ fn a_large_derp_map_keeps_the_lowest_regions_and_skips_unusable_relays() {
     assert_eq!(netmap.derp.region(4).unwrap().nodes.len(), 1);
     assert!(netmap.derp.region(4).unwrap().code.starts_with("r4-"));
 }
+
+#[test]
+fn surplus_self_addresses_keep_the_ipv4_address_instead_of_failing() {
+    let v6: Vec<String> = (1..=6)
+        .map(|i| format!("\"fd7a:115c:a1e0::{i}/128\""))
+        .collect();
+    let document = format!(
+        r#"{{"Node":{{"Key":"{RANKED_SELF}","Addresses":[{},"100.64.0.7/32"]}}}}"#,
+        v6.join(",")
+    );
+    let mut netmap = Netmap::<32>::new();
+    let mut parser = Parser::<32>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    assert_eq!(netmap.addresses.len(), tailfeather::netmap::MAX_ADDRESSES);
+    assert!(
+        netmap
+            .addresses
+            .iter()
+            .any(|cidr| cidr.address == "100.64.0.7".parse::<core::net::IpAddr>().unwrap())
+    );
+}
