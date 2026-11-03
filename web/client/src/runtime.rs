@@ -36,11 +36,10 @@ use crate::logic;
 use crate::netstack::NetStack;
 use crate::ws::{WsError, WsStream};
 
-/// Peers retained from the netmap. Hosted tailnets with ephemeral CI nodes
-/// pass thirty peers; a full table keeps a stable, ranked subset, but a
-/// browser has room for more. `Node<128>` is about 190 KB, well inside the
-/// wasm stack it is built on before boxing.
-pub const PEERS: usize = 128;
+/// Peers retained from the netmap. A browser has memory to spare, so the
+/// peer tables grow on the heap (tailfeather's `alloc` feature) with no fixed
+/// cap; if an allocation fails, the table keeps a stable, ranked subset.
+pub const PEERS: usize = tailfeather::UNBOUNDED;
 pub const CONTROL_HOST: &str = "controlplane.tailscale.com";
 const CONTROL_URL: &str = "https://controlplane.tailscale.com";
 /// Where the node's durable identity lives.

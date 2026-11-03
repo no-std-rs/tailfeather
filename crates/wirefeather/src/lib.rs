@@ -43,11 +43,17 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+use peer_vec::PeerVec;
+
 pub mod budget;
 pub mod crypto;
 pub mod ip;
 pub mod messages;
 pub mod noise;
+pub mod peer_vec;
 pub mod replay;
 pub mod timers;
 pub mod transport;
@@ -241,12 +247,14 @@ impl Peer {
 ///
 /// `PEERS` is a const parameter rather than a fixed number because a
 /// point-to-point tunnel needs one and a Tailscale mesh needs many, and neither
-/// should pay for the other's table.
+/// should pay for the other's table. With the `alloc` feature the table grows
+/// on the heap instead of being reserved inline, and `PEERS` may be
+/// [`peer_vec::UNBOUNDED`].
 pub struct Device<const PEERS: usize> {
     static_private: StaticSecret,
     static_public: PublicKey,
     mac1_key: Key,
-    peers: heapless::Vec<Peer, PEERS>,
+    peers: PeerVec<Peer, PEERS>,
     budget: HandshakeBudget,
 }
 
@@ -259,7 +267,7 @@ impl<const PEERS: usize> Device<PEERS> {
             mac1_key: noise::mac1_key(&static_public),
             static_private,
             static_public,
-            peers: heapless::Vec::new(),
+            peers: PeerVec::new(),
             budget: HandshakeBudget::new(),
         }
     }

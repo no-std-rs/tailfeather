@@ -10,6 +10,7 @@ use zeroize::Zeroize;
 
 use crate::keys::{DiscoPrivate, Identity, MachinePrivate, NodePrivate, NodePublic};
 use crate::netmap::{Netmap, Peer};
+use crate::tunnel::peer_vec::PeerVec;
 use crate::tunnel::{self, Action as TunnelAction, Device, Instant, PeerId, Tai64n};
 
 /// Largest packet carried by a node action.
@@ -525,7 +526,7 @@ pub struct Node<const PEERS: usize = 32> {
     identity: Identity,
     netmap: Netmap<PEERS>,
     tunnel: Device<PEERS>,
-    paths: Vec<PeerPath, PEERS>,
+    paths: PeerVec<PeerPath, PEERS>,
     registration: RegistrationState,
     generation: u64,
     trusted_time_floor: u64,
@@ -571,7 +572,7 @@ impl<const PEERS: usize> Node<PEERS> {
             identity,
             netmap: Netmap::new(),
             tunnel,
-            paths: Vec::new(),
+            paths: PeerVec::new(),
             registration: RegistrationState::WaitingForPersistence,
             generation,
             trusted_time_floor: 0,
@@ -976,7 +977,7 @@ impl<const PEERS: usize> Node<PEERS> {
                 .iter()
                 .any(|peer| peer.node_key.as_bytes() == key)
         });
-        let mut next_paths = Vec::new();
+        let mut next_paths = PeerVec::<PeerPath, PEERS>::new();
         for peer in self.netmap.peers.iter() {
             if self
                 .tunnel
@@ -1302,7 +1303,7 @@ impl<const PEERS: usize> Node<PEERS> {
         if !self.direct_paths {
             return Ok(None);
         }
-        for path in &mut self.paths {
+        for path in self.paths.iter_mut() {
             if !path.direct_healthy
                 && path.relay_region.is_some()
                 && !path.advertised.is_empty()
@@ -3316,6 +3317,32 @@ mod tests {
     #[test]
     fn no_home_region_is_skipped_for_rendezvous_but_allowed_for_a_peer() {
         on_node_test_stack(no_home_region_is_skipped_for_rendezvous_but_allowed_for_a_peer_fixture);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn an_unbounded_heap_node_tracks_every_peer_of_a_large_tailnet() {
+        let mut node =
+            Node::<{ crate::UNBOUNDED }>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+        persisted(&mut node);
+        let mut lease = Netmap::new();
+        for id in 1..=300u64 {
+            let mut key = [0u8; 32];
+            key[1..9].copy_from_slice(&id.to_le_bytes());
+            key[31] = 1;
+            lease
+                .peers
+                .upsert(Peer::new(id, NodePrivate::from_bytes(key).public()))
+                .unwrap();
+        }
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        assert_eq!(node.netmap().peers.len(), 300);
+        assert_eq!(node.tunnel.peer_count(), 300);
+        assert_eq!(node.paths.len(), 300);
     }
 
     fn no_home_region_is_skipped_for_rendezvous_but_allowed_for_a_peer_fixture() {

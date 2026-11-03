@@ -16,6 +16,9 @@ default = ["fast-curve25519"]
 fast-curve25519 = ["x25519-dalek/precomputed-tables"]
 # Fused CPU-dispatched AEAD on native x86_64/AArch64; portable elsewhere.
 accelerated-crypto = ["dep:ring"]
+# Grow peer-sized tables on the heap up to their const bound (which may be
+# `peer_vec::UNBOUNDED`) instead of reserving them inline. For hosts, not MCUs.
+alloc = []
 
 [dependencies]
 blake2            = { version = "0.10", default-features = false }

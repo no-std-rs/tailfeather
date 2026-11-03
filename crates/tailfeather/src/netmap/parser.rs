@@ -96,10 +96,12 @@ pub struct Netmap<const PEERS: usize = MAX_PEERS> {
     /// The control map named more peers than this target retains, or named a
     /// peer whose addresses or allowed IPs exceed the per-peer bounds.
     ///
-    /// Selection is deterministic: a full snapshot keeps the first `PEERS`
-    /// non-self records in server order, skipping oversized records. This lets
-    /// memory-constrained targets remain connected to control instead of
-    /// rejecting the entire map.
+    /// Selection is deterministic and independent of server order: a full
+    /// table keeps the highest-ranked non-self records (online first, then the
+    /// lowest node id), skipping oversized records. With the `alloc` feature
+    /// the table is full only at `PEERS` or when the allocator refuses to
+    /// grow it. This lets memory-constrained targets remain connected to
+    /// control instead of rejecting the entire map.
     pub peers_truncated: bool,
     pub derp: DerpMap,
     /// The tailnet's DNS configuration, minus the unbounded `Routes` map.
@@ -150,8 +152,8 @@ impl<const PEERS: usize> Netmap<PEERS> {
     /// on the caller's stack. This is used to reseed the one streaming-delta
     /// lease after swapping it into the active node.
     pub(crate) fn copy_from(&mut self, source: &Self) {
-        self.peers.copy_from(&source.peers);
-        self.peers_truncated = source.peers_truncated;
+        let complete = self.peers.copy_from(&source.peers);
+        self.peers_truncated = source.peers_truncated || !complete;
         self.derp.copy_from(&source.derp);
         self.dns.copy_from(&source.dns);
         self.node_key = source.node_key;

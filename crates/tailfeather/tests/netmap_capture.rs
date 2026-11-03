@@ -1124,3 +1124,24 @@ fn a_low_ranked_delayed_self_record_still_carries_route_approval() {
     ids.sort_unstable();
     assert_eq!(ids, vec![6, 7]);
 }
+
+#[cfg(feature = "alloc")]
+#[test]
+fn an_unbounded_heap_netmap_keeps_every_peer_of_a_large_tailnet() {
+    use tailfeather::UNBOUNDED;
+    let peers: Vec<String> = (1..=300u64)
+        .map(|id| format!(r#"{{"ID":{id},"Key":"nodekey:{id:064x}"}}"#))
+        .collect();
+    let document = format!(
+        r#"{{"Node":{{"Key":"{RANKED_SELF}"}},"Peers":[{}]}}"#,
+        peers.join(",")
+    );
+    let mut netmap = Netmap::<UNBOUNDED>::new();
+    let mut parser = Parser::<UNBOUNDED>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    assert_eq!(netmap.peers.len(), 300);
+    assert!(!netmap.peers_truncated);
+    // Nothing per-peer is reserved inline.
+    assert!(core::mem::size_of::<Netmap<UNBOUNDED>>() < 32 * 1024);
+}
