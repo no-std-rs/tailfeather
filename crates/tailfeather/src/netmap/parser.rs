@@ -363,9 +363,10 @@ struct State {
     /// This response explicitly replaced the self home, including legacy DERP.
     self_home_derp_set: bool,
     pending: Pending,
-    /// The first peer that overflowed before a snapshot identified its self
-    /// key. It can fill the slot released when that delayed self record is
-    /// removed.
+    /// The best-ranked peer that overflowed before a snapshot identified its
+    /// self key. It fills the slot released when that delayed self record is
+    /// removed, so the retained set is the same ranked subset whether `Node`
+    /// precedes or follows the peer list.
     deferred_peer: Option<Peer>,
     region: PendingRegion,
     filter: PendingFilter,
@@ -698,16 +699,25 @@ impl State {
         }
         if let Err(error) = netmap.peers.upsert(peer.clone()) {
             if error == Error::Full(CapacityError::Peers) {
+                let dropped = Self::insert_ranked(netmap, peer);
                 if netmap.node_key.is_none() {
-                    // This may be the self record, which reconciliation
-                    // removes; it must not displace a real peer.
-                    if self.deferred_peer.is_none() {
-                        self.deferred_peer = Some(peer);
-                    } else {
-                        netmap.peers_truncated = true;
-                    }
+                    // One retained record may be the self record, which
+                    // reconciliation removes. Keep the best overflow as the
+                    // runner-up for that slot; anything below it is lost.
+                    let runner_up = match self.deferred_peer.take() {
+                        None => dropped,
+                        Some(previous) => {
+                            netmap.peers_truncated = true;
+                            if Self::rank(&dropped) > Self::rank(&previous) {
+                                dropped
+                            } else {
+                                previous
+                            }
+                        }
+                    };
+                    self.deferred_peer = Some(runner_up);
                 } else {
-                    Self::insert_ranked(netmap, peer);
+                    netmap.peers_truncated = true;
                 }
             } else {
                 self.fail(error);
@@ -722,18 +732,25 @@ impl State {
     /// map and tear down tunnels to the peers that fell out. Ranking makes the
     /// retained set independent of arrival order: online peers first, then
     /// the lowest node id.
-    fn insert_ranked<const PEERS: usize>(netmap: &mut Netmap<PEERS>, peer: Peer) {
-        netmap.peers_truncated = true;
-        let rank = |peer: &Peer| (peer.online(), core::cmp::Reverse(peer.id));
-        let Some(worst) = netmap.peers.iter().min_by_key(|peer| rank(peer)) else {
-            return;
+    ///
+    /// Returns the peer left out: the new one, or the retained peer it
+    /// displaced.
+    fn insert_ranked<const PEERS: usize>(netmap: &mut Netmap<PEERS>, peer: Peer) -> Peer {
+        let Some(worst) = netmap.peers.iter().min_by_key(|peer| Self::rank(peer)) else {
+            return peer;
         };
-        if rank(&peer) > rank(worst) {
-            let worst = worst.id;
-            netmap.peers.remove(worst);
-            // Cannot fail: a slot was just freed.
-            let _ = netmap.peers.upsert(peer);
+        if Self::rank(&peer) <= Self::rank(worst) {
+            return peer;
         }
+        let worst = worst.clone();
+        netmap.peers.remove(worst.id);
+        // Cannot fail: a slot was just freed.
+        let _ = netmap.peers.upsert(peer);
+        worst
+    }
+
+    fn rank(peer: &Peer) -> (bool, core::cmp::Reverse<u64>) {
+        (peer.online(), core::cmp::Reverse(peer.id))
     }
 
     fn reconcile_self_peer<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
@@ -742,13 +759,22 @@ impl State {
         // whether Key precedes or follows the route arrays in JSON.
         let Some(own) = netmap.node_key else { return };
         if !self.self_routes_seen {
-            let own_routes = netmap.peers.by_node_key(&own).map(|peer| {
-                (
-                    peer.allowed_ips.clone(),
-                    peer.approved_ipv4_default(),
-                    peer.approved_ipv6_default,
-                )
-            });
+            // Ranking may have left the self record in the deferred slot.
+            let deferred_self = self
+                .deferred_peer
+                .as_ref()
+                .filter(|peer| peer.node_key == own);
+            let own_routes = netmap
+                .peers
+                .by_node_key(&own)
+                .or(deferred_self)
+                .map(|peer| {
+                    (
+                        peer.allowed_ips.clone(),
+                        peer.approved_ipv4_default(),
+                        peer.approved_ipv6_default,
+                    )
+                });
             if let Some((routes, approved_ipv4_default, approved_ipv6_default)) =
                 own_routes.as_ref()
             {
@@ -770,9 +796,11 @@ impl State {
             netmap.peers.remove(id);
         }
         if let Some(peer) = self.deferred_peer.take()
+            && peer.node_key != own
             && netmap.peers.upsert(peer.clone()).is_err()
         {
             Self::insert_ranked(netmap, peer);
+            netmap.peers_truncated = true;
         }
     }
 

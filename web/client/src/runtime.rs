@@ -498,8 +498,16 @@ impl State {
             // Every map update reports one of these. Once relays are up, a
             // routine update (or the first map after a control reconnect)
             // must not knock the visible state back from "ready".
-            NodeStatus::MapActive if self.phase == "ready" => return,
-            NodeStatus::MapActive if !self.derp_up.is_empty() => "DERP connected",
+            // Browsers advertise no routes, so their maps normally report
+            // AwaitingRouteApproval rather than MapActive.
+            NodeStatus::MapActive | NodeStatus::AwaitingRouteApproval if self.phase == "ready" => {
+                return;
+            }
+            NodeStatus::MapActive | NodeStatus::AwaitingRouteApproval
+                if !self.derp_up.is_empty() =>
+            {
+                "DERP connected"
+            }
             NodeStatus::MapChanged | NodeStatus::AwaitingRouteApproval | NodeStatus::MapActive => {
                 "netmap received"
             }
