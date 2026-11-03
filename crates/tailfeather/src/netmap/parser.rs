@@ -340,6 +340,18 @@ impl PendingRegion {
     }
 }
 
+/// Records dropped before the self key is known whose routes are kept.
+const MAX_DROPPED_ROUTES: usize = 4;
+
+/// The route-approval facts of a record ranked out of a full peer table.
+#[derive(Clone)]
+struct DroppedRoutes {
+    node_key: NodePublic,
+    allowed_ips: heapless::Vec<Cidr4, { crate::netmap::MAX_ALLOWED_IPS }>,
+    approved_ipv4_default: bool,
+    approved_ipv6_default: bool,
+}
+
 /// The parser's own state: where it is in the document and what it is building.
 /// The netmap is passed in per call rather than borrowed for the parser's life,
 /// so a caller can read it between chunks — which is the whole point of
@@ -368,6 +380,10 @@ struct State {
     /// removed, so the retained set is the same ranked subset whether `Node`
     /// precedes or follows the peer list.
     deferred_peer: Option<Peer>,
+    /// Route facts of records ranked out entirely before the self key was
+    /// known. A lower-ranked self record can be among them, and its route
+    /// approval must still reach reconciliation.
+    dropped_routes: heapless::Vec<DroppedRoutes, MAX_DROPPED_ROUTES>,
     region: PendingRegion,
     filter: PendingFilter,
     #[cfg(feature = "ssh-policy")]
@@ -708,11 +724,20 @@ impl State {
                         None => dropped,
                         Some(previous) => {
                             netmap.peers_truncated = true;
-                            if Self::rank(&dropped) > Self::rank(&previous) {
-                                dropped
+                            let (kept, lost) = if Self::rank(&dropped) > Self::rank(&previous) {
+                                (dropped, previous)
                             } else {
-                                previous
-                            }
+                                (previous, dropped)
+                            };
+                            // Best effort beyond the bound: a self record this
+                            // far down the ranking loses only its routes.
+                            let _ = self.dropped_routes.push(DroppedRoutes {
+                                node_key: lost.node_key,
+                                approved_ipv4_default: lost.approved_ipv4_default(),
+                                approved_ipv6_default: lost.approved_ipv6_default,
+                                allowed_ips: lost.allowed_ips,
+                            });
+                            kept
                         }
                     };
                     self.deferred_peer = Some(runner_up);
@@ -774,6 +799,18 @@ impl State {
                         peer.approved_ipv4_default(),
                         peer.approved_ipv6_default,
                     )
+                })
+                .or_else(|| {
+                    self.dropped_routes
+                        .iter()
+                        .find(|dropped| dropped.node_key == own)
+                        .map(|dropped| {
+                            (
+                                dropped.allowed_ips.clone(),
+                                dropped.approved_ipv4_default,
+                                dropped.approved_ipv6_default,
+                            )
+                        })
                 });
             if let Some((routes, approved_ipv4_default, approved_ipv6_default)) =
                 own_routes.as_ref()
@@ -1334,6 +1371,7 @@ impl<const PEERS: usize> Parser<PEERS> {
                 self_home_derp_set: false,
                 pending: Pending::new(),
                 deferred_peer: None,
+                dropped_routes: heapless::Vec::new(),
                 region: PendingRegion::new(),
                 filter: PendingFilter::new(),
                 #[cfg(feature = "ssh-policy")]
@@ -1353,6 +1391,7 @@ impl<const PEERS: usize> Parser<PEERS> {
         self.state.self_home_derp_set = false;
         self.state.pending.reset();
         self.state.deferred_peer = None;
+        self.state.dropped_routes.clear();
         self.state.region = PendingRegion::new();
         self.state.filter = PendingFilter::new();
         #[cfg(feature = "ssh-policy")]

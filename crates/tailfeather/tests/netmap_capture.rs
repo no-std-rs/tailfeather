@@ -1101,3 +1101,26 @@ fn a_delayed_self_record_frees_its_slot_for_the_best_overflow() {
     assert_eq!(ids, vec![5, 6]);
     assert!(!netmap.peers_truncated);
 }
+
+#[test]
+fn a_low_ranked_delayed_self_record_still_carries_route_approval() {
+    let keys = [
+        "nodekey:7777777777777777777777777777777777777777777777777777777777777777",
+        "nodekey:8888888888888888888888888888888888888888888888888888888888888888",
+        "nodekey:9999999999999999999999999999999999999999999999999999999999999999",
+    ];
+    // The self record is offline with a high id, so ranking drops it below
+    // every later overflow before Node identifies it.
+    let document = format!(
+        r#"{{"Peers":[{{"ID":99,"Key":"{RANKED_SELF}","AllowedIPs":["0.0.0.0/0","::/0"]}},{{"ID":5,"Key":"{}"}},{{"ID":6,"Key":"{}","Online":true}},{{"ID":7,"Key":"{}","Online":true}}],"Node":{{"Key":"{RANKED_SELF}"}}}}"#,
+        keys[0], keys[1], keys[2]
+    );
+    let mut netmap = Netmap::<2>::new();
+    let mut parser = Parser::<2>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    assert!(netmap.default_routes_approved());
+    let mut ids: Vec<u64> = netmap.peers.iter().map(|peer| peer.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![6, 7]);
+}
