@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.0](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.2.1...tailfeather-v0.3.0) (2026-11-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* grow the DERP map and packet-filter tables on the heap with alloc
+
+### Features
+
+* **netmap:** grow the DERP map and packet-filter tables on the heap with alloc ([#38](https://github.com/no-std-rs/tailfeather/issues/38)) ([d63fd5a](https://github.com/no-std-rs/tailfeather/commit/d63fd5ac4ef624f9000276c33f19888405f048d2))
+* optional alloc feature for uncapped peer tables; degrade gracefully on oversized input ([#36](https://github.com/no-std-rs/tailfeather/issues/36)) ([099c297](https://github.com/no-std-rs/tailfeather/commit/099c297e37cdbf044cf943e00bc5a0434694bc11))
+
+### Bug Fixes
+
+* **netmap:** retain a stable, ranked peer subset when the table is full ([#34](https://github.com/no-std-rs/tailfeather/issues/34)) ([3f7b9c1](https://github.com/no-std-rs/tailfeather/commit/3f7b9c1bdff62fe0dffca09d50cc19144b95adb1))
+
 ## [0.2.1](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.2.0...tailfeather-v0.2.1) (2026-11-02)
 
 
