@@ -287,7 +287,7 @@ struct PendingRegion {
     id: u16,
     code: heapless::String<16>,
     no_measure_no_home: bool,
-    nodes: heapless::Vec<DerpNode, { crate::netmap::MAX_DERP_NODES }>,
+    nodes: crate::BoundedVec<DerpNode, { crate::netmap::MAX_DERP_NODES }>,
     stun_fallback: Option<DerpNode>,
     node_host: heapless::String<{ crate::netmap::MAX_DERP_HOSTNAME }>,
     node_cert: heapless::String<{ crate::netmap::MAX_DERP_HOSTNAME }>,
@@ -348,7 +348,7 @@ impl PendingRegion {
             id: 0,
             code: heapless::String::new(),
             no_measure_no_home: false,
-            nodes: heapless::Vec::new(),
+            nodes: crate::BoundedVec::new(),
             stun_fallback: None,
             node_host: heapless::String::new(),
             node_cert: heapless::String::new(),
@@ -636,8 +636,8 @@ impl State {
                     if self.region.node_flags & 2 != 0 {
                         node.mark_insecure_for_tests();
                     }
-                    if !node.host_name.is_empty() {
-                        let _ = self.region.nodes.push(node);
+                    if !node.host_name.is_empty() && self.region.nodes.push(node).is_err() {
+                        netmap.derp.mark_truncated();
                     }
                 }
             }
@@ -649,10 +649,17 @@ impl State {
                     && let Some(mut stun) = self.region.stun_fallback.take()
                 {
                     stun.port = 0;
-                    if self.region.nodes.len() == crate::netmap::MAX_DERP_NODES {
+                    if self.region.nodes.is_full() {
                         self.region.nodes.pop();
                     }
-                    let _ = self.region.nodes.push(stun);
+                    if let Err(stun) = self.region.nodes.push(stun) {
+                        // Out of memory: a relay with no STUN port still
+                        // relays, so give its slot to the STUN host.
+                        if self.region.nodes.pop().is_some() {
+                            let _ = self.region.nodes.push(stun);
+                        }
+                        netmap.derp.mark_truncated();
+                    }
                 }
                 let region = DerpRegion {
                     id: self.region.id,

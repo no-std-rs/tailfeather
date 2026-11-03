@@ -77,7 +77,7 @@ fn netmap(own: &str, peer_key: NodePublic, peer_address: &str) -> Netmap<4> {
         .push("192.0.2.1:41641".parse().unwrap())
         .unwrap();
     map.peers.upsert(peer).unwrap();
-    let mut nodes = heapless::Vec::new();
+    let mut nodes = tailfeather::BoundedVec::new();
     nodes
         .push(DerpNode {
             host_name: heapless::String::try_from("derp.example").unwrap(),

@@ -229,6 +229,219 @@ impl<T: PartialEq, const N: usize> PartialEq for PeerVec<T, N> {
 
 impl<T: Eq, const N: usize> Eq for PeerVec<T, N> {}
 
+/// A vector of at most `N` plain values, for collections that hold no
+/// secrets: packet-filter rules, DERP relays, parser scratch space. Without
+/// `alloc` it is a `heapless::Vec<T, N>`; with `alloc` it is a heap vector
+/// that grows on demand up to `N` (which may be [`UNBOUNDED`]). Unlike
+/// [`PeerVec`], elements are stored contiguously, so growing may move them.
+///
+/// As with [`PeerVec`], a push that does not fit, because of `N` or because
+/// the allocator refused, is returned to the caller rather than aborting.
+/// The infallible [`Clone`] impl may abort on allocation failure; code that
+/// must survive memory pressure uses [`Self::try_clone`].
+#[derive(Clone)]
+pub struct BoundedVec<T, const N: usize> {
+    #[cfg(not(feature = "alloc"))]
+    inner: heapless::Vec<T, N>,
+    #[cfg(feature = "alloc")]
+    inner: alloc::vec::Vec<T>,
+}
+
+impl<T, const N: usize> BoundedVec<T, N> {
+    pub const fn new() -> Self {
+        Self {
+            #[cfg(not(feature = "alloc"))]
+            inner: heapless::Vec::new(),
+            #[cfg(feature = "alloc")]
+            inner: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// The configured limit, which with `alloc` is not reserved up front.
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.inner.len() >= N
+    }
+
+    /// Append `value`, or return it if the vector already holds `N` elements
+    /// or (with `alloc`) the allocator cannot grow it.
+    pub fn push(&mut self, value: T) -> Result<(), T> {
+        #[cfg(not(feature = "alloc"))]
+        {
+            self.inner.push(value)
+        }
+        #[cfg(feature = "alloc")]
+        {
+            if self.inner.len() >= N || self.inner.try_reserve(1).is_err() {
+                return Err(value);
+            }
+            self.inner.push(value);
+            Ok(())
+        }
+    }
+
+    /// Insert `value` at `index`, shifting later elements; refused like
+    /// [`Self::push`]. Panics if `index > len`.
+    pub fn insert(&mut self, index: usize, value: T) -> Result<(), T> {
+        #[cfg(not(feature = "alloc"))]
+        {
+            self.inner.insert(index, value)
+        }
+        #[cfg(feature = "alloc")]
+        {
+            if self.inner.len() >= N || self.inner.try_reserve(1).is_err() {
+                return Err(value);
+            }
+            self.inner.insert(index, value);
+            Ok(())
+        }
+    }
+
+    /// Make room for `total` elements, so that pushes up to that length
+    /// cannot be refused. Returns `false`, changing nothing, if `total`
+    /// exceeds `N` or (with `alloc`) the allocator cannot provide it.
+    #[must_use]
+    pub fn try_reserve_total(&mut self, total: usize) -> bool {
+        if total > N {
+            return false;
+        }
+        #[cfg(feature = "alloc")]
+        {
+            self.inner
+                .try_reserve(total.saturating_sub(self.inner.len()))
+                .is_ok()
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            true
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    pub fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
+        self.inner.retain(keep);
+    }
+
+    pub fn retain_mut(&mut self, keep: impl FnMut(&mut T) -> bool) {
+        self.inner.retain_mut(keep);
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.inner.truncate(len);
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        self.inner.pop()
+    }
+
+    pub fn remove(&mut self, index: usize) -> T {
+        self.inner.remove(index)
+    }
+
+    pub fn swap_remove(&mut self, index: usize) -> T {
+        self.inner.swap_remove(index)
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        &self.inner
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.inner
+    }
+
+    /// A copy that reports allocation failure instead of aborting.
+    pub fn try_clone(&self) -> Option<Self>
+    where
+        T: Clone,
+    {
+        let mut copy = Self::new();
+        if !copy.try_reserve_total(self.len()) {
+            return None;
+        }
+        for value in self.iter() {
+            copy.push(value.clone()).ok()?;
+        }
+        Some(copy)
+    }
+}
+
+impl<T, const N: usize> Default for BoundedVec<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, const N: usize> core::ops::Deref for BoundedVec<T, N> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.inner
+    }
+}
+
+impl<T, const N: usize> core::ops::DerefMut for BoundedVec<T, N> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.inner
+    }
+}
+
+impl<T, const N: usize> IntoIterator for BoundedVec<T, N> {
+    type Item = T;
+    #[cfg(not(feature = "alloc"))]
+    type IntoIter = heapless::vec::IntoIter<T, N, usize>;
+    #[cfg(feature = "alloc")]
+    type IntoIter = alloc::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a BoundedVec<T, N> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.iter()
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a mut BoundedVec<T, N> {
+    type Item = &'a mut T;
+    type IntoIter = core::slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.iter_mut()
+    }
+}
+
+impl<T: core::fmt::Debug, const N: usize> core::fmt::Debug for BoundedVec<T, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T: PartialEq, const N: usize> PartialEq for BoundedVec<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: Eq, const N: usize> Eq for BoundedVec<T, N> {}
+
+impl<T: PartialEq, const N: usize, const M: usize> PartialEq<[T; M]> for BoundedVec<T, N> {
+    fn eq(&self, other: &[T; M]) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +474,31 @@ mod tests {
         values.push(2).unwrap();
         values.push(3).unwrap();
         assert_eq!(values.push(4), Err(4));
+    }
+
+    #[test]
+    fn bounded_vec_refuses_past_the_limit_and_clones_fallibly() {
+        let mut values = BoundedVec::<u8, 3>::new();
+        values.push(1).unwrap();
+        values.push(3).unwrap();
+        values.insert(1, 2).unwrap();
+        assert_eq!(values.push(4), Err(4));
+        assert_eq!(values.insert(0, 0), Err(0));
+        assert_eq!(values, [1, 2, 3]);
+        assert_eq!(values.try_clone().unwrap(), values);
+        assert!(!values.try_reserve_total(4));
+        assert_eq!(values.into_iter().sum::<u8>(), 6);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn unbounded_bounded_vec_grows_on_demand() {
+        let mut values = BoundedVec::<u32, UNBOUNDED>::new();
+        for value in 0..10_000 {
+            values.push(value).unwrap();
+        }
+        assert_eq!(values.len(), 10_000);
+        assert_eq!(values[9_999], 9_999);
     }
 
     #[cfg(feature = "alloc")]

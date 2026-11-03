@@ -1066,7 +1066,7 @@ mod tests {
                     .await
                     .unwrap();
                 let port = server.local_addr().unwrap().port();
-                let mut nodes = heapless::Vec::new();
+                let mut nodes = tailfeather::BoundedVec::new();
                 for host in ["127.0.0.2", "127.0.0.1"] {
                     nodes
                         .push(DerpNode {
@@ -1206,7 +1206,7 @@ mod tests {
                 let reactor = Reactor::new();
                 let mut selected = 7;
                 for (id, excluded, expected) in [(8, false, 8), (8, true, 0), (7, false, 7)] {
-                    let mut nodes = heapless::Vec::new();
+                    let mut nodes = tailfeather::BoundedVec::new();
                     nodes
                         .push(DerpNode {
                             host_name: heapless::String::try_from("127.0.0.1").unwrap(),

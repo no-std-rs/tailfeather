@@ -28,8 +28,10 @@ ssh-policy = []
 # Larger bounded address lists for workstation/phone fleets; embedded defaults stay small.
 hosted-policy = []
 # Grow the peer table, per-peer path state and WireGuard peers on the heap up
-# to `PEERS`, which may be `UNBOUNDED`, instead of reserving them inline. For
-# hosts and browsers; firmware keeps the fixed, statically sized tables.
+# to `PEERS`, which may be `UNBOUNDED`, instead of reserving them inline. The
+# DERP map and packet-filter tables also grow without a configured limit.
+# Allocation is fallible: running out of memory truncates like a full table.
+# For hosts and browsers; firmware keeps the fixed, statically sized tables.
 alloc = ["wirefeather/alloc"]
 
 [dependencies]
