@@ -1395,3 +1395,18 @@ fn unreadable_disco_keys_and_dns_entries_are_not_kept_or_hidden() {
     );
     assert!(netmap.dns.truncated);
 }
+
+#[test]
+fn an_oversized_self_key_replaces_the_old_one_like_an_unparseable_one() {
+    let blob = "s".repeat(10 * 1024);
+    let mut netmap = Netmap::<32>::new();
+    for document in [
+        format!(r#"{{"Node":{{"Key":"{RANKED_SELF}"}}}}"#),
+        format!(r#"{{"Node":{{"Key":"{blob}"}}}}"#),
+    ] {
+        let mut parser = Parser::<32>::new();
+        parser.push(&mut netmap, document.as_bytes()).unwrap();
+        parser.finish(&mut netmap).unwrap();
+    }
+    assert!(netmap.node_key.is_none());
+}

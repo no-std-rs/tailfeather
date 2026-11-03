@@ -1384,6 +1384,10 @@ impl State {
             Context::PeerObject | Context::PatchObject if self.key == "DiscoKey" => {
                 self.pending.disco_unreadable = true;
             }
+            // As for a short key that does not parse: this node's identity is
+            // replaced by none, never left at a stale one.
+            Context::SelfNode if self.key == "Key" => netmap.node_key = None,
+            Context::SelfNode if self.key == "DiscoKey" => netmap.disco_key = None,
             // Retained DNS entries that do not fit are reported as dropped.
             Context::DnsDomains | Context::DnsResolvers => netmap.dns.truncated = true,
             Context::DnsResolverObject if self.key == "Addr" => netmap.dns.truncated = true,
