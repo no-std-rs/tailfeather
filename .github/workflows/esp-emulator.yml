@@ -35,19 +35,21 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          # Fetch the list first: an API failure must fail this job, never
-          # read as "nothing relevant changed" and skip the tests.
-          if [ "$EVENT" != pull_request ]; then
-            echo relevant=true >> "$GITHUB_OUTPUT"
-          elif files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename') \
-              && grep -Eq '^(firmware/|crates/tailfeather/|crates/tailfeather-gateway/|crates/wirefeather/|bazel/|platforms/|MODULE\.bazel[^/]*$|Cargo\.[^/]*$|BUILD\.bazel$|\.bazel[^/]*$|scripts/esp-emulator-smoke\.py$|\.github/workflows/esp-emulator\.yml$)' <<<"$files"; then
-            echo relevant=true >> "$GITHUB_OUTPUT"
-          elif [ -n "${files+set}" ] && [ -n "$files" ]; then
-            echo relevant=false >> "$GITHUB_OUTPUT"
-          else
-            echo "could not list the pull request's files" >&2
-            exit 1
+          # Run under `bash -e`: a failed API call (including a later page)
+          # fails this job, which fails the summary check, rather than
+          # reading as "nothing relevant changed".
+          relevant=true
+          if [ "$EVENT" = pull_request ]; then
+            count=$(gh api "repos/$REPO/pulls/$PR" --jq .changed_files)
+            # The files endpoint stops at 3000; past that, assume relevant.
+            if [ "$count" -lt 3000 ]; then
+              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')
+              if ! grep -Eq '^(firmware/|crates/tailfeather/|crates/tailfeather-gateway/|crates/wirefeather/|bazel/|platforms/|MODULE\.bazel[^/]*$|Cargo\.[^/]*$|BUILD\.bazel$|\.bazel[^/]*$|scripts/esp-emulator-smoke\.py$|\.github/workflows/esp-emulator\.yml$)' <<<"$files"; then
+                relevant=false
+              fi
+            fi
           fi
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
   firmware-smoke:
     name: ESP32-C6 firmware smoke
     needs: changes
@@ -87,3 +89,17 @@ jobs:
           path: ${{ runner.temp }}/esp-emulator-logs/
           if-no-files-found: ignore
           retention-days: 7
+  # The check to require. Skipped jobs pass required checks, so a failed
+  # `changes` job must surface here rather than skip the smoke test.
+  result:
+    name: ESP32-C6 emulator
+    needs: [changes, firmware-smoke]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            case "$result" in success|skipped) ;; *) echo "an emulator job ended: $result"; exit 1;; esac
+          done

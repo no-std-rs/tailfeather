@@ -17,7 +17,12 @@ concurrency:
 jobs:
   privileged-lab:
     name: Privileged lab
-    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--')
+    # Same-repository release branches only: a fork can name its branch
+    # anything.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.head_ref, 'release-please--'))
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

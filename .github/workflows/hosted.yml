@@ -27,19 +27,21 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          # Fetch the list first: an API failure must fail this job, never
-          # read as "nothing relevant changed" and skip the tests.
-          if [ "$EVENT" != pull_request ]; then
-            echo relevant=true >> "$GITHUB_OUTPUT"
-          elif files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename') \
-              && grep -Eq '^(hosted/|crates/tailfeather-reactor/|crates/tailfeather/|crates/wirefeather/|\.github/workflows/hosted\.yml$)' <<<"$files"; then
-            echo relevant=true >> "$GITHUB_OUTPUT"
-          elif [ -n "${files+set}" ] && [ -n "$files" ]; then
-            echo relevant=false >> "$GITHUB_OUTPUT"
-          else
-            echo "could not list the pull request's files" >&2
-            exit 1
+          # Run under `bash -e`: a failed API call (including a later page)
+          # fails this job, which fails the summary check, rather than
+          # reading as "nothing relevant changed".
+          relevant=true
+          if [ "$EVENT" = pull_request ]; then
+            count=$(gh api "repos/$REPO/pulls/$PR" --jq .changed_files)
+            # The files endpoint stops at 3000; past that, assume relevant.
+            if [ "$count" -lt 3000 ]; then
+              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')
+              if ! grep -Eq '^(hosted/|crates/tailfeather-reactor/|crates/tailfeather/|crates/wirefeather/|\.github/workflows/hosted\.yml$)' <<<"$files"; then
+                relevant=false
+              fi
+            fi
           fi
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
   native:
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
@@ -101,7 +103,8 @@ jobs:
       - name: Full Embassy executor task without a global allocator
         run: cargo build --manifest-path crates/tailfeather-reactor/probe/Cargo.toml --locked --features accelerated-crypto --target riscv32imac-unknown-none-elf
   # The one check to require: a skipped matrix job reports a single
-  # unexpanded check, so the per-OS names cannot be required directly.
+  # unexpanded check, so the per-OS names cannot be required directly, and
+  # a failed `changes` job must surface here rather than skip the tests.
   result:
     name: Hosted runtime
     needs: [changes, native, embassy]
