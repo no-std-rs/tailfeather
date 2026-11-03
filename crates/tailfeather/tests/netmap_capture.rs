@@ -997,3 +997,130 @@ fn non_integer_forms_in_retained_numeric_fields_still_fail() {
         }
     }
 }
+
+const RANKED_KEYS: [&str; 4] = [
+    "nodekey:f4dfaca7341906ffa704d7e529ad63aba59b6616ebea8c9ebbc6c84bb814ed4d",
+    "nodekey:8e07760a26199478b22a13636eeca585330878b24f673b0a25d658e0bbfb7c79",
+    "nodekey:1552a65976f79439979be043fd4707a4626379a87b59d69123e6416a1a678a4d",
+    "nodekey:9c22d8de2a5a8c8f8e0d3c0a3a1a6a7d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7",
+];
+
+const RANKED_SELF: &str =
+    "nodekey:0a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829";
+
+fn retained_ids(document: &str) -> Vec<u64> {
+    let mut netmap = Netmap::<2>::new();
+    let mut parser = Parser::<2>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    assert!(netmap.peers_truncated);
+    let mut ids: Vec<u64> = netmap.peers.iter().map(|peer| peer.id).collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn a_full_peer_table_retains_the_same_peers_in_any_server_order() {
+    // (id, online). Online peers outrank offline ones; then the lowest id.
+    let peers = [(1, false), (2, true), (3, false), (4, true)];
+    let record = |&(id, online): &(u64, bool)| {
+        format!(
+            r#"{{"ID":{id},"Key":"{}","Online":{online}}}"#,
+            RANKED_KEYS[id as usize - 1]
+        )
+    };
+    let orders: [[usize; 4]; 4] = [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1], [1, 3, 0, 2]];
+    for order in orders {
+        let list: Vec<String> = order.iter().map(|&index| record(&peers[index])).collect();
+        let document = format!(
+            r#"{{"Node":{{"Key":"{RANKED_SELF}"}},"Peers":[{}]}}"#,
+            list.join(",")
+        );
+        assert_eq!(retained_ids(&document), vec![2, 4], "order {order:?}");
+    }
+}
+
+#[test]
+fn a_full_peer_table_prefers_online_peers_from_peers_changed() {
+    let mut netmap = Netmap::<2>::new();
+    let documents = [
+        format!(
+            r#"{{"Node":{{"Key":"{RANKED_SELF}"}},"Peers":[{{"ID":1,"Key":"{}"}},{{"ID":2,"Key":"{}"}}]}}"#,
+            RANKED_KEYS[0], RANKED_KEYS[1]
+        ),
+        format!(
+            r#"{{"PeersChanged":[{{"ID":3,"Key":"{}","Online":true}}]}}"#,
+            RANKED_KEYS[2]
+        ),
+    ];
+    for document in &documents {
+        let mut parser = Parser::<2>::new();
+        parser.push(&mut netmap, document.as_bytes()).unwrap();
+        parser.finish(&mut netmap).unwrap();
+    }
+    let mut ids: Vec<u64> = netmap.peers.iter().map(|peer| peer.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 3]);
+    assert!(netmap.peers_truncated);
+}
+
+#[test]
+fn ranking_holds_when_node_follows_the_peer_list() {
+    // Offline 10 and 9, then online 8 and 7, before this node's key is known.
+    let keys = [
+        "nodekey:1111111111111111111111111111111111111111111111111111111111111111",
+        "nodekey:2222222222222222222222222222222222222222222222222222222222222222",
+        "nodekey:3333333333333333333333333333333333333333333333333333333333333333",
+        "nodekey:4444444444444444444444444444444444444444444444444444444444444444",
+    ];
+    let document = format!(
+        r#"{{"Peers":[{{"ID":10,"Key":"{}"}},{{"ID":9,"Key":"{}"}},{{"ID":8,"Key":"{}","Online":true}},{{"ID":7,"Key":"{}","Online":true}}],"Node":{{"Key":"{RANKED_SELF}"}}}}"#,
+        keys[0], keys[1], keys[2], keys[3]
+    );
+    assert_eq!(retained_ids(&document), vec![7, 8]);
+}
+
+#[test]
+fn a_delayed_self_record_frees_its_slot_for_the_best_overflow() {
+    let keys = [
+        "nodekey:5555555555555555555555555555555555555555555555555555555555555555",
+        "nodekey:6666666666666666666666666666666666666666666666666666666666666666",
+    ];
+    // The self record ranks highest (online, lowest id); after it is removed,
+    // both real peers fit, so nothing was truncated.
+    let document = format!(
+        r#"{{"Peers":[{{"ID":1,"Key":"{RANKED_SELF}","Online":true}},{{"ID":5,"Key":"{}"}},{{"ID":6,"Key":"{}"}}],"Node":{{"Key":"{RANKED_SELF}"}}}}"#,
+        keys[0], keys[1]
+    );
+    let mut netmap = Netmap::<2>::new();
+    let mut parser = Parser::<2>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    let mut ids: Vec<u64> = netmap.peers.iter().map(|peer| peer.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![5, 6]);
+    assert!(!netmap.peers_truncated);
+}
+
+#[test]
+fn a_low_ranked_delayed_self_record_still_carries_route_approval() {
+    let keys = [
+        "nodekey:7777777777777777777777777777777777777777777777777777777777777777",
+        "nodekey:8888888888888888888888888888888888888888888888888888888888888888",
+        "nodekey:9999999999999999999999999999999999999999999999999999999999999999",
+    ];
+    // The self record is offline with a high id, so ranking drops it below
+    // every later overflow before Node identifies it.
+    let document = format!(
+        r#"{{"Peers":[{{"ID":99,"Key":"{RANKED_SELF}","AllowedIPs":["0.0.0.0/0","::/0"]}},{{"ID":5,"Key":"{}"}},{{"ID":6,"Key":"{}","Online":true}},{{"ID":7,"Key":"{}","Online":true}}],"Node":{{"Key":"{RANKED_SELF}"}}}}"#,
+        keys[0], keys[1], keys[2]
+    );
+    let mut netmap = Netmap::<2>::new();
+    let mut parser = Parser::<2>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    assert!(netmap.default_routes_approved());
+    let mut ids: Vec<u64> = netmap.peers.iter().map(|peer| peer.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![6, 7]);
+}

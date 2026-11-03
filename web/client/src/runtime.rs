@@ -9,7 +9,7 @@
 //! so a callback that calls back into the client cannot hit a live borrow.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::rc::{Rc, Weak};
 
@@ -36,8 +36,11 @@ use crate::logic;
 use crate::netstack::NetStack;
 use crate::ws::{WsError, WsStream};
 
-/// Peers retained from the netmap. The target tailnet has about seventeen.
-pub const PEERS: usize = 32;
+/// Peers retained from the netmap. Hosted tailnets with ephemeral CI nodes
+/// pass thirty peers; a full table keeps a stable, ranked subset, but a
+/// browser has room for more. `Node<128>` is about 190 KB, well inside the
+/// wasm stack it is built on before boxing.
+pub const PEERS: usize = 128;
 pub const CONTROL_HOST: &str = "controlplane.tailscale.com";
 const CONTROL_URL: &str = "https://controlplane.tailscale.com";
 /// Where the node's durable identity lives.
@@ -133,6 +136,8 @@ pub struct State {
     runtime: Weak<Runtime>,
     authority_hash: [u8; 16],
     derp: BTreeMap<u16, DerpLink>,
+    /// Regions whose DERP handshake completed and whose link is still open.
+    derp_up: BTreeSet<u16>,
     control: Option<ControlLink>,
     next_id: u64,
     queue: VecDeque<Internal>,
@@ -188,6 +193,7 @@ impl Runtime {
                 runtime: weak.clone(),
                 authority_hash,
                 derp: BTreeMap::new(),
+                derp_up: BTreeSet::new(),
                 control: None,
                 next_id: 1,
                 queue: VecDeque::new(),
@@ -409,6 +415,7 @@ impl State {
                 self.handle(result, now, "control");
             }
             Internal::DerpDisconnected(region) => {
+                self.derp_up.remove(&region);
                 let result = self.node.handle_derp_event(
                     DerpEvent::Disconnected { region },
                     now,
@@ -487,6 +494,19 @@ impl State {
             NodeStatus::Registered => {
                 self.log("Registered with the tailnet; reconnecting to fetch the netmap.");
                 "registered"
+            }
+            // Every map update reports one of these. Once relays are up, a
+            // routine update (or the first map after a control reconnect)
+            // must not knock the visible state back from "ready".
+            // Browsers advertise no routes, so their maps normally report
+            // AwaitingRouteApproval rather than MapActive.
+            NodeStatus::MapActive | NodeStatus::AwaitingRouteApproval if self.phase == "ready" => {
+                return;
+            }
+            NodeStatus::MapActive | NodeStatus::AwaitingRouteApproval
+                if !self.derp_up.is_empty() =>
+            {
+                "DERP connected"
             }
             NodeStatus::MapChanged | NodeStatus::AwaitingRouteApproval | NodeStatus::MapActive => {
                 "netmap received"
@@ -866,6 +886,7 @@ impl State {
         for (_, link) in std::mem::take(&mut self.derp) {
             link.abort.abort();
         }
+        self.derp_up.clear();
     }
 
     fn shutdown(&mut self) {
@@ -889,6 +910,7 @@ impl State {
             .as_ref()
             .map_or(endpoint.host.as_str(), |name| name.as_str())
             .to_string();
+        self.derp_up.remove(&region);
         if let Some(link) = self.derp.remove(&region) {
             link.abort.abort();
         }
@@ -940,6 +962,7 @@ impl State {
         self.log(format!(
             "DERP region {region} ({code}): connected to {host}."
         ));
+        self.derp_up.insert(region);
         let result =
             self.node
                 .handle_derp_event(DerpEvent::Connected { region }, now_ms(), &mut JsRng);
