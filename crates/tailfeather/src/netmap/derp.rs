@@ -170,10 +170,9 @@ impl DerpMap {
                     self.truncated = true;
                 }
             }
-            if self.regions.push(copy).is_err() {
-                self.truncated = true;
-                break;
-            }
+            // Like a parse, an allocation failure keeps the lowest ids
+            // whatever order the source holds them in.
+            self.insert_bounded(copy);
         }
     }
 

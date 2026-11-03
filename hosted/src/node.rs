@@ -1278,57 +1278,62 @@ mod tests {
     }
 
     #[test]
-    fn expanded_fleet_acl_is_complete_and_still_bounded() {
+    fn hosted_fleet_acls_are_kept_whole_past_the_firmware_bounds() {
         std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
-            for count in [40, 512, 513] {
+            // The hosted node enables `alloc`, so rule size is limited by
+            // memory rather than hosted-policy's 512 entries.
+            for count in [40, 512, 513, 5000] {
                 let sources = (1..=count).map(|n| format!("\"100.64.{}.{}/32\"", n / 256, n % 256)).collect::<Vec<_>>().join(",");
                 let destinations = (1..=count).map(|n| format!(r#"{{"IP":"100.65.{}.{}/32","Ports":{{"First":2222,"Last":2222}}}}"#, n / 256, n % 256)).collect::<Vec<_>>().join(",");
                 let json = format!(r#"{{"PacketFilter":[{{"SrcIPs":[{sources}],"DstPorts":[{destinations}],"IPProto":[6]}}]}}"#);
                 let mut map = tailfeather::netmap::Netmap::<PEERS>::new();
                 let mut parser = tailfeather::netmap::Parser::new();
                 parser.push(&mut map, json.as_bytes()).unwrap();
-                let result = parser.finish(&mut map);
-                if count > 512 {
-                    // A rule that outgrows its bound is dropped whole, which
-                    // only denies; the rest of the map still applies.
-                    result.unwrap();
-                    assert!(map.packet_filter.is_valid());
-                    assert!(map.packet_filter.truncated());
-                    assert!(!map.packet_filter.allows([100,64,0,1].into(), [100,65,0,1].into(), 6, 2222));
-                } else {
-                    result.unwrap();
-                    assert!(map.packet_filter.allows([100,64,(count / 256) as u8,(count % 256) as u8].into(), [100,65,(count / 256) as u8,(count % 256) as u8].into(), 6, 2222));
-                    assert!(!map.packet_filter.allows([100,64,2,200].into(), [100,65,0,1].into(), 6, 2222));
-                    assert!(!map.packet_filter.allows([100,64,0,1].into(), [100,65,0,1].into(), 6, 22));
-                }
+                parser.finish(&mut map).unwrap();
+                let last = [(count / 256) as u8, (count % 256) as u8];
+                assert!(!map.packet_filter.truncated(), "{count} entries");
+                assert!(map.packet_filter.allows([100,64,last[0],last[1]].into(), [100,65,last[0],last[1]].into(), 6, 2222));
+                assert!(map.packet_filter.allows([100,64,0,1].into(), [100,65,0,1].into(), 6, 2222));
+                assert!(!map.packet_filter.allows([100,64,0,1].into(), [100,65,0,1].into(), 6, 22));
+                assert!(!map.packet_filter.allows([100,66,0,1].into(), [100,65,0,1].into(), 6, 2222));
             }
         }).unwrap().join().unwrap();
     }
     #[test]
-    fn over_capacity_acl_updates_drop_rules_instead_of_the_map() {
-        crate::on_worker_stack(over_capacity_acl_updates_drop_rules_instead_of_the_map_on_worker);
+    fn large_acl_updates_apply_whole_and_drop_only_unreadable_rules() {
+        crate::on_worker_stack(
+            large_acl_updates_apply_whole_and_drop_only_unreadable_rules_on_worker,
+        );
     }
-    fn over_capacity_acl_updates_drop_rules_instead_of_the_map_on_worker() {
-        let rules=(0..100).map(|port|format!(r#"{{"SrcIPs":["*"],"DstPorts":[{{"IP":"*","Ports":{{"First":{port},"Last":{port}}}}}]}}"#)).collect::<Vec<_>>().join(",");
-        let json = format!(r#"{{"PacketFilter":[{rules}]}}"#);
+    fn large_acl_updates_apply_whole_and_drop_only_unreadable_rules_on_worker() {
+        let mut rules=(0..100).map(|port|format!(r#"{{"SrcIPs":["*"],"DstPorts":[{{"IP":"*","Ports":{{"First":{port},"Last":{port}}}}}]}}"#)).collect::<Vec<_>>();
+        // A source longer than any field the parser reads cannot be kept;
+        // dropping its rule only denies.
+        rules.push(format!(
+            r#"{{"SrcIPs":["{}"],"DstPorts":[{{"IP":"*","Ports":{{"First":100,"Last":100}}}}]}}"#,
+            "1".repeat(10 * 1024)
+        ));
+        let json = format!(r#"{{"PacketFilter":[{}]}}"#, rules.join(","));
         let mut map = tailfeather::netmap::Netmap::<PEERS>::new();
         let mut parser = tailfeather::netmap::Parser::new();
         parser.push(&mut map, json.as_bytes()).unwrap();
         // Keeping the previous map instead would keep a stale policy that may
-        // still allow what control just revoked. Rules that do not fit are
-        // dropped, which only denies.
+        // still allow what control just revoked.
         parser.finish(&mut map).unwrap();
         assert!(map.packet_filter.is_valid());
         assert!(map.packet_filter.truncated());
-        let kept = map.packet_filter.rule_count();
-        assert!(kept > 0 && kept < 100);
-        assert!(
-            map.packet_filter
-                .allows([100, 64, 0, 1].into(), [100, 64, 0, 2].into(), 6, 0)
-        );
+        assert_eq!(map.packet_filter.rule_count(), 100);
+        for port in [0, 99] {
+            assert!(map.packet_filter.allows(
+                [100, 64, 0, 1].into(),
+                [100, 64, 0, 2].into(),
+                6,
+                port
+            ));
+        }
         assert!(
             !map.packet_filter
-                .allows([100, 64, 0, 1].into(), [100, 64, 0, 2].into(), 6, 99)
+                .allows([100, 64, 0, 1].into(), [100, 64, 0, 2].into(), 6, 100)
         );
     }
     #[test]

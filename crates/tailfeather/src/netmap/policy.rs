@@ -358,9 +358,8 @@ impl PacketPolicy {
     pub fn replace_set(&mut self, name: &str) -> Result<(), Error> {
         self.valid_name(name)?;
         self.delete_set(name);
-        let id = (0..MAX_FILTER_SETS)
-            .map_while(|candidate| SetId::try_from(candidate).ok())
-            .find(|candidate| self.sets.iter().all(|set| set.id != *candidate))
+        let id = self
+            .free_set_id()
             .ok_or(Error::Full(CapacityError::PacketPolicy))?;
         self.sets
             .push(FilterSet {
@@ -372,6 +371,41 @@ impl PacketPolicy {
             .map_err(|_| Error::Full(CapacityError::PacketPolicy))?;
         self.valid = true;
         Ok(())
+    }
+
+    /// An id no stored set uses, found in one pass over the sets: one past
+    /// the highest id when that fits, otherwise the lowest gap. Only the
+    /// fixed table (or a heap table that exhausted `SetId`) needs the gap.
+    fn free_set_id(&self) -> Option<SetId> {
+        if self.sets.len() >= MAX_FILTER_SETS {
+            return None;
+        }
+        let next = match self.sets.iter().map(|set| set.id).max() {
+            None => Some(0),
+            Some(highest) => highest.checked_add(1),
+        };
+        if let Some(next) = next.filter(|&next| (next as usize) < MAX_FILTER_SETS) {
+            return Some(next);
+        }
+        // Fewer sets than ids, so a gap exists. Mark the ids in use and
+        // take the first free one; ids past the set count cannot be the
+        // first gap, so a bitmap of `len + 1` bits suffices.
+        let mut used = BoundedVec::<bool, MAX_FILTER_SETS>::new();
+        let slots = self.sets.len() + 1;
+        if !used.try_reserve_total(slots) {
+            return None;
+        }
+        for _ in 0..slots {
+            let _ = used.push(false);
+        }
+        for set in self.sets.iter() {
+            if let Some(slot) = used.get_mut(set.id as usize) {
+                *slot = true;
+            }
+        }
+        used.iter()
+            .position(|used| !used)
+            .and_then(|index| SetId::try_from(index).ok())
     }
 
     pub fn delete_set(&mut self, name: &str) {
@@ -932,6 +966,35 @@ mod tests {
         policy.delete_set("ssh");
         assert_eq!(policy.rule_count(), 0);
         assert!(policy.is_valid());
+    }
+
+    #[test]
+    fn set_ids_are_reused_after_deletion_without_colliding() {
+        use core::fmt::Write as _;
+        let mut policy = PacketPolicy::new();
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for name in names {
+            policy.replace_set(name).unwrap();
+            policy.push_rule(name, any_rule()).unwrap();
+        }
+        // Free a middle id and the highest; new sets must not share ids
+        // with surviving sets, or deleting one would delete the other's rules.
+        policy.delete_set("c");
+        policy.delete_set("h");
+        for index in 0..2 {
+            let mut name = String::<8>::new();
+            write!(name, "n{index}").unwrap();
+            policy.replace_set(&name).unwrap();
+            policy.push_rule(&name, any_rule()).unwrap();
+        }
+        let mut ids: std::vec::Vec<_> = policy.sets.iter().map(|set| set.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 8);
+        assert_eq!(policy.rule_count(), 8);
+        policy.delete_set("n0");
+        policy.delete_set("n1");
+        assert_eq!(policy.rule_count(), 6);
     }
 
     #[cfg(not(feature = "alloc"))]
