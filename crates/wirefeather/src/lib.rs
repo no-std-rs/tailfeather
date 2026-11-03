@@ -47,6 +47,7 @@
 extern crate alloc;
 
 use peer_vec::PeerVec;
+use zeroize::Zeroizing;
 
 pub mod budget;
 pub mod crypto;
@@ -176,7 +177,9 @@ impl core::error::Error for Error {}
 
 struct Peer {
     public: PublicKey,
-    preshared_key: Key,
+    /// Zeroed when the peer is dropped: with the `alloc` feature a removed
+    /// peer's storage returns to the heap.
+    preshared_key: Zeroizing<Key>,
     /// The newest TAI64N timestamp accepted from this peer. Initiations must
     /// carry strictly increasing timestamps.
     last_timestamp: Option<Tai64n>,
@@ -288,7 +291,7 @@ impl<const PEERS: usize> Device<PEERS> {
         self.peers
             .push(Peer {
                 public: PublicKey::from(public),
-                preshared_key: preshared_key.unwrap_or([0u8; 32]),
+                preshared_key: Zeroizing::new(preshared_key.unwrap_or([0u8; 32])),
                 last_timestamp: None,
                 current: None,
                 previous: None,

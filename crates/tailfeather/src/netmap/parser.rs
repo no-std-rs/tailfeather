@@ -238,6 +238,9 @@ struct Pending {
     /// The record's `Key` was too large to read. Whatever this node knew of
     /// the peer is stale, so the record removes it rather than being ignored.
     key_unreadable: bool,
+    /// The record's `DiscoKey` was too large to read; a patch clears the old
+    /// one rather than keep probing with a retired key.
+    disco_unreadable: bool,
     #[cfg(feature = "peer-names")]
     name: heapless::String<{ crate::netmap::MAX_PEER_NAME }>,
     #[cfg(feature = "peer-names")]
@@ -265,6 +268,7 @@ impl Pending {
             endpoints_present: false,
             oversized: None,
             key_unreadable: false,
+            disco_unreadable: false,
             #[cfg(feature = "peer-names")]
             name: heapless::String::new(),
             #[cfg(feature = "peer-names")]
@@ -983,6 +987,9 @@ impl State {
         if let Some(derp) = self.pending.home_derp {
             peer.home_derp = derp;
         }
+        if self.pending.disco_unreadable {
+            peer.disco_key = None;
+        }
         if let Some(key) = self.pending.disco_key {
             peer.disco_key = Some(key);
         }
@@ -1374,6 +1381,12 @@ impl State {
             Context::PeerObject | Context::PatchObject if self.key == "Key" => {
                 self.pending.key_unreadable = true;
             }
+            Context::PeerObject | Context::PatchObject if self.key == "DiscoKey" => {
+                self.pending.disco_unreadable = true;
+            }
+            // Retained DNS entries that do not fit are reported as dropped.
+            Context::DnsDomains | Context::DnsResolvers => netmap.dns.truncated = true,
+            Context::DnsResolverObject if self.key == "Addr" => netmap.dns.truncated = true,
             Context::PeerAllowedIps | Context::PeerPrimaryRoutes => {
                 self.pending
                     .oversized

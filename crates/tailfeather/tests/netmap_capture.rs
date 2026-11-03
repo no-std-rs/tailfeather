@@ -1368,3 +1368,30 @@ fn oversized_unknown_acl_members_and_endpoint_patches_are_handled_like_short_one
         "the patch replaced the stale endpoint"
     );
 }
+
+#[test]
+fn unreadable_disco_keys_and_dns_entries_are_not_kept_or_hidden() {
+    let blob = "d".repeat(10 * 1024);
+    let disco = format!("discokey:{}", "ab".repeat(32));
+    let mut netmap = Netmap::<32>::new();
+    let documents = [
+        format!(
+            r#"{{"Node":{{"Key":"{RANKED_SELF}"}},"Peers":[{{"ID":4,"Key":"{}","DiscoKey":"{disco}"}}]}}"#,
+            RANKED_KEYS[0]
+        ),
+        format!(r#"{{"PeersChangedPatch":[{{"NodeID":4,"DiscoKey":"{blob}"}}]}}"#),
+        format!(
+            r#"{{"DNSConfig":{{"Domains":["{blob}","ok.example"],"Resolvers":[{{"Addr":"{blob}"}}]}}}}"#
+        ),
+    ];
+    for document in &documents {
+        let mut parser = Parser::<32>::new();
+        parser.push(&mut netmap, document.as_bytes()).unwrap();
+        parser.finish(&mut netmap).unwrap();
+    }
+    assert!(
+        netmap.peers.get(4).unwrap().disco_key.is_none(),
+        "the retired disco key was kept"
+    );
+    assert!(netmap.dns.truncated);
+}
