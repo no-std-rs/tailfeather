@@ -1289,7 +1289,12 @@ mod tests {
                 parser.push(&mut map, json.as_bytes()).unwrap();
                 let result = parser.finish(&mut map);
                 if count > 512 {
-                    assert!(matches!(result, Err(tailfeather::netmap::Error::Full(_))));
+                    // A rule that outgrows its bound is dropped whole, which
+                    // only denies; the rest of the map still applies.
+                    result.unwrap();
+                    assert!(map.packet_filter.is_valid());
+                    assert!(map.packet_filter.truncated());
+                    assert!(!map.packet_filter.allows([100,64,0,1].into(), [100,65,0,1].into(), 6, 2222));
                 } else {
                     result.unwrap();
                     assert!(map.packet_filter.allows([100,64,(count / 256) as u8,(count % 256) as u8].into(), [100,65,(count / 256) as u8,(count % 256) as u8].into(), 6, 2222));
@@ -1300,20 +1305,30 @@ mod tests {
         }).unwrap().join().unwrap();
     }
     #[test]
-    fn over_capacity_acl_updates_are_terminal() {
-        crate::on_worker_stack(over_capacity_acl_updates_are_terminal_on_worker);
+    fn over_capacity_acl_updates_drop_rules_instead_of_the_map() {
+        crate::on_worker_stack(over_capacity_acl_updates_drop_rules_instead_of_the_map_on_worker);
     }
-    fn over_capacity_acl_updates_are_terminal_on_worker() {
+    fn over_capacity_acl_updates_drop_rules_instead_of_the_map_on_worker() {
         let rules=(0..100).map(|port|format!(r#"{{"SrcIPs":["*"],"DstPorts":[{{"IP":"*","Ports":{{"First":{port},"Last":{port}}}}}]}}"#)).collect::<Vec<_>>().join(",");
         let json = format!(r#"{{"PacketFilter":[{rules}]}}"#);
         let mut map = tailfeather::netmap::Netmap::<PEERS>::new();
         let mut parser = tailfeather::netmap::Parser::new();
         parser.push(&mut map, json.as_bytes()).unwrap();
-        let error = parser.finish(&mut map).unwrap_err();
-        assert!(matches!(error, tailfeather::netmap::Error::Full(_)));
-        assert_eq!(
-            map_failure(transport::Error::<std::io::Error>::Netmap(error)),
-            "netmap rejected"
+        // Keeping the previous map instead would keep a stale policy that may
+        // still allow what control just revoked. Rules that do not fit are
+        // dropped, which only denies.
+        parser.finish(&mut map).unwrap();
+        assert!(map.packet_filter.is_valid());
+        assert!(map.packet_filter.truncated());
+        let kept = map.packet_filter.rule_count();
+        assert!(kept > 0 && kept < 100);
+        assert!(
+            map.packet_filter
+                .allows([100, 64, 0, 1].into(), [100, 64, 0, 2].into(), 6, 0)
+        );
+        assert!(
+            !map.packet_filter
+                .allows([100, 64, 0, 1].into(), [100, 64, 0, 2].into(), 6, 99)
         );
     }
     #[test]
