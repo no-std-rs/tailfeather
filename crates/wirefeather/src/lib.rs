@@ -307,6 +307,17 @@ impl<const PEERS: usize> Device<PEERS> {
         self.peers.len()
     }
 
+    /// Make room for `total` registered peers in advance, so that adding peers
+    /// up to that count cannot fail for lack of space. Fails, changing
+    /// nothing, past `PEERS` or (with `alloc`) when the allocator refuses.
+    pub fn try_reserve_peers(&mut self, total: usize) -> Result<(), Error> {
+        if self.peers.try_reserve_total(total) {
+            Ok(())
+        } else {
+            Err(Error::TooManyPeers)
+        }
+    }
+
     /// Find a registered peer by its static public key.
     pub fn peer_by_public_key(&self, public: &[u8; 32]) -> Option<PeerId> {
         self.peers

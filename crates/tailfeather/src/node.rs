@@ -922,7 +922,11 @@ impl<const PEERS: usize> Node<PEERS> {
                 result: Ok(()),
             } if self.registration != RegistrationState::WaitingForPersistence => {
                 core::mem::swap(&mut self.netmap, lease);
-                self.reconcile_peers()?;
+                if let Err(error) = self.reconcile_peers() {
+                    // Nothing was changed; keep running on the previous map.
+                    core::mem::swap(&mut self.netmap, lease);
+                    return Err(error);
+                }
                 let status = if !self.netmap.packet_filter.is_valid() {
                     NodeStatus::MapChanged
                 } else if !self.netmap.ipv4_default_route_approved()
@@ -953,10 +957,28 @@ impl<const PEERS: usize> Node<PEERS> {
         self.registration = RegistrationState::Registered;
         self.reconnect_backoff_s = 1;
         core::mem::swap(&mut self.netmap, lease);
-        self.reconcile_peers()
+        let result = self.reconcile_peers();
+        if result.is_err() {
+            // Nothing was changed; keep running on the previous map.
+            core::mem::swap(&mut self.netmap, lease);
+        }
+        result
     }
 
+    /// Bring the tunnel and path state in line with `self.netmap`.
+    ///
+    /// Either completes or, on error, changes nothing: everything that can
+    /// fail for lack of space is reserved before any live state is touched,
+    /// so a heap-backed node that cannot grow stays wholly on its old map.
     fn reconcile_peers(&mut self) -> Result<(), NodeError> {
+        let peers = self.netmap.peers.len();
+        let mut next_paths = PeerVec::<PeerPath, PEERS>::new();
+        if !next_paths.try_reserve_total(peers) {
+            return Err(NodeError::Capacity);
+        }
+        self.tunnel
+            .try_reserve_peers(peers)
+            .map_err(|_| NodeError::Capacity)?;
         if self.netmap.home_derp != 0
             && self
                 .netmap
@@ -977,7 +999,6 @@ impl<const PEERS: usize> Node<PEERS> {
                 .iter()
                 .any(|peer| peer.node_key.as_bytes() == key)
         });
-        let mut next_paths = PeerVec::<PeerPath, PEERS>::new();
         for peer in self.netmap.peers.iter() {
             if self
                 .tunnel
@@ -2315,7 +2336,10 @@ mod tests {
         peer.home_derp = 9;
         peer.endpoints.push(endpoint).unwrap();
         lease.peers.upsert(peer).unwrap();
-        let cert_name = lease.derp.intern_cert_name("certificate.example").unwrap();
+        let cert_name = lease
+            .derp
+            .intern_cert_name("certificate.example", &mut [])
+            .unwrap();
         let mut nodes = heapless::Vec::new();
         nodes
             .push(crate::netmap::DerpNode {
@@ -3140,7 +3164,10 @@ mod tests {
 
         let mut map = Netmap::<1>::new();
         map.home_derp = 9;
-        let cert_name = map.derp.intern_cert_name("certificate.example").unwrap();
+        let cert_name = map
+            .derp
+            .intern_cert_name("certificate.example", &mut [])
+            .unwrap();
         let mut relay = crate::netmap::DerpNode {
             host_name: heapless::String::try_from("derp.example").unwrap(),
             cert_name: Some(cert_name),

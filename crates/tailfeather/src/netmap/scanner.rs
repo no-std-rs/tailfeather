@@ -35,11 +35,16 @@
 //! [`Token::Oversized`] (or [`Token::OversizedKey`]) without its contents. The
 //! parser decides whether the field it replaces matters.
 
-use crate::netmap::{Error, MAX_STRING};
+use crate::netmap::{CapacityError, Error, MAX_STRING};
 
 /// How deeply a MapResponse may nest. The deepest real path is
 /// `DERPMap.Regions.<id>.Nodes[].<field>`, which is five.
 pub const MAX_DEPTH: usize = 16;
+
+/// Further nesting a value may have past [`MAX_DEPTH`] and still be skipped
+/// as one [`Token::Oversized`]: one bit of state per level. Deeper than this
+/// the document is refused.
+const MAX_SKIPPED_DEPTH: u8 = 128;
 
 /// One JSON token.
 #[derive(Debug, PartialEq)]
@@ -91,13 +96,6 @@ enum State {
     /// A value has ended; expecting a comma or a closing bracket.
     AfterValue,
     ExpectColon,
-    /// Inside a container nested past [`MAX_DEPTH`]: only strings and
-    /// brackets are tracked until it closes.
-    Skip {
-        depth: u32,
-        in_string: bool,
-        escape: bool,
-    },
 }
 
 pub struct Scanner {
@@ -107,6 +105,14 @@ pub struct Scanner {
     /// The token being built outgrew `buffer`; its remaining bytes are only
     /// syntax-checked.
     overflowed: bool,
+    /// Containers open past [`MAX_DEPTH`]. While any are, the document is
+    /// checked exactly as usual but no tokens are emitted; one
+    /// [`Token::Oversized`] reports the outermost when it closes.
+    deep: u8,
+    /// Bit `i` set: skipped level `i` is an object rather than an array.
+    deep_kinds: u128,
+    /// `expecting_key` of the innermost skipped level, if it is an object.
+    deep_expecting_key: bool,
     /// Accumulates a `\uXXXX` escape.
     code_point: u32,
     /// A high surrogate awaiting its partner.
@@ -128,6 +134,9 @@ impl Scanner {
             stack: heapless::Vec::new(),
             buffer: heapless::Vec::new(),
             overflowed: false,
+            deep: 0,
+            deep_kinds: 0,
+            deep_expecting_key: false,
             code_point: 0,
             pending_surrogate: None,
             done: false,
@@ -139,6 +148,9 @@ impl Scanner {
         self.stack.clear();
         self.buffer.clear();
         self.overflowed = false;
+        self.deep = 0;
+        self.deep_kinds = 0;
+        self.deep_expecting_key = false;
         self.code_point = 0;
         self.pending_surrogate = None;
         self.done = false;
@@ -208,12 +220,12 @@ impl Scanner {
                     b'{' => {
                         if self.open(Container::Object {
                             expecting_key: true,
-                        }) {
+                        })? {
                             on_token(Token::StartObject)?;
                         }
                     }
                     b'[' => {
-                        if self.open(Container::Array) {
+                        if self.open(Container::Array)? {
                             on_token(Token::StartArray)?;
                         }
                     }
@@ -248,12 +260,17 @@ impl Scanner {
                             return Err(Error::Json);
                         }
                         let is_key = matches!(
-                            self.stack.last(),
+                            self.top(),
                             Some(Container::Object {
                                 expecting_key: true
                             })
                         );
-                        if self.overflowed {
+                        if self.deep > 0 {
+                            // Skipped: still must be valid UTF-8 if whole.
+                            if !self.overflowed {
+                                core::str::from_utf8(&self.buffer).map_err(|_| Error::Json)?;
+                            }
+                        } else if self.overflowed {
                             // Truncated bytes may end mid-character; only the
                             // fact that it was too long is reported.
                             on_token(if is_key {
@@ -351,7 +368,7 @@ impl Scanner {
                 }
                 match byte {
                     b',' => {
-                        if let Some(Container::Object { .. }) = self.stack.last() {
+                        if let Some(Container::Object { .. }) = self.top() {
                             self.set_expecting_key(true);
                         }
                         self.state = State::Value;
@@ -370,35 +387,6 @@ impl Scanner {
                     return Err(Error::Json);
                 }
                 self.state = State::Value;
-                Ok(true)
-            }
-
-            State::Skip {
-                depth,
-                in_string,
-                escape,
-            } => {
-                let (depth, in_string, escape) = match (in_string, escape, byte) {
-                    (true, true, _) => (depth, true, false),
-                    (true, false, b'\\') => (depth, true, true),
-                    (true, false, b'"') => (depth, false, false),
-                    (true, false, 0x00..=0x1f) => return Err(Error::Json),
-                    (true, false, _) => (depth, true, false),
-                    (false, _, b'"') => (depth, true, false),
-                    (false, _, b'{' | b'[') => (depth.saturating_add(1), false, false),
-                    (false, _, b'}' | b']') => (depth - 1, false, false),
-                    (false, _, _) => (depth, false, false),
-                };
-                if depth == 0 {
-                    on_token(Token::Oversized)?;
-                    self.state = State::AfterValue;
-                } else {
-                    self.state = State::Skip {
-                        depth,
-                        in_string,
-                        escape,
-                    };
-                }
                 Ok(true)
             }
         }
@@ -437,7 +425,7 @@ impl Scanner {
         on_token: &mut impl FnMut(Token<'_>) -> Result<(), Error>,
     ) -> Result<(), Error> {
         // An over-long number cannot be an id, port or region.
-        let token = if self.overflowed {
+        let token = if self.overflowed || self.deep > 0 {
             Token::OtherNumber
         } else {
             let text = core::str::from_utf8(&self.buffer).map_err(|_| Error::Json)?;
@@ -446,7 +434,9 @@ impl Scanner {
                 Err(_) => Token::OtherNumber,
             }
         };
-        on_token(token)?;
+        if self.deep == 0 {
+            on_token(token)?;
+        }
         self.state = State::AfterValue;
         Ok(())
     }
@@ -461,25 +451,49 @@ impl Scanner {
             b"null" => Token::Null,
             _ => return Err(Error::Json),
         };
-        on_token(token)?;
+        if self.deep == 0 {
+            on_token(token)?;
+        }
         self.state = State::AfterValue;
         Ok(())
     }
 
-    /// Enter a container. Returns `false` if it nests past [`MAX_DEPTH`], in
-    /// which case it is skipped whole and later reported as one
-    /// [`Token::Oversized`].
-    fn open(&mut self, container: Container) -> bool {
-        if self.stack.push(container).is_err() {
-            self.state = State::Skip {
-                depth: 1,
-                in_string: false,
-                escape: false,
-            };
-            return false;
+    /// The innermost open container, skipped or not.
+    fn top(&self) -> Option<Container> {
+        if self.deep > 0 {
+            Some(if self.deep_kinds >> (self.deep - 1) & 1 != 0 {
+                Container::Object {
+                    expecting_key: self.deep_expecting_key,
+                }
+            } else {
+                Container::Array
+            })
+        } else {
+            self.stack.last().copied()
         }
+    }
+
+    /// Enter a container. Returns whether to report it: one nested past
+    /// [`MAX_DEPTH`] is checked but reported only as one
+    /// [`Token::Oversized`] when it closes.
+    fn open(&mut self, container: Container) -> Result<bool, Error> {
         self.state = State::Value;
-        true
+        if self.deep == 0 && self.stack.push(container).is_ok() {
+            return Ok(true);
+        }
+        if self.deep >= MAX_SKIPPED_DEPTH {
+            return Err(Error::Full(CapacityError::ParserDepth));
+        }
+        let object = matches!(container, Container::Object { .. });
+        let bit = 1u128 << self.deep;
+        self.deep_kinds = if object {
+            self.deep_kinds | bit
+        } else {
+            self.deep_kinds & !bit
+        };
+        self.deep_expecting_key = object;
+        self.deep += 1;
+        Ok(false)
     }
 
     fn close(
@@ -487,6 +501,20 @@ impl Scanner {
         byte: u8,
         on_token: &mut impl FnMut(Token<'_>) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        if self.deep > 0 {
+            let object = self.deep_kinds >> (self.deep - 1) & 1 != 0;
+            if (byte == b'}') != object {
+                return Err(Error::Json);
+            }
+            self.deep -= 1;
+            // A parent object has just received this value as a member.
+            self.deep_expecting_key = false;
+            self.state = State::AfterValue;
+            if self.deep == 0 {
+                on_token(Token::Oversized)?;
+            }
+            return Ok(());
+        }
         let container = self.stack.pop().ok_or(Error::Json)?;
         match (byte, container) {
             (b'}', Container::Object { .. }) => on_token(Token::EndObject)?,
@@ -503,7 +531,9 @@ impl Scanner {
     }
 
     fn set_expecting_key(&mut self, expecting: bool) {
-        if let Some(Container::Object { expecting_key }) = self.stack.last_mut() {
+        if self.deep > 0 {
+            self.deep_expecting_key = expecting;
+        } else if let Some(Container::Object { expecting_key }) = self.stack.last_mut() {
             *expecting_key = expecting;
         }
     }
@@ -697,9 +727,29 @@ mod tests {
         for chunk in [1, 5, document.len()] {
             assert_eq!(joined(&document, chunk).as_str(), expected);
         }
-        // Skipped content is still syntax-checked for strings.
+        // Skipped content is checked exactly like retained content.
+        for bad in [
+            std::format!("{open}\"\u{1}\""),
+            std::format!("{open}]}}"),
+            std::format!("{open}tru]"),
+            std::format!("{open}1 2]"),
+            std::format!("{open}{{1:2}}]"),
+            std::format!("{open}{{\"a\" 1}}]"),
+        ] {
+            let mut scanner = Scanner::new();
+            assert_eq!(
+                scanner.push(bad.as_bytes(), |_| Ok(())),
+                Err(Error::Json),
+                "{bad}"
+            );
+        }
+        // Past the skipped bound as well, the document is refused rather than
+        // tracked without limit.
         let mut scanner = Scanner::new();
-        let bad = std::format!("{open}\"\u{1}\"");
-        assert_eq!(scanner.push(bad.as_bytes(), |_| Ok(())), Err(Error::Json));
+        let abyss = "[".repeat(MAX_DEPTH + usize::from(MAX_SKIPPED_DEPTH) + 1);
+        assert_eq!(
+            scanner.push(abyss.as_bytes(), |_| Ok(())),
+            Err(Error::Full(CapacityError::ParserDepth))
+        );
     }
 }

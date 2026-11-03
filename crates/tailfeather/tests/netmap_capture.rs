@@ -1255,3 +1255,52 @@ fn surplus_self_addresses_keep_the_ipv4_address_instead_of_failing() {
             .any(|cidr| cidr.address == "100.64.0.7".parse::<core::net::IpAddr>().unwrap())
     );
 }
+
+#[test]
+fn an_oversized_destination_drops_its_rule_instead_of_the_map() {
+    let long = "1".repeat(10 * 1024);
+    let document = format!(
+        r#"{{"PacketFilter":[{{"SrcIPs":["*"],"DstPorts":[{{"IP":"{long}","Ports":{{"First":22,"Last":22}}}}]}},{{"SrcIPs":["100.64.0.1"],"DstPorts":[{{"IP":"*","Ports":{{"First":80,"Last":80}}}}]}}]}}"#
+    );
+    let mut netmap = Netmap::<32>::new();
+    let mut parser = Parser::<32>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    assert!(netmap.packet_filter.truncated());
+    assert_eq!(netmap.packet_filter.rule_count(), 1);
+}
+
+#[test]
+fn evicted_regions_release_their_certificate_names() {
+    // High region ids arrive first, each with its own certificate override,
+    // and are evicted as lower ids follow. Their names must not exhaust the
+    // pool the retained regions need.
+    let regions: Vec<String> = (1..=60u16)
+        .rev()
+        .map(|id| {
+            let cert = if id == 1 || id == 2 || id > 40 { format!("cert{id}.example") } else { String::new() };
+            format!(
+                r#""{id}":{{"RegionID":{id},"RegionCode":"r{id}","Nodes":[{{"Name":"n","RegionID":{id},"HostName":"derp{id}.example","CertName":"{cert}","DERPPort":443}}]}}"#
+            )
+        })
+        .collect();
+    let document = format!(r#"{{"DERPMap":{{"Regions":{{{}}}}}}}"#, regions.join(","));
+    let mut netmap = Netmap::<32>::new();
+    let mut parser = Parser::<32>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    for id in [1u16, 2] {
+        let region = netmap.derp.region(id).unwrap();
+        assert_eq!(region.nodes.len(), 1, "region {id} kept its relay");
+        assert_eq!(
+            netmap.derp.cert_name(&region.nodes[0]),
+            format!("cert{id}.example")
+        );
+    }
+    assert_eq!(
+        netmap
+            .derp
+            .cert_name(&netmap.derp.region(5).unwrap().nodes[0]),
+        "derp5.example"
+    );
+}

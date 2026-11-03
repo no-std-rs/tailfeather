@@ -81,6 +81,26 @@ impl<T, const N: usize> PeerVec<T, N> {
         }
     }
 
+    /// Make room for the vector to hold `total` elements, so that pushes up
+    /// to that length cannot be refused. Returns `false`, changing nothing, if
+    /// `total` exceeds `N` or (with `alloc`) the allocator cannot provide it.
+    #[must_use]
+    pub fn try_reserve_total(&mut self, total: usize) -> bool {
+        if total > N {
+            return false;
+        }
+        #[cfg(feature = "alloc")]
+        {
+            self.inner
+                .try_reserve(total.saturating_sub(self.inner.len()))
+                .is_ok()
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            true
+        }
+    }
+
     pub fn get(&self, index: usize) -> Option<&T> {
         self.inner.get(index).map(|slot| slot.borrow())
     }
@@ -199,6 +219,18 @@ mod tests {
             values.iter().copied().collect::<heapless::Vec<u8, 4>>(),
             [2, 4]
         );
+    }
+
+    #[test]
+    fn reservations_respect_the_limit_and_change_nothing_on_failure() {
+        let mut values = PeerVec::<u8, 3>::new();
+        values.push(1).unwrap();
+        assert!(values.try_reserve_total(3));
+        assert!(!values.try_reserve_total(4));
+        assert_eq!(values.len(), 1);
+        values.push(2).unwrap();
+        values.push(3).unwrap();
+        assert_eq!(values.push(4), Err(4));
     }
 
     #[cfg(feature = "alloc")]

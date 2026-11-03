@@ -610,7 +610,10 @@ impl State {
                     if !self.region.node_cert.is_empty()
                         && self.region.node_cert != self.region.node_host
                     {
-                        match netmap.derp.intern_cert_name(self.region.node_cert.as_str()) {
+                        match netmap.derp.intern_cert_name(
+                            self.region.node_cert.as_str(),
+                            &mut self.region.nodes,
+                        ) {
                             Ok(name) => node.cert_name = Some(name),
                             // Without its certificate name the relay cannot be
                             // verified; skip it rather than the whole map.
@@ -649,6 +652,10 @@ impl State {
                 };
                 netmap.derp.insert_bounded(region);
             }
+            // The rule is already being dropped; a destination missing the
+            // field that overflowed is not a reason to reject the map.
+            Context::FilterDestinationObject
+                if self.filter.rule_overflow || self.filter.skip_set => {}
             Context::FilterDestinationObject => {
                 let destination = match (
                     self.filter.destination_network,
