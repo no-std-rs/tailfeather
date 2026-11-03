@@ -235,6 +235,9 @@ struct Pending {
     /// Those lists decide routing and source checks, so a partial copy is not
     /// kept: the peer is omitted instead of failing the whole map.
     oversized: Option<CapacityError>,
+    /// The record's `Key` was too large to read. Whatever this node knew of
+    /// the peer is stale, so the record removes it rather than being ignored.
+    key_unreadable: bool,
     #[cfg(feature = "peer-names")]
     name: heapless::String<{ crate::netmap::MAX_PEER_NAME }>,
     #[cfg(feature = "peer-names")]
@@ -261,6 +264,7 @@ impl Pending {
             endpoints: heapless::Vec::new(),
             endpoints_present: false,
             oversized: None,
+            key_unreadable: false,
             #[cfg(feature = "peer-names")]
             name: heapless::String::new(),
             #[cfg(feature = "peer-names")]
@@ -705,7 +709,12 @@ impl State {
 
     fn commit_peer<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
         let Some(node_key) = self.pending.node_key else {
-            // A record with no key names nothing and cannot be routed to.
+            // A record with no key names nothing and cannot be routed to. One
+            // whose key could not be read replaces whatever was known.
+            if self.pending.key_unreadable {
+                netmap.peers.remove(self.pending.id);
+                netmap.peers_truncated = true;
+            }
             return;
         };
         // The server sends a node its own record in `PeersChanged` — the
@@ -827,7 +836,7 @@ impl State {
     }
 
     fn rank(peer: &Peer) -> (bool, core::cmp::Reverse<u64>) {
-        (peer.online(), core::cmp::Reverse(peer.id))
+        peer.retention_rank()
     }
 
     fn reconcile_self_peer<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
@@ -940,6 +949,12 @@ impl State {
     /// every heartbeat, and the tunnel would keep falling back to a relay.
     fn apply_patch<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
         let id = self.pending.id;
+        if self.pending.key_unreadable {
+            // A rotated key that could not be read: the old one is stale.
+            netmap.peers.remove(id);
+            netmap.peers_truncated = true;
+            return;
+        }
         let Some(peer) = netmap.peers.get_mut(id) else {
             // A patch for a peer we never saw. Nothing to merge it into, and
             // inventing one would produce a peer with no key.
@@ -1333,6 +1348,9 @@ impl State {
                 self.pending
                     .oversized
                     .get_or_insert(CapacityError::Addresses);
+            }
+            Context::PeerObject | Context::PatchObject if self.key == "Key" => {
+                self.pending.key_unreadable = true;
             }
             Context::PeerAllowedIps | Context::PeerPrimaryRoutes => {
                 self.pending

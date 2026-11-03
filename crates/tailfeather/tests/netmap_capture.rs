@@ -1320,3 +1320,22 @@ fn an_oversized_unknown_relay_field_keeps_the_relay() {
     assert_eq!(region.nodes.len(), 1);
     assert_eq!(region.nodes[0].host_name.as_str(), "derp9.example");
 }
+
+#[test]
+fn a_changed_peer_with_an_unreadable_key_is_forgotten() {
+    let mut netmap = Netmap::<32>::new();
+    let initial = format!(
+        r#"{{"Node":{{"Key":"{RANKED_SELF}"}},"Peers":[{{"ID":4,"Key":"{}"}},{{"ID":5,"Key":"{}"}}]}}"#,
+        RANKED_KEYS[0], RANKED_KEYS[1]
+    );
+    let long = "k".repeat(10 * 1024);
+    let changed = format!(r#"{{"PeersChanged":[{{"ID":4,"Key":"{long}"}}]}}"#);
+    let patched = format!(r#"{{"PeersChangedPatch":[{{"NodeID":5,"Key":"{long}"}}]}}"#);
+    for document in [initial, changed, patched] {
+        let mut parser = Parser::<32>::new();
+        parser.push(&mut netmap, document.as_bytes()).unwrap();
+        parser.finish(&mut netmap).unwrap();
+    }
+    assert!(netmap.peers.is_empty(), "stale keys were kept");
+    assert!(netmap.peers_truncated);
+}

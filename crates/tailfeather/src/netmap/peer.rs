@@ -106,6 +106,12 @@ impl Peer {
         }
     }
 
+    /// Which peers a full table keeps: online before offline, then the
+    /// lowest node id. Unique per peer, and independent of server order.
+    pub(crate) fn retention_rank(&self) -> (bool, core::cmp::Reverse<u64>) {
+        (self.online(), core::cmp::Reverse(self.id))
+    }
+
     pub fn online(&self) -> bool {
         self.state_flags & 1 != 0
     }
@@ -204,9 +210,30 @@ impl<const N: usize> PeerTable<N> {
     /// copy is incomplete because a heap-backed table could not grow.
     pub(crate) fn copy_from(&mut self, source: &Self) -> bool {
         self.peers.clear();
-        source
+        if self.peers.try_reserve_total(source.len())
+            && source
+                .iter()
+                .all(|peer| self.peers.push(peer.clone()).is_ok())
+        {
+            return true;
+        }
+        // Memory ran out part way. Keep the highest-ranked peers that fit, as
+        // a full table would, rather than an arbitrary prefix. Selecting
+        // without an index buffer is quadratic, but needs no allocation and
+        // runs only under memory pressure.
+        self.peers.clear();
+        let mut below = None;
+        while let Some(peer) = source
             .iter()
-            .all(|peer| self.peers.push(peer.clone()).is_ok())
+            .filter(|peer| below.is_none_or(|rank| peer.retention_rank() < rank))
+            .max_by_key(|peer| peer.retention_rank())
+        {
+            below = Some(peer.retention_rank());
+            if self.peers.push(peer.clone()).is_err() {
+                break;
+            }
+        }
+        false
     }
 
     pub fn get(&self, id: u64) -> Option<&Peer> {
