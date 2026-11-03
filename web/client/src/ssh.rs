@@ -133,8 +133,37 @@ enum Input {
 /// A running terminal session, handed to the page.
 #[wasm_bindgen]
 pub struct SshSession {
-    input: mpsc::Sender<Input>,
+    /// One stored sender. `try_send` on a fresh clone always succeeds (each
+    /// clone gets a guaranteed slot), so cloning per call would let input
+    /// queue without bound while the remote is not reading.
+    input: core::cell::RefCell<mpsc::Sender<Input>>,
+    /// Forwarding opens not yet answered. Each holds a sender clone (and so a
+    /// guaranteed queue slot) while it waits, so their number is capped.
+    pending_forwards: std::rc::Rc<core::cell::Cell<usize>>,
     abort: AbortHandle,
+}
+
+/// Forwarding opens one session may have waiting for an answer at once.
+const MAX_PENDING_FORWARDS: usize = 32;
+
+/// Counts one pending forwarding open until dropped.
+struct PendingForward(std::rc::Rc<core::cell::Cell<usize>>);
+
+impl PendingForward {
+    fn start(count: &std::rc::Rc<core::cell::Cell<usize>>) -> Option<Self> {
+        let pending = count.get();
+        if pending >= MAX_PENDING_FORWARDS {
+            return None;
+        }
+        count.set(pending + 1);
+        Some(Self(count.clone()))
+    }
+}
+
+impl Drop for PendingForward {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 #[wasm_bindgen]
@@ -150,9 +179,13 @@ impl SshSession {
         closed: js_sys::Function,
     ) -> Result<crate::forwarding::SshForwardPipe, JsError> {
         use futures::SinkExt;
+        let _pending = PendingForward::start(&self.pending_forwards)
+            .ok_or_else(|| JsError::new("too many forwarding requests are pending"))?;
         let (request, pipe, ready) = crate::forwarding::request(host, port, write, eof, closed)?;
-        self.input
-            .clone()
+        // A clone holds one guaranteed queue slot while it waits; the cap
+        // above bounds how many can exist.
+        let mut input = self.input.borrow().clone();
+        input
             .send(Input::Forward(request))
             .await
             .map_err(|_| JsError::new("SSH session closed"))?;
@@ -164,17 +197,19 @@ impl SshSession {
     }
     /// Keystrokes or pasted text for the remote shell.
     pub fn send(&self, data: &[u8]) {
-        let _ = self.input.clone().try_send(Input::Data(data.to_vec()));
+        // A full queue means the remote has stopped reading; input typed
+        // meanwhile is dropped rather than buffered without bound.
+        let _ = self.input.borrow_mut().try_send(Input::Data(data.to_vec()));
     }
 
     pub fn resize(&self, cols: u32, rows: u32) {
-        let _ = self.input.clone().try_send(Input::Resize(cols, rows));
+        let _ = self.input.borrow_mut().try_send(Input::Resize(cols, rows));
     }
 
     pub fn close(&self) {
         // The queue can be full while a write is blocked; a disconnect must
         // not be lost then, so fall back to ending the task outright.
-        if self.input.clone().try_send(Input::Close).is_err() {
+        if self.input.borrow_mut().try_send(Input::Close).is_err() {
             self.abort.abort();
         }
     }
@@ -216,7 +251,8 @@ pub fn start(options: SshOptions, callbacks: SshCallbacks) -> SshSession {
         }
     });
     SshSession {
-        input: sender,
+        input: core::cell::RefCell::new(sender),
+        pending_forwards: std::rc::Rc::new(core::cell::Cell::new(0)),
         abort,
     }
 }

@@ -81,6 +81,7 @@ impl DerpRegion {
 pub struct DerpMap {
     regions: heapless::Vec<DerpRegion, MAX_DERP_REGIONS>,
     cert_names: heapless::Vec<heapless::String<MAX_DERP_HOSTNAME>, MAX_DERP_CERT_NAMES>,
+    truncated: bool,
 }
 
 impl DerpMap {
@@ -88,7 +89,19 @@ impl DerpMap {
         Self {
             regions: heapless::Vec::new(),
             cert_names: heapless::Vec::new(),
+            truncated: false,
         }
+    }
+
+    /// Control named more regions (or relays) than this map retains. The
+    /// lowest region ids are kept, so the subset does not depend on the
+    /// order control lists them in.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub(crate) fn mark_truncated(&mut self) {
+        self.truncated = true;
     }
 
     pub fn len(&self) -> usize {
@@ -106,6 +119,7 @@ impl DerpMap {
     pub(crate) fn copy_from(&mut self, source: &Self) {
         self.regions.clear();
         self.cert_names.clear();
+        self.truncated = source.truncated;
         for name in source.cert_names.iter() {
             self.cert_names
                 .push(name.clone())
@@ -130,7 +144,14 @@ impl DerpMap {
             .map_or(node.host_name.as_str(), |name| name.as_str())
     }
 
-    pub(crate) fn intern_cert_name(&mut self, name: &str) -> Result<DerpCertName, Error> {
+    /// Intern a certificate-name override. `pending` holds relays of the
+    /// region being parsed, which are not in the map yet but already refer to
+    /// interned names; they are renumbered if the pool has to be compacted.
+    pub(crate) fn intern_cert_name(
+        &mut self,
+        name: &str,
+        pending: &mut [DerpNode],
+    ) -> Result<DerpCertName, Error> {
         if let Some(index) = self
             .cert_names
             .iter()
@@ -140,10 +161,48 @@ impl DerpMap {
         }
         let name = heapless::String::try_from(name)
             .map_err(|_| Error::Full(super::CapacityError::String))?;
+        if self.cert_names.is_full() {
+            // Regions evicted by the bounded insert may have left names no
+            // retained relay uses any more.
+            self.compact_cert_names(pending);
+        }
         self.cert_names
             .push(name)
             .map_err(|_| Error::Full(super::CapacityError::String))?;
         Ok(DerpCertName((self.cert_names.len() - 1) as u8))
+    }
+
+    /// Drop certificate names that no retained or pending relay refers to,
+    /// renumbering the references that remain.
+    fn compact_cert_names(&mut self, pending: &mut [DerpNode]) {
+        let Self {
+            regions,
+            cert_names,
+            ..
+        } = self;
+        let mut kept = heapless::Vec::<_, MAX_DERP_CERT_NAMES>::new();
+        let mut remap = [None::<u8>; MAX_DERP_CERT_NAMES];
+        let nodes = regions
+            .iter_mut()
+            .flat_map(|region| region.nodes.iter_mut())
+            .chain(pending.iter_mut());
+        for node in nodes {
+            let Some(reference) = node.cert_name else {
+                continue;
+            };
+            let Some(index) = reference.index() else {
+                continue;
+            };
+            let Some(name) = cert_names.get(index) else {
+                continue;
+            };
+            let new = *remap[index].get_or_insert_with(|| {
+                let _ = kept.push(name.clone());
+                (kept.len() - 1) as u8
+            });
+            node.cert_name = Some(DerpCertName(new | (reference.0 & 0x80)));
+        }
+        *cert_names = kept;
     }
 
     pub(crate) fn region_mut(&mut self, id: u16) -> Option<&mut DerpRegion> {
@@ -160,9 +219,27 @@ impl DerpMap {
             .map_err(|_| Error::Full(CapacityError::DerpRegions))
     }
 
+    /// Insert into a possibly full map, keeping the lowest region ids and
+    /// recording that the map was truncated.
+    pub(crate) fn insert_bounded(&mut self, region: DerpRegion) {
+        let Err(_) = self.insert(region.clone()) else {
+            return;
+        };
+        self.truncated = true;
+        if let Some(highest) = self
+            .regions
+            .iter_mut()
+            .max_by_key(|existing| existing.id)
+            .filter(|existing| existing.id > region.id)
+        {
+            *highest = region;
+        }
+    }
+
     pub fn clear(&mut self) {
         self.regions.clear();
         self.cert_names.clear();
+        self.truncated = false;
     }
 }
 

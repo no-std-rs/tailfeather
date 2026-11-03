@@ -43,11 +43,18 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+use peer_vec::PeerVec;
+use zeroize::Zeroizing;
+
 pub mod budget;
 pub mod crypto;
 pub mod ip;
 pub mod messages;
 pub mod noise;
+pub mod peer_vec;
 pub mod replay;
 pub mod timers;
 pub mod transport;
@@ -170,7 +177,9 @@ impl core::error::Error for Error {}
 
 struct Peer {
     public: PublicKey,
-    preshared_key: Key,
+    /// Zeroed when the peer is dropped: with the `alloc` feature a removed
+    /// peer's storage returns to the heap.
+    preshared_key: Zeroizing<Key>,
     /// The newest TAI64N timestamp accepted from this peer. Initiations must
     /// carry strictly increasing timestamps.
     last_timestamp: Option<Tai64n>,
@@ -241,12 +250,14 @@ impl Peer {
 ///
 /// `PEERS` is a const parameter rather than a fixed number because a
 /// point-to-point tunnel needs one and a Tailscale mesh needs many, and neither
-/// should pay for the other's table.
+/// should pay for the other's table. With the `alloc` feature the table grows
+/// on the heap instead of being reserved inline, and `PEERS` may be
+/// [`peer_vec::UNBOUNDED`].
 pub struct Device<const PEERS: usize> {
     static_private: StaticSecret,
     static_public: PublicKey,
     mac1_key: Key,
-    peers: heapless::Vec<Peer, PEERS>,
+    peers: PeerVec<Peer, PEERS>,
     budget: HandshakeBudget,
 }
 
@@ -259,7 +270,7 @@ impl<const PEERS: usize> Device<PEERS> {
             mac1_key: noise::mac1_key(&static_public),
             static_private,
             static_public,
-            peers: heapless::Vec::new(),
+            peers: PeerVec::new(),
             budget: HandshakeBudget::new(),
         }
     }
@@ -280,7 +291,7 @@ impl<const PEERS: usize> Device<PEERS> {
         self.peers
             .push(Peer {
                 public: PublicKey::from(public),
-                preshared_key: preshared_key.unwrap_or([0u8; 32]),
+                preshared_key: Zeroizing::new(preshared_key.unwrap_or([0u8; 32])),
                 last_timestamp: None,
                 current: None,
                 previous: None,
@@ -297,6 +308,17 @@ impl<const PEERS: usize> Device<PEERS> {
     /// How many peers are registered.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Make room for `total` registered peers in advance, so that adding peers
+    /// up to that count cannot fail for lack of space. Fails, changing
+    /// nothing, past `PEERS` or (with `alloc`) when the allocator refuses.
+    pub fn try_reserve_peers(&mut self, total: usize) -> Result<(), Error> {
+        if self.peers.try_reserve_total(total) {
+            Ok(())
+        } else {
+            Err(Error::TooManyPeers)
+        }
     }
 
     /// Find a registered peer by its static public key.

@@ -25,7 +25,9 @@ pub(crate) struct Request {
 
 #[wasm_bindgen]
 pub struct SshForwardPipe {
-    input: mpsc::Sender<Command>,
+    /// One stored sender, used one send at a time. A fresh clone per send
+    /// would get its own guaranteed slot in the channel and bypass its bound.
+    input: futures::lock::Mutex<mpsc::Sender<Command>>,
     abort: AbortHandle,
 }
 
@@ -38,7 +40,8 @@ impl SshForwardPipe {
         }
         let (ready, done) = oneshot::channel();
         self.input
-            .clone()
+            .lock()
+            .await
             .send(Command::Data(bytes.to_vec(), ready))
             .await
             .map_err(|_| JsError::new("forwarding channel closed"))?;
@@ -49,7 +52,8 @@ impl SshForwardPipe {
 
     pub async fn eof(&self) -> Result<(), JsError> {
         self.input
-            .clone()
+            .lock()
+            .await
             .send(Command::Eof)
             .await
             .map_err(|_| JsError::new("forwarding channel closed"))
@@ -100,7 +104,7 @@ pub(crate) fn request(
             registration,
         },
         SshForwardPipe {
-            input: sender,
+            input: futures::lock::Mutex::new(sender),
             abort,
         },
         done,

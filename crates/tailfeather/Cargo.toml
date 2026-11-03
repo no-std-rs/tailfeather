@@ -27,6 +27,10 @@ peer-names = []
 ssh-policy = []
 # Larger bounded address lists for workstation/phone fleets; embedded defaults stay small.
 hosted-policy = []
+# Grow the peer table, per-peer path state and WireGuard peers on the heap up
+# to `PEERS`, which may be `UNBOUNDED`, instead of reserving them inline. For
+# hosts and browsers; firmware keeps the fixed, statically sized tables.
+alloc = ["wirefeather/alloc"]
 
 [dependencies]
 crypto-bigint = { version = "0.5.5", default-features = false }

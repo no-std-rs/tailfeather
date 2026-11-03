@@ -105,9 +105,15 @@ enum Context {
     Ignore,
 }
 
+/// The builder's stack depth. Every container it opens was opened by the
+/// scanner first, so this must be at least the scanner's depth for its
+/// pushes and pops to stay balanced (the `unwrap`s below rely on it).
+const SSH_STACK: usize = 16;
+const _: () = assert!(SSH_STACK >= crate::netmap::scanner::MAX_DEPTH);
+
 /// One extra token consumer; reuses the netmap's JSON scanner and token buffer.
 pub(crate) struct Builder {
-    stack: Vec<(Context, u16), 16>,
+    stack: Vec<(Context, u16), SSH_STACK>,
     key: String<64>,
     rule: Rule,
     bad: bool,
@@ -279,6 +285,8 @@ impl Builder {
                 _ => self.bad = true,
             },
             Token::Int(0) if context == Context::Action && self.key == "sessionDuration" => (),
+            // Too large to retain, but inside a subtree the console ignores.
+            Token::Oversized | Token::OversizedKey if context == Context::Ignore => (),
             Token::Null => match (context, self.key.as_str()) {
                 (Context::Policy, "rules")
                 | (

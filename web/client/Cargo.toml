@@ -18,7 +18,7 @@ publish      = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-tailfeather = { path = "../../crates/tailfeather", features = ["peer-names"] }
+tailfeather = { path = "../../crates/tailfeather", features = ["peer-names", "alloc"] }
 heapless = "0.9"
 embedded-io-async = "0.7"
 

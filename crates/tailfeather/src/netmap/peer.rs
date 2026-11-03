@@ -4,6 +4,7 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use core::str::FromStr;
 
 use crate::keys::{DiscoPublic, NodePublic};
+use wirefeather::peer_vec::PeerVec;
 
 use crate::netmap::{
     CapacityError, Error, MAX_ADDRESSES, MAX_ALLOWED_IPS, MAX_ENDPOINTS, MAX_PEERS,
@@ -105,6 +106,12 @@ impl Peer {
         }
     }
 
+    /// Which peers a full table keeps: online before offline, then the
+    /// lowest node id. Unique per peer, and independent of server order.
+    pub(crate) fn retention_rank(&self) -> (bool, core::cmp::Reverse<u64>) {
+        (self.online(), core::cmp::Reverse(self.id))
+    }
+
     pub fn online(&self) -> bool {
         self.state_flags & 1 != 0
     }
@@ -166,9 +173,12 @@ impl Peer {
 ///
 /// Keyed by node id rather than by key: a peer that rotates its node key is the
 /// same peer, and a table keyed by key would grow a duplicate every rotation.
+///
+/// With the `alloc` feature the table grows on the heap up to `N`, which may
+/// be [`crate::UNBOUNDED`]; without it all `N` entries are reserved inline.
 #[derive(Clone)]
 pub struct PeerTable<const N: usize = MAX_PEERS> {
-    peers: heapless::Vec<Peer, N>,
+    peers: PeerVec<Peer, N>,
 }
 
 impl<const N: usize> Default for PeerTable<N> {
@@ -180,7 +190,7 @@ impl<const N: usize> Default for PeerTable<N> {
 impl<const N: usize> PeerTable<N> {
     pub const fn new() -> Self {
         Self {
-            peers: heapless::Vec::new(),
+            peers: PeerVec::new(),
         }
     }
 
@@ -196,13 +206,34 @@ impl<const N: usize> PeerTable<N> {
         self.peers.iter()
     }
 
-    pub(crate) fn copy_from(&mut self, source: &Self) {
+    /// Replace this table with a copy of `source`. Returns `false` if the
+    /// copy is incomplete because a heap-backed table could not grow.
+    pub(crate) fn copy_from(&mut self, source: &Self) -> bool {
         self.peers.clear();
-        for peer in source.iter() {
-            self.peers
-                .push(peer.clone())
-                .expect("equal peer capacities");
+        if self.peers.try_reserve_total(source.len())
+            && source
+                .iter()
+                .all(|peer| self.peers.push(peer.clone()).is_ok())
+        {
+            return true;
         }
+        // Memory ran out part way. Keep the highest-ranked peers that fit, as
+        // a full table would, rather than an arbitrary prefix. Selecting
+        // without an index buffer is quadratic, but needs no allocation and
+        // runs only under memory pressure.
+        self.peers.clear();
+        let mut below = None;
+        while let Some(peer) = source
+            .iter()
+            .filter(|peer| below.is_none_or(|rank| peer.retention_rank() < rank))
+            .max_by_key(|peer| peer.retention_rank())
+        {
+            below = Some(peer.retention_rank());
+            if self.peers.push(peer.clone()).is_err() {
+                break;
+            }
+        }
+        false
     }
 
     pub fn get(&self, id: u64) -> Option<&Peer> {
@@ -233,7 +264,8 @@ impl<const N: usize> PeerTable<N> {
     }
 
     pub fn remove(&mut self, id: u64) -> bool {
-        match self.peers.iter().position(|p| p.id == id) {
+        let index = self.peers.iter().position(|p| p.id == id);
+        match index {
             Some(index) => {
                 self.peers.swap_remove(index);
                 true

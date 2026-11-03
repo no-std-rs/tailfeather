@@ -51,3 +51,6 @@ pub use node::{
     Transport,
 };
 pub use wirefeather as tunnel;
+/// A `PEERS` bound with no limit: tables grow while memory allows. Requires
+/// the `alloc` feature.
+pub use wirefeather::peer_vec::UNBOUNDED;
