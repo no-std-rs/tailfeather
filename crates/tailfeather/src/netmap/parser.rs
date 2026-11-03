@@ -1339,9 +1339,13 @@ impl State {
                     .oversized
                     .get_or_insert(CapacityError::AllowedIps);
             }
-            // A relay field that did not fit (its certificate name, say)
-            // cannot be replaced by a guess; drop that relay.
-            Context::DerpNode => self.region.node_flags |= 4,
+            // A relay name that did not fit cannot be replaced by a guess
+            // (verifying against the host name instead of the certificate
+            // name would accept a certificate control did not name); drop
+            // that relay. Unknown relay fields stay ignored.
+            Context::DerpNode if matches!(self.key.as_str(), "HostName" | "CertName") => {
+                self.region.node_flags |= 4;
+            }
             // Anything else is unread, advisory, or only shortens what the
             // node knows (a peer without a parseable key is not retained).
             _ => {}

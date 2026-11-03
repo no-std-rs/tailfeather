@@ -137,7 +137,33 @@ pub struct SshSession {
     /// clone gets a guaranteed slot), so cloning per call would let input
     /// queue without bound while the remote is not reading.
     input: core::cell::RefCell<mpsc::Sender<Input>>,
+    /// Forwarding opens not yet answered. Each holds a sender clone (and so a
+    /// guaranteed queue slot) while it waits, so their number is capped.
+    pending_forwards: std::rc::Rc<core::cell::Cell<usize>>,
     abort: AbortHandle,
+}
+
+/// Forwarding opens one session may have waiting for an answer at once.
+const MAX_PENDING_FORWARDS: usize = 32;
+
+/// Counts one pending forwarding open until dropped.
+struct PendingForward(std::rc::Rc<core::cell::Cell<usize>>);
+
+impl PendingForward {
+    fn start(count: &std::rc::Rc<core::cell::Cell<usize>>) -> Option<Self> {
+        let pending = count.get();
+        if pending >= MAX_PENDING_FORWARDS {
+            return None;
+        }
+        count.set(pending + 1);
+        Some(Self(count.clone()))
+    }
+}
+
+impl Drop for PendingForward {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 #[wasm_bindgen]
@@ -153,9 +179,11 @@ impl SshSession {
         closed: js_sys::Function,
     ) -> Result<crate::forwarding::SshForwardPipe, JsError> {
         use futures::SinkExt;
+        let _pending = PendingForward::start(&self.pending_forwards)
+            .ok_or_else(|| JsError::new("too many forwarding requests are pending"))?;
         let (request, pipe, ready) = crate::forwarding::request(host, port, write, eof, closed)?;
-        // Forward requests are rare and each waits for its answer, so a
-        // clone (one guaranteed slot per pending request) stays bounded.
+        // A clone holds one guaranteed queue slot while it waits; the cap
+        // above bounds how many can exist.
         let mut input = self.input.borrow().clone();
         input
             .send(Input::Forward(request))
@@ -224,6 +252,7 @@ pub fn start(options: SshOptions, callbacks: SshCallbacks) -> SshSession {
     });
     SshSession {
         input: core::cell::RefCell::new(sender),
+        pending_forwards: std::rc::Rc::new(core::cell::Cell::new(0)),
         abort,
     }
 }

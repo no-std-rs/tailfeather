@@ -1304,3 +1304,19 @@ fn evicted_regions_release_their_certificate_names() {
         "derp5.example"
     );
 }
+
+#[test]
+fn an_oversized_unknown_relay_field_keeps_the_relay() {
+    let blob = "z".repeat(10 * 1024);
+    let document = format!(
+        r#"{{"DERPMap":{{"Regions":{{"9":{{"RegionID":9,"RegionCode":"r9","Nodes":[{{"Name":"n","RegionID":9,"HostName":"derp9.example","FutureMetadata":"{blob}","DERPPort":443}},{{"Name":"m","RegionID":9,"HostName":"derp9b.example","CertName":"{blob}","DERPPort":443}}]}}}}}}}}"#
+    );
+    let mut netmap = Netmap::<32>::new();
+    let mut parser = Parser::<32>::new();
+    parser.push(&mut netmap, document.as_bytes()).unwrap();
+    parser.finish(&mut netmap).unwrap();
+    let region = netmap.derp.region(9).unwrap();
+    // The unknown field is ignored; the unverifiable relay is dropped.
+    assert_eq!(region.nodes.len(), 1);
+    assert_eq!(region.nodes[0].host_name.as_str(), "derp9.example");
+}

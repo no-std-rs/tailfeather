@@ -7,8 +7,9 @@
 //! `N`, or [`UNBOUNDED`], and pay only for the peers it actually has.
 //!
 //! Either way a push that does not fit is refused rather than aborting: with
-//! `alloc`, running out of memory is reported exactly like reaching `N`, so
-//! callers keep one bounded-capacity code path.
+//! `alloc`, running out of memory (for the table or for the element itself)
+//! is reported exactly like reaching `N`, so callers keep one
+//! bounded-capacity code path.
 
 use core::borrow::{Borrow, BorrowMut};
 use core::ops::{Index, IndexMut};
@@ -20,11 +21,43 @@ pub const UNBOUNDED: usize = usize::MAX;
 
 #[cfg(not(feature = "alloc"))]
 type Slot<T> = T;
-/// Each element is boxed so that it never moves once stored: growing the
-/// vector or removing an element moves only pointers, never leaving copies of
-/// session keys behind in freed memory.
+
+/// Each element lives in its own allocation so that it never moves once
+/// stored: growing the vector or removing an element moves only handles,
+/// never leaving copies of session keys behind in freed memory.
+///
+/// A one-element `Vec` rather than a `Box`, because stable Rust can allocate
+/// a `Vec` fallibly (`try_reserve_exact`) but not a `Box`. It never grows past
+/// its single element, so it never reallocates either.
 #[cfg(feature = "alloc")]
-type Slot<T> = alloc::boxed::Box<T>;
+#[derive(Clone)]
+struct Slot<T>(alloc::vec::Vec<T>);
+
+#[cfg(feature = "alloc")]
+impl<T> Slot<T> {
+    fn try_new(value: T) -> Result<Self, T> {
+        let mut storage = alloc::vec::Vec::new();
+        if storage.try_reserve_exact(1).is_err() {
+            return Err(value);
+        }
+        storage.push(value);
+        Ok(Self(storage))
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T> Borrow<T> for Slot<T> {
+    fn borrow(&self) -> &T {
+        &self.0[0]
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T> BorrowMut<T> for Slot<T> {
+    fn borrow_mut(&mut self) -> &mut T {
+        &mut self.0[0]
+    }
+}
 
 /// A vector of at most `N` elements. See the [module documentation](self).
 #[derive(Clone)]
@@ -74,9 +107,7 @@ impl<T, const N: usize> PeerVec<T, N> {
             if self.inner.len() >= N || self.inner.try_reserve(1).is_err() {
                 return Err(value);
             }
-            // `Box::new` still aborts if this one element cannot be
-            // allocated; stable Rust has no fallible box allocation.
-            self.inner.push(alloc::boxed::Box::new(value));
+            self.inner.push(Slot::try_new(value)?);
             Ok(())
         }
     }
@@ -159,9 +190,8 @@ impl<T, const N: usize> PeerVec<T, N> {
     }
 
     #[cfg(feature = "alloc")]
-    #[allow(clippy::boxed_local)] // Unboxing is the point.
-    fn unslot(slot: Slot<T>) -> T {
-        *slot
+    fn unslot(mut slot: Slot<T>) -> T {
+        slot.0.pop().expect("a slot holds exactly one element")
     }
 }
 
