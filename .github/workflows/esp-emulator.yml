@@ -2,7 +2,6 @@ name: ESP32-C6 emulator
 
 on:
   pull_request:
-    paths: ['firmware/**', 'crates/tailfeather/**', 'crates/tailfeather-gateway/**', 'crates/wirefeather/**', 'bazel/**', 'platforms/**', 'MODULE.bazel*', 'Cargo.*', 'BUILD.bazel', '.bazel*', 'scripts/esp-emulator-smoke.py', '.github/workflows/esp-emulator.yml']
   push:
     branches: [main]
     paths: ['firmware/**', 'crates/tailfeather/**', 'crates/tailfeather-gateway/**', 'crates/wirefeather/**', 'bazel/**', 'platforms/**', 'MODULE.bazel*', 'Cargo.*', 'BUILD.bazel', '.bazel*', 'scripts/esp-emulator-smoke.py', '.github/workflows/esp-emulator.yml']
@@ -16,8 +15,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.files.outputs.relevant }}
+    steps:
+      # Path filtering happens here rather than in `on:` so that a pull
+      # request touching nothing relevant skips the jobs below, which
+      # satisfies required checks, instead of never starting them, which
+      # leaves required checks pending forever.
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Run under `bash -e`: a failed API call (including a later page)
+          # fails this job, which fails the summary check, rather than
+          # reading as "nothing relevant changed".
+          relevant=true
+          if [ "$EVENT" = pull_request ]; then
+            count=$(gh api "repos/$REPO/pulls/$PR" --jq .changed_files)
+            # The files endpoint stops at 3000; past that, assume relevant.
+            if [ "$count" -lt 3000 ]; then
+              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
+              if ! grep -Eq '^(firmware/|crates/tailfeather/|crates/tailfeather-gateway/|crates/wirefeather/|bazel/|platforms/|MODULE\.bazel[^/]*$|Cargo\.[^/]*$|BUILD\.bazel$|\.bazel[^/]*$|scripts/esp-emulator-smoke\.py$|\.github/workflows/esp-emulator\.yml$)' <<<"$files"; then
+                relevant=false
+              fi
+            fi
+          fi
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
   firmware-smoke:
     name: ESP32-C6 firmware smoke
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -53,3 +89,17 @@ jobs:
           path: ${{ runner.temp }}/esp-emulator-logs/
           if-no-files-found: ignore
           retention-days: 7
+  # The check to require. Skipped jobs pass required checks, so a failed
+  # `changes` job must surface here rather than skip the smoke test.
+  result:
+    name: ESP32-C6 emulator
+    needs: [changes, firmware-smoke]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            case "$result" in success|skipped) ;; *) echo "an emulator job ended: $result"; exit 1;; esac
+          done

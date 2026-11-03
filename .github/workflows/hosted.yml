@@ -1,14 +1,50 @@
 name: Hosted runtime
 on:
   pull_request:
-    paths: ['hosted/**', 'crates/tailfeather-reactor/**', 'crates/tailfeather/**', 'crates/wirefeather/**', '.github/workflows/hosted.yml']
   push:
     branches: [main]
     paths: ['hosted/**', 'crates/tailfeather-reactor/**', 'crates/tailfeather/**', 'crates/wirefeather/**', '.github/workflows/hosted.yml']
 permissions:
   contents: read
 jobs:
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.files.outputs.relevant }}
+    steps:
+      # Path filtering happens here rather than in `on:` so that a pull
+      # request touching nothing relevant skips the jobs below, which
+      # satisfies required checks, instead of never starting them, which
+      # leaves required checks pending forever.
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Run under `bash -e`: a failed API call (including a later page)
+          # fails this job, which fails the summary check, rather than
+          # reading as "nothing relevant changed".
+          relevant=true
+          if [ "$EVENT" = pull_request ]; then
+            count=$(gh api "repos/$REPO/pulls/$PR" --jq .changed_files)
+            # The files endpoint stops at 3000; past that, assume relevant.
+            if [ "$count" -lt 3000 ]; then
+              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
+              if ! grep -Eq '^(hosted/|crates/tailfeather-reactor/|crates/tailfeather/|crates/wirefeather/|\.github/workflows/hosted\.yml$)' <<<"$files"; then
+                relevant=false
+              fi
+            fi
+          fi
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
   native:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +85,8 @@ jobs:
           TAILFEATHER_FIXTURE_RUNTIME: reactor-owned
         run: python3 hosted/tools/test-headscale.py
   embassy:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -64,3 +102,18 @@ jobs:
       - run: cargo fmt --manifest-path crates/tailfeather-reactor/probe/Cargo.toml --check
       - name: Full Embassy executor task without a global allocator
         run: cargo build --manifest-path crates/tailfeather-reactor/probe/Cargo.toml --locked --features accelerated-crypto --target riscv32imac-unknown-none-elf
+  # The one check to require: a skipped matrix job reports a single
+  # unexpanded check, so the per-OS names cannot be required directly, and
+  # a failed `changes` job must surface here rather than skip the tests.
+  result:
+    name: Hosted runtime
+    needs: [changes, native, embassy]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            case "$result" in success|skipped) ;; *) echo "a hosted job ended: $result"; exit 1;; esac
+          done

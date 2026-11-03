@@ -1,8 +1,9 @@
 name: Privileged lab
 
+# Runs only for release pull requests (Runnerless/release-please branches)
+# and on demand. Elsewhere the job is skipped, which a required check
+# accepts, so requiring it gates releases without blocking feature PRs.
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -16,6 +17,12 @@ concurrency:
 jobs:
   privileged-lab:
     name: Privileged lab
+    # Same-repository release branches only: a fork can name its branch
+    # anything.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.head_ref, 'release-please--'))
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
