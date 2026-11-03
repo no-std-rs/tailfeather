@@ -43,7 +43,7 @@ jobs:
             count=$(gh api "repos/$REPO/pulls/$PR" --jq .changed_files)
             # The files endpoint stops at 3000; past that, assume relevant.
             if [ "$count" -lt 3000 ]; then
-              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')
+              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
               if ! grep -Eq '^(firmware/|crates/tailfeather/|crates/tailfeather-gateway/|crates/wirefeather/|bazel/|platforms/|MODULE\.bazel[^/]*$|Cargo\.[^/]*$|BUILD\.bazel$|\.bazel[^/]*$|scripts/esp-emulator-smoke\.py$|\.github/workflows/esp-emulator\.yml$)' <<<"$files"; then
                 relevant=false
               fi

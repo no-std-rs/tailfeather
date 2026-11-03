@@ -35,7 +35,7 @@ jobs:
             count=$(gh api "repos/$REPO/pulls/$PR" --jq .changed_files)
             # The files endpoint stops at 3000; past that, assume relevant.
             if [ "$count" -lt 3000 ]; then
-              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')
+              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
               if ! grep -Eq '^(hosted/|crates/tailfeather-reactor/|crates/tailfeather/|crates/wirefeather/|\.github/workflows/hosted\.yml$)' <<<"$files"; then
                 relevant=false
               fi
