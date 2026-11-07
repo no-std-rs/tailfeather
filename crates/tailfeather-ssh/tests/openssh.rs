@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
@@ -36,7 +36,8 @@ impl Write for Stream {
 }
 
 struct Echo {
-    used: Arc<AtomicBool>,
+    /// Input bytes delivered to the console.
+    used: Arc<AtomicUsize>,
     revoke: bool,
     access: Arc<AtomicBool>,
     bulk: bool,
@@ -52,7 +53,7 @@ impl Console for Echo {
         Reply::exit(output.len(), 0)
     }
     fn input(&mut self, byte: u8, output: &mut [u8]) -> Reply {
-        self.used.store(true, Ordering::SeqCst);
+        self.used.fetch_add(1, Ordering::SeqCst);
         if self.revoke {
             self.access.store(false, Ordering::SeqCst);
         }
@@ -87,10 +88,10 @@ fn run(
     exec: bool,
     revoke: bool,
     bulk: bool,
-) -> (std::process::Output, bool, String) {
+) -> (std::process::Output, usize, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let used = Arc::new(AtomicBool::new(false));
+    let used = Arc::new(AtomicUsize::new(0));
     let server_used = used.clone();
     let worker = std::thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
@@ -198,6 +199,7 @@ fn run(
 #[test]
 fn openssh_none_auth_console_round_trip_with_real_policy() {
     let (result, used, server) = run("console", false, false, false);
+    let used = used > 0;
     assert!(
         result.status.success(),
         "{}; server={server}",
@@ -212,6 +214,7 @@ fn openssh_none_auth_console_round_trip_with_real_policy() {
 fn denied_user_and_exec_cannot_reach_the_console() {
     for (username, exec) in [("root", false), ("console", true)] {
         let (result, used, _) = run(username, exec, false, false);
+        let used = used > 0;
         assert!(!result.status.success());
         assert!(!used);
         assert!(result.stdout.is_empty());
@@ -221,7 +224,9 @@ fn denied_user_and_exec_cannot_reach_the_console() {
 #[test]
 fn revoked_access_prevents_further_output() {
     let (result, used, server) = run("console", false, true, false);
-    assert!(used);
+    // The first byte revokes access; the rest of "hello\n" must not reach
+    // the console even when it arrived in the same chunk.
+    assert_eq!(used, 1);
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
     assert!(server.contains("AccessRevoked"), "{server}");

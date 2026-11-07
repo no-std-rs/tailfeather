@@ -36,7 +36,7 @@ stage() {
 }
 
 diagnostics() {
-    status=$?
+    status=${1:-$?}
     trap - EXIT
     echo "--- guest capability state ---" >&2
     uname -a >&2 || true
@@ -237,5 +237,4 @@ if grep -q ' FAIL' "$RESULTS"; then diagnostics_status=1; fi
 # The matrix report (its table, then the logs of any failing run) is the
 # evidence a reviewer wants whether it passed or not.
 if test -f "$STATE/nat-matrix.log"; then sed -n '/^== NAT matrix/,$p' "$STATE/nat-matrix.log" | head -n 600; fi
-(exit "$diagnostics_status")
-diagnostics
+diagnostics "$diagnostics_status"

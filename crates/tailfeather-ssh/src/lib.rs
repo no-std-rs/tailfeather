@@ -235,8 +235,9 @@ impl Drop for Wipe<'_> {
 /// Receive credit for the rest of the chunk's grant may still be
 /// outstanding, so the wait for send credit stashes arriving input behind
 /// `input[..*pending]`; a grant never exceeds `input.len()`, so it fits.
-/// Authorization is checked before the console runs and before every
-/// message leaves, so no output follows a revocation. One credit wait and
+/// Authorization is checked immediately before every console callback (after
+/// any credit wait) and before every message leaves, so a revoked session
+/// neither delivers input nor sends output. One credit wait and
 /// one send site keep the state machine (and firmware) small.
 #[cfg(feature = "chunked-input")]
 #[allow(clippy::too_many_arguments)]
@@ -254,9 +255,6 @@ async fn feed<T: zssh::Behavior, A: Authorizer, C: Console>(
     // Reply bytes in `output` not yet copied into a message.
     let (mut copied, mut written) = (0, 0);
     loop {
-        if !access.allows(username) {
-            return Err(Error::AccessRevoked);
-        }
         let (mut writer, stashed) = channel.stdout_stashing(&mut input[*pending..]).await?;
         *pending += stashed;
         let mut used = 0;
@@ -264,6 +262,10 @@ async fn feed<T: zssh::Behavior, A: Authorizer, C: Console>(
             if copied == written {
                 if status.is_some() || (!open && next == *pending) {
                     break;
+                }
+                // After any credit wait: no byte reaches a revoked session.
+                if !access.allows(username) {
+                    return Err(Error::AccessRevoked);
                 }
                 let reply = if open {
                     open = false;

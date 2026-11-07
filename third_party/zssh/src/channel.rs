@@ -79,26 +79,30 @@ impl<'a, 'b, T: Behavior> Channel<'a, 'b, T> {
     /// write between reads while credit is still outstanding. Unlike
     /// [`Channel::read_exact_stdin`] this returns as soon as any data arrives.
     pub async fn read_stdin(&mut self, bytes: &mut [u8]) -> Result<usize, TransportError<T>> {
-        match self.transport.channel_rx_window() {
-            None => return Ok(0),
-            Some(0) => {
-                self.transport
-                    .channel_adjust(Some(into_u32(bytes.len())))
-                    .await?
+        loop {
+            match self.transport.channel_rx_window() {
+                None => return Ok(0),
+                Some(0) => {
+                    self.transport
+                        .channel_adjust(Some(into_u32(bytes.len())))
+                        .await?
+                }
+                Some(_) => {}
             }
-            Some(_) => {}
-        }
-        match self.transport.channel_read().await? {
-            Some(read) => {
-                // Only a caller shrinking `bytes` below an earlier grant can
-                // receive more than fits; refuse rather than drop data.
-                let dest = bytes
-                    .get_mut(..read.len())
-                    .ok_or(crate::ProtocolError::BufferExhausted)?;
-                dest.copy_from_slice(read);
-                Ok(read.len())
+            match self.transport.channel_read().await? {
+                // An empty data packet is not EOF; keep reading.
+                Some([]) => {}
+                Some(read) => {
+                    // Only a caller shrinking `bytes` below an earlier grant can
+                    // receive more than fits; refuse rather than drop data.
+                    let dest = bytes
+                        .get_mut(..read.len())
+                        .ok_or(crate::ProtocolError::BufferExhausted)?;
+                    dest.copy_from_slice(read);
+                    return Ok(read.len());
+                }
+                None => return Ok(0),
             }
-            None => Ok(0),
         }
     }
 

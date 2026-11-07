@@ -484,3 +484,19 @@ fn chunked_reads_return_each_packet_and_regrant_only_when_spent() {
     }
     assert_eq!(grants, [4, 4]);
 }
+
+#[test]
+fn chunked_reads_skip_empty_data_packets() {
+    let mut buffer = [0; 1024];
+    let data = |bytes: &'static [u8]| wire::Message::ChannelData {
+        recipient_channel: 0,
+        data: wire::Data::Borrowed { bytes },
+    };
+    let mut transport = authenticated(&mut buffer, &[data(b""), data(b"ab")]);
+    active(&mut transport, 0);
+    let mut chunk = [0; 4];
+    let mut channel = Channel::new(&mut transport);
+    // Zero is reserved for EOF: the empty packet must not end the input.
+    assert_eq!(blocking(channel.read_stdin(&mut chunk)).unwrap(), 2);
+    assert_eq!(&chunk[..2], b"ab");
+}

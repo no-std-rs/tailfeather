@@ -47,7 +47,7 @@ jobs:
             # The files endpoint stops at 3000; past that, assume relevant.
             if [ "$count" -lt 3000 ]; then
               files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
-              if ! grep -Eq '^(crates/tailfeather/|crates/tailfeather-reactor/|crates/tailfeather-ssh/|crates/wirefeather/|third_party/zssh/|scripts/BUILD\.bazel$|tests/lab/|MODULE\.bazel$|\.github/workflows/nat-matrix\.yml$)' <<<"$files"; then
+              if ! grep -Eq '^(crates/tailfeather/|crates/tailfeather-reactor/|crates/tailfeather-ssh/|crates/wirefeather/|third_party/smoltcp/|third_party/zssh/|scripts/BUILD\.bazel$|tests/lab/|MODULE\.bazel$|\.github/workflows/nat-matrix\.yml$)' <<<"$files"; then
                 relevant=false
               fi
             fi
