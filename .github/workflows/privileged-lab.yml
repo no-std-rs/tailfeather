@@ -1,10 +1,15 @@
 name: Privileged lab
 
-# Runs only for release pull requests (Runnerless/release-please branches)
-# and on demand. Elsewhere the job is skipped, which a required check
-# accepts, so requiring it gates releases without blocking feature PRs.
+# Runs for release pull requests (Runnerless/release-please branches), nightly
+# on main, and on demand. Elsewhere the job is skipped, which a required check
+# accepts, so requiring it gates releases without blocking feature PRs. The
+# nightly run finds a regression within a day of the commit that caused it
+# rather than at release time; the faster NAT matrix (nat-matrix.yml) runs on
+# every relevant pull request.
 on:
   pull_request:
+  schedule:
+    - cron: '41 2 * * *'
   workflow_dispatch:
 
 permissions:

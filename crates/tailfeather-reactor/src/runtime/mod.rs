@@ -244,6 +244,10 @@ pub struct Runtime<'a, P: Network, S: State, const PEERS: usize, const A: usize 
     candidate_generation: Cell<u64>,
     probe: RefCell<Option<Probe>>,
     probed: Signal<NoopRawMutex, ()>,
+    /// A direct peer fell back to DERP, so our public mapping may have
+    /// moved: the control session should re-sweep STUN early.
+    restun_requested: Cell<bool>,
+    restun: Signal<NoopRawMutex, ()>,
     last_timestamp: Cell<[u8; 12]>,
     reserved_timestamp: Cell<[u8; 12]>,
     running: Cell<bool>,
@@ -326,6 +330,8 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             candidate_generation: Cell::new(0),
             probe: RefCell::new(None),
             probed: Signal::new(),
+            restun_requested: Cell::new(false),
+            restun: Signal::new(),
             last_timestamp: Cell::new(floor),
             reserved_timestamp: Cell::new(floor),
             running: Cell::new(false),
@@ -642,6 +648,10 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             let now = reactor.clock_millis();
             if now >= next_maintenance {
                 next_maintenance = now.saturating_add(100);
+                if self.node.borrow_mut().take_direct_path_lost() && !self.config.relay_only {
+                    self.restun_requested.set(true);
+                    self.restun.signal(());
+                }
                 if !self.config.relay_only {
                     if generation != self.candidate_generation.get() {
                         punches.clear();

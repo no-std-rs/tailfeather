@@ -1,0 +1,90 @@
+name: NAT matrix
+
+# Tailfeather against the official Tailscale client across every NAT topology,
+# mid-session event, bulk throughput and Tailscale SSH case in
+# tests/lab/nat-matrix.sh. It boots the same pinned smolVM as the privileged
+# lab but builds only the reactor node and the SSH console server, so it is fast
+# enough for every change to the networking crates, plus a nightly run that
+# catches regressions on main even when no pull request touched these paths.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nat-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.files.outputs.relevant }}
+    steps:
+      # Path filtering happens here rather than in `on:` so that a pull
+      # request touching nothing relevant skips the job below, which
+      # satisfies a required check, instead of never starting it.
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          relevant=true
+          if [ "$EVENT" = pull_request ]; then
+            count=$(gh api "repos/$REPO/pulls/$PR" --jq .changed_files)
+            # The files endpoint stops at 3000; past that, assume relevant.
+            if [ "$count" -lt 3000 ]; then
+              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
+              if ! grep -Eq '^(crates/tailfeather/|crates/tailfeather-reactor/|crates/tailfeather-ssh/|crates/wirefeather/|third_party/zssh/|scripts/BUILD\.bazel$|tests/lab/|MODULE\.bazel$|\.github/workflows/nat-matrix\.yml$)' <<<"$files"; then
+                relevant=false
+              fi
+            fi
+          fi
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+
+  nat-matrix:
+    name: NAT matrix
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: bazel-contrib/setup-bazel@8cb04a772ab4c1eb984e9c1b493a182e96c5e425 # 0.19.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+      - name: Enable KVM access on the disposable hosted VM
+        run: |
+          test -c /dev/kvm
+          test -c /dev/net/tun
+          sudo chmod a+rw /dev/kvm /dev/net/tun
+      # Optimized: a debug node adds ~10 ms of curve arithmetic per disco
+      # round trip, which the matrix rightly reports as a regression.
+      - name: Run the NAT matrix
+        run: >-
+          bazel test --config=local --config=optimized
+          --strategy=TestRunner=local --test_output=all
+          //:nat_matrix
+      - name: Retain matrix diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nat-matrix-logs
+          path: bazel-testlogs/tests/lab/nat_matrix/
+          if-no-files-found: ignore
+          retention-days: 7

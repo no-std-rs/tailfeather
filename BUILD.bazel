@@ -86,6 +86,7 @@ test_suite(
         "//crates/tailfeather-gateway:unit_test",
         "//crates/tailfeather-gateway:doc_test",
         "//crates/tailfeather-ssh:unit_test",
+        "//crates/tailfeather-ssh:unit_test_byte_input",
         "//crates/tailfeather-ssh:openssh_test",
         "//crates/tailfeather-ssh:live_server_test",
         "//crates/tailfeather-ssh:doc_test",
@@ -224,4 +225,9 @@ sh_test(
 test_suite(
     name = "privileged_lab",
     tests = ["//tests/lab:privileged_lab"],
+)
+
+test_suite(
+    name = "nat_matrix",
+    tests = ["//tests/lab:nat_matrix"],
 )

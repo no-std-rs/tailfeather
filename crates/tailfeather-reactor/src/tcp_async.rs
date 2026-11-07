@@ -21,6 +21,11 @@ use crate::{
 
 /// Cancellation-safe ingress and backpressured egress for complete inner IPv4 packets.
 /// Implementations authenticate and authorize ingress before returning it here.
+/// Packets the TCP driver moves per wakeup in either direction before
+/// yielding: one burst becomes one batched send, so a larger burst means
+/// fewer system calls, while the bound keeps other actors responsive.
+const BURST: usize = 32;
+
 pub trait PacketIo {
     type Error;
     async fn receive(&self, packet: &mut [u8]) -> Result<usize, Self::Error>;
@@ -132,12 +137,12 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> Tcp<'a, N, Q, B> {
         }
         let _guard = Guard(self);
         let transmit = async {
-            let mut burst = heapless::Vec::<crate::tcp::Packet, 8>::new();
+            let mut burst = heapless::Vec::<crate::tcp::Packet, BURST>::new();
             loop {
                 let now = reactor.clock_millis();
                 self.now.set(now);
                 self.stack.borrow_mut().poll_stack(now);
-                for _ in 0..8 {
+                for _ in 0..BURST {
                     let Some(packet) = self.stack.borrow_mut().take_transmit() else {
                         break;
                     };
@@ -181,7 +186,7 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> Tcp<'a, N, Q, B> {
                     self.changed.signal(());
                 }
                 budget += 1;
-                if budget == 8 {
+                if budget == BURST {
                     budget = 0;
                     crate::exec::yield_now().await;
                 }

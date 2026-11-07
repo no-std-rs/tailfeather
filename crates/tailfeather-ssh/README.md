@@ -28,9 +28,15 @@ are discarded by the engine and never reach the application.
   Key operations trade some speed for flash size. Other node consumers retain
   their previous default via `fast-curve25519`; Cargo feature unification may
   re-enable the tables if the application requests that feature elsewhere.
-- A one-byte receive window permits alternating input/output with a single
-  packet buffer. This sacrifices throughput, especially for pasted text over
-  a high-latency path. Console line editing and echo belong to the application.
+- Input is granted 256 bytes (`INPUT_CHUNK`) of receive window at a time and
+  copied out of the packet buffer before replies reuse it. The console's
+  replies to a chunk leave in as few SSH messages as credit allows, and input
+  arriving while a reply waits for send credit is kept, not dropped. Pasted
+  text moves one chunk per round trip (about 240 KB/s at 1 ms; previously one
+  byte per round trip). This is the default `chunked-input` feature; with
+  `default-features = false` the console reads one byte per round trip,
+  which saves about 0.7 KiB of code and 256 bytes of session future. Console
+  line editing and echo belong to the application.
 - The 4 KiB packet limit deliberately omits SSH's general 32 KiB packet guarantee.
   Oversized client packets disconnect. OpenSSH's default handshake is covered
   by the interoperability test.
@@ -46,7 +52,7 @@ With Rust 1.95.0 on x86-64 Linux, the optimized host memory probe reports:
 
 | Storage | Bytes |
 | --- | ---: |
-| SSH session future (probe I/O adapter) | 3,376 |
+| SSH session future (probe I/O adapter) | 3,936 |
 | Shared SSH packet | 4,096 |
 | Suggested console response | 256 |
 | Retained SSH policy | 1,552 |
@@ -54,10 +60,10 @@ With Rust 1.95.0 on x86-64 Linux, the optimized host memory probe reports:
 | Small TCP storage, including socket metadata | 4,928 |
 
 The separate `probe:no_std_probe` fixture links without `std`, libc, or an
-allocator. Its optimized x86-64 code and read-only data are 130,384 bytes, with
-173 bytes of initialized data. This measures the SSH console fixture, excluding
+allocator. Its optimized x86-64 code and read-only data are 131,352 bytes, with
+173 bytes of initialized data (about 0.7 KiB less without `chunked-input`). This measures the SSH console fixture, excluding
 the Tailscale node, TCP stack, and application-specific policy/console code; it
-is not an ESP32 flash measurement. Its 128 KiB code/data budget and allocator
+is not an ESP32 flash measurement. Its 132 KiB code/data budget and allocator
 absence are checked with:
 
 ```sh

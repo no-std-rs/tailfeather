@@ -6,7 +6,8 @@ runfile() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$PWD" "$
 
 ROOTFS="" SMOLVM="" LIBKRUNFW="" GUEST="" HEADSCALE="" TAILSCALE="" TAILSCALED=""
 CONFORMANCE="" HARNESS="" RESPONDER="" INTEROP="" NOSTD_INTEROP="" EXPECTATIONS="" VECTORS=""
-HEADSCALE_CONFIG="" SSH_SERVER="" SSH_NETWORK="" REACTOR_NODE="" REACTOR_REBIND=""
+HEADSCALE_CONFIG="" SSH_SERVER="" SSH_NETWORK="" REACTOR_NODE="" REACTOR_REBIND="" NAT_MATRIX=""
+STAGES=all
 APKS=()
 for arg in "$@"; do
     case "$arg" in
@@ -29,16 +30,26 @@ for arg in "$@"; do
         --reactor-node=*) REACTOR_NODE=$(runfile "${arg#*=}") ;;
         --reactor-rebind=*) REACTOR_REBIND=$(runfile "${arg#*=}") ;;
         --headscale-config=*) HEADSCALE_CONFIG=$(runfile "${arg#*=}") ;;
+        --nat-matrix=*) NAT_MATRIX=$(runfile "${arg#*=}") ;;
+        --stages=*) STAGES=${arg#*=} ;;
         --apk=*) APKS+=("$(runfile "${arg#*=}")") ;;
         *) fail "unknown argument: $arg" ;;
     esac
 done
 
 for input in "$ROOTFS" "$SMOLVM" "$LIBKRUNFW" "$GUEST" "$HEADSCALE" "$TAILSCALE" "$TAILSCALED" \
-    "$CONFORMANCE" "$HARNESS" "$RESPONDER" "$INTEROP" "$NOSTD_INTEROP" "$EXPECTATIONS" "$VECTORS" \
-    "$HEADSCALE_CONFIG" "$SSH_SERVER" "$SSH_NETWORK" "$REACTOR_NODE" "$REACTOR_REBIND"; do
+    "$HEADSCALE_CONFIG"; do
     test -r "$input" || fail "missing runfile: $input"
 done
+# Stage inputs are optional so a focused target (one --stages subset) need not
+# build the rest of the lab. The full lab passes them all, and a stage whose
+# input was not staged fails inside the guest rather than being skipped.
+if test "$STAGES" = all; then
+    for input in "$CONFORMANCE" "$HARNESS" "$RESPONDER" "$INTEROP" "$NOSTD_INTEROP" "$EXPECTATIONS" \
+        "$VECTORS" "$SSH_SERVER" "$SSH_NETWORK" "$REACTOR_NODE" "$REACTOR_REBIND" "$NAT_MATRIX"; do
+        test -r "$input" || fail "missing runfile: $input"
+    done
+fi
 test -r /dev/kvm && test -w /dev/kvm || fail "/dev/kvm is unavailable"
 test -c /dev/net/tun || fail "/dev/net/tun is unavailable on the KVM worker"
 command -v flock >/dev/null || fail "flock is unavailable"
@@ -71,23 +82,25 @@ for apk in "${APKS[@]}"; do
     tar --warning=no-unknown-keyword --ignore-zeros -xzf "$apk" -C "$GUEST_ROOT" --exclude='.SIGN.*' --exclude='.PKGINFO'
 done
 
-cp "$GUEST" "$GUEST_ROOT/opt/lab/guest-controller.sh"
-cp "$HEADSCALE" "$GUEST_ROOT/opt/lab/headscale"
-cp "$TAILSCALE" "$GUEST_ROOT/opt/lab/tailscale"
-cp "$TAILSCALED" "$GUEST_ROOT/opt/lab/tailscaled"
-cp "$CONFORMANCE" "$GUEST_ROOT/opt/lab/conformance"
-cp "$HARNESS" "$GUEST_ROOT/opt/lab/harness"
-cp "$SSH_SERVER" "$GUEST_ROOT/opt/lab/ssh-server"
-cp "$SSH_NETWORK" "$GUEST_ROOT/opt/lab/ssh-network.sh"
-cp "$REACTOR_NODE" "$GUEST_ROOT/opt/lab/reactor-node"
-cp "$REACTOR_REBIND" "$GUEST_ROOT/opt/lab/reactor-rebind.sh"
-cp "$RESPONDER" "$GUEST_ROOT/opt/lab/responder"
-cp "$INTEROP" "$GUEST_ROOT/opt/lab/interop-wireguard.sh"
-cp "$NOSTD_INTEROP" "$GUEST_ROOT/opt/lab/nostd-interop.sh"
-cp "$EXPECTATIONS" "$GUEST_ROOT/opt/lab/lab.json"
-cp "$HEADSCALE_CONFIG" "$GUEST_ROOT/opt/lab/headscale.yaml"
-cp -RL "$(dirname "$VECTORS")"/. "$GUEST_ROOT/opt/lab/vectors/"
-chmod 755 "$GUEST_ROOT"/opt/lab/{guest-controller.sh,headscale,tailscale,tailscaled,conformance,harness,responder,interop-wireguard.sh,nostd-interop.sh,ssh-server,ssh-network.sh,reactor-node,reactor-rebind.sh}
+stage_input() { test -z "$1" || cp "$1" "$GUEST_ROOT/opt/lab/$2"; }
+stage_input "$GUEST" guest-controller.sh
+stage_input "$HEADSCALE" headscale
+stage_input "$TAILSCALE" tailscale
+stage_input "$TAILSCALED" tailscaled
+stage_input "$HEADSCALE_CONFIG" headscale.yaml
+stage_input "$CONFORMANCE" conformance
+stage_input "$HARNESS" harness
+stage_input "$SSH_SERVER" ssh-server
+stage_input "$SSH_NETWORK" ssh-network.sh
+stage_input "$REACTOR_NODE" reactor-node
+stage_input "$REACTOR_REBIND" reactor-rebind.sh
+stage_input "$NAT_MATRIX" nat-matrix.sh
+stage_input "$RESPONDER" responder
+stage_input "$INTEROP" interop-wireguard.sh
+stage_input "$NOSTD_INTEROP" nostd-interop.sh
+stage_input "$EXPECTATIONS" lab.json
+if test -n "$VECTORS"; then cp -RL "$(dirname "$VECTORS")"/. "$GUEST_ROOT/opt/lab/vectors/"; fi
+find "$GUEST_ROOT/opt/lab" -maxdepth 1 -type f -exec chmod 755 {} +
 
 SMOLVM_SOURCE=$(cd "$(dirname "$SMOLVM")" && pwd)
 SMOLVM_DIR="$WORK/smolvm"
@@ -125,10 +138,10 @@ SMOLVM_BOOT_DEBUG=1 \
 "$SMOLVM_DIR/smolvm" machine run \
     --image "$GUEST_ROOT" \
     --cpus 4 \
-    --mem 2048 \
+    --mem 6144 \
     --timeout 2400s \
     --no-init-cache \
-    -- /opt/lab/guest-controller.sh || status=$?
+    -- /opt/lab/guest-controller.sh "$STAGES" || status=$?
 
 if test "$status" -ne 0; then
     echo "--- smolVM diagnostics ---" >&2

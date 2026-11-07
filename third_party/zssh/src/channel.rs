@@ -71,11 +71,57 @@ impl<'a, 'b, T: Behavior> Channel<'a, 'b, T> {
         Ok(read_len - bytes.len())
     }
 
+    /// Reads the next channel data packet into `bytes`, returning its length,
+    /// or 0 at EOF.
+    ///
+    /// Window credit of `bytes.len()` is granted only once the previous grant
+    /// is used up, so a packet never exceeds `bytes`, and the caller may
+    /// write between reads while credit is still outstanding. Unlike
+    /// [`Channel::read_exact_stdin`] this returns as soon as any data arrives.
+    pub async fn read_stdin(&mut self, bytes: &mut [u8]) -> Result<usize, TransportError<T>> {
+        match self.transport.channel_rx_window() {
+            None => return Ok(0),
+            Some(0) => {
+                self.transport
+                    .channel_adjust(Some(into_u32(bytes.len())))
+                    .await?
+            }
+            Some(_) => {}
+        }
+        match self.transport.channel_read().await? {
+            Some(read) => {
+                // Only a caller shrinking `bytes` below an earlier grant can
+                // receive more than fits; refuse rather than drop data.
+                let dest = bytes
+                    .get_mut(..read.len())
+                    .ok_or(crate::ProtocolError::BufferExhausted)?;
+                dest.copy_from_slice(read);
+                Ok(read.len())
+            }
+            None => Ok(0),
+        }
+    }
+
     /// Obtains a writer over this channel for the specified pipe.
     /// Waits for positive window credit before any payload buffer is exposed.
     pub async fn writer(&mut self, pipe: Pipe) -> Result<Writer<'a, '_, T>, TransportError<T>> {
         self.transport.channel_write_window(1).await?;
         Ok(Writer::new(self.transport, pipe))
+    }
+
+    /// Obtains a standard-output writer while receive credit may still be
+    /// outstanding: channel data arriving while this waits for send credit
+    /// is appended to `stash`. Returns the writer and the stashed length.
+    /// `stash` must hold the receive credit still outstanding.
+    pub async fn stdout_stashing(
+        &mut self,
+        stash: &mut [u8],
+    ) -> Result<(Writer<'a, '_, T>, usize), TransportError<T>> {
+        let (_, stashed) = self
+            .transport
+            .channel_write_window_stashing(1, stash)
+            .await?;
+        Ok((Writer::new(self.transport, Pipe::Stdout), stashed))
     }
 
     /// Obtains a writer over this channel for standard output.
