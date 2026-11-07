@@ -84,6 +84,7 @@ impl embedded_io_async::Write for TcpStream {
 /// The data socket's kernel buffers, as wireguard-go sizes them. The default
 /// (about 200 KiB) holds only ~150 datagrams, so a burst from a fast peer is
 /// dropped before the runtime reads it and TCP inside the tunnel backs off.
+#[cfg(unix)]
 const SOCKET_BUFFER: usize = 7 << 20;
 
 /// Best effort: with CAP_NET_ADMIN the forced variants pass `rmem_max`;
