@@ -17,6 +17,10 @@ pub use tailfeather::netmap::ssh::{MAX_USERNAME, Policy};
 
 /// Shared incoming/outgoing SSH packet storage. Oversized packets disconnect.
 pub const PACKET_BUFFER: usize = 4096;
+/// Input bytes read per receive-window grant with the `chunked-input`
+/// feature. Larger chunks paste faster over long round trips; each byte of
+/// the chunk is part of the session future.
+pub const INPUT_CHUNK: usize = 256;
 /// Suggested application response buffer, separate from the shared packet.
 pub const CONSOLE_BUFFER: usize = 256;
 pub const PORT: u16 = 22;
@@ -223,6 +227,79 @@ impl Drop for Wipe<'_> {
     }
 }
 
+/// Run the console over `input[..*pending]` (or, with `open`, only its
+/// greeting) and send the replies, gathered into as few SSH messages as the
+/// packet buffer and window credit allow. Returns the exit status once the
+/// console asks to exit.
+///
+/// Receive credit for the rest of the chunk's grant may still be
+/// outstanding, so the wait for send credit stashes arriving input behind
+/// `input[..*pending]`; a grant never exceeds `input.len()`, so it fits.
+/// Authorization is checked immediately before every console callback (after
+/// any credit wait) and before every message leaves, so a revoked session
+/// neither delivers input nor sends output. One credit wait and
+/// one send site keep the state machine (and firmware) small.
+#[cfg(feature = "chunked-input")]
+#[allow(clippy::too_many_arguments)]
+async fn feed<T: zssh::Behavior, A: Authorizer, C: Console>(
+    channel: &mut zssh::Channel<'_, '_, T>,
+    input: &mut [u8; INPUT_CHUNK],
+    pending: &mut usize,
+    mut open: bool,
+    console: &mut C,
+    output: &mut [u8],
+    access: &A,
+    username: &str,
+) -> Result<Option<u32>, Error<<T::Stream as embedded_io_async::ErrorType>::Error>> {
+    let (mut next, mut status) = (0, None);
+    // Reply bytes in `output` not yet copied into a message.
+    let (mut copied, mut written) = (0, 0);
+    loop {
+        let (mut writer, stashed) = channel.stdout_stashing(&mut input[*pending..]).await?;
+        *pending += stashed;
+        let mut used = 0;
+        loop {
+            if copied == written {
+                if status.is_some() || (!open && next == *pending) {
+                    break;
+                }
+                // After any credit wait: no byte reaches a revoked session.
+                if !access.allows(username) {
+                    return Err(Error::AccessRevoked);
+                }
+                let reply = if open {
+                    open = false;
+                    console.open(output)
+                } else {
+                    next += 1;
+                    console.input(input[next - 1], output)
+                };
+                if reply.written > output.len() {
+                    return Err(Error::ConsoleOverflow);
+                }
+                (copied, written, status) = (0, reply.written, reply.exit_status);
+                continue;
+            }
+            let buffer = writer.buffer();
+            let len = (buffer.len() - used).min(written - copied);
+            if len == 0 {
+                break;
+            }
+            buffer[used..used + len].copy_from_slice(&output[copied..copied + len]);
+            (used, copied) = (used + len, copied + len);
+        }
+        if used > 0 {
+            if !access.allows(username) {
+                return Err(Error::AccessRevoked);
+            }
+            writer.write_all(used).await?;
+        }
+        if copied == written && (status.is_some() || next == *pending) {
+            return Ok(status);
+        }
+    }
+}
+
 async fn run<S: Read + Write, R: RngCore + CryptoRng, A: Authorizer, C: Console>(
     stream: S,
     random: &mut R,
@@ -244,36 +321,70 @@ async fn run<S: Read + Write, R: RngCore + CryptoRng, A: Authorizer, C: Console>
         channel.exit(1).await?;
     } else {
         let username = channel.user();
-        let mut first = true;
-        let status = loop {
-            if !access.allows(&username) {
-                return Err(Error::AccessRevoked);
+        #[cfg(feature = "chunked-input")]
+        let status = {
+            // Input arrives in chunks of at most INPUT_CHUNK bytes: the receive
+            // window is granted one chunk at a time, so each data packet is
+            // copied out of the shared packet buffer before replies reuse it.
+            let mut input = [0; INPUT_CHUNK];
+            let mut pending = 0;
+            let mut open = true;
+            loop {
+                if !open {
+                    pending = channel.read_stdin(&mut input).await?;
+                    if pending == 0 {
+                        break 0;
+                    }
+                }
+                let fed = feed(
+                    &mut channel,
+                    &mut input,
+                    &mut pending,
+                    open,
+                    console,
+                    output,
+                    access,
+                    &username,
+                );
+                open = false;
+                if let Some(status) = fed.await? {
+                    break status;
+                }
             }
-            let reply = if first {
-                first = false;
-                console.open(output)
-            } else {
-                // A one-byte receive window lets this single-buffer engine
-                // alternate input and output without retaining unread packets.
-                // This trades throughput for fixed memory and simple backpressure.
-                let mut byte = [0];
-                if channel.read_exact_stdin(&mut byte).await? == 0 {
-                    break 0;
+        };
+        // A one-byte receive window lets this single-buffer engine alternate
+        // input and output without retaining unread packets. This trades
+        // throughput for fixed memory and simple backpressure.
+        #[cfg(not(feature = "chunked-input"))]
+        let status = {
+            let mut first = true;
+            loop {
+                if !access.allows(&username) {
+                    return Err(Error::AccessRevoked);
+                }
+                let reply = if first {
+                    first = false;
+                    console.open(output)
+                } else {
+                    let mut byte = [0];
+                    if channel.read_exact_stdin(&mut byte).await? == 0 {
+                        break 0;
+                    }
+                    if !access.allows(&username) {
+                        return Err(Error::AccessRevoked);
+                    }
+                    console.input(byte[0], output)
+                };
+                if reply.written > output.len() {
+                    return Err(Error::ConsoleOverflow);
                 }
                 if !access.allows(&username) {
                     return Err(Error::AccessRevoked);
                 }
-                console.input(byte[0], output)
-            };
-            if reply.written > output.len() {
-                return Err(Error::ConsoleOverflow);
-            }
-            if !access.allows(&username) {
-                return Err(Error::AccessRevoked);
-            }
-            channel.write_all_stdout(&output[..reply.written]).await?;
-            if let Some(status) = reply.exit_status {
-                break status;
+                channel.write_all_stdout(&output[..reply.written]).await?;
+                if let Some(status) = reply.exit_status {
+                    break status;
+                }
             }
         };
         channel.exit(status).await?;

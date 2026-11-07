@@ -73,6 +73,9 @@ fn run<T>(
 ) -> io::Result<T> {
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let mut future = std::pin::pin!(future);
+    // Polled without a waker: spin briefly after each poll so a burst of
+    // relay frames flows at full speed, then sleep to stay idle-cheap.
+    let mut spins = 0;
     loop {
         if stop.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
@@ -86,7 +89,13 @@ fn run<T>(
         {
             return result;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        if spins < 200 {
+            spins += 1;
+            std::thread::yield_now();
+        } else {
+            spins = 0;
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 

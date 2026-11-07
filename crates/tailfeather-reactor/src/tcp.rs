@@ -255,14 +255,34 @@ impl<const N: usize, const BUFFER: usize> Default for Storage<'_, N, BUFFER> {
 
 enum Pool<'a, const N: usize> {
     Borrowed(Vec<tcp::Socket<'a>, N>),
+    /// Receive and send buffer bytes allocated per connection.
     #[cfg(feature = "alloc")]
-    Owned,
+    Owned(usize),
 }
+
+/// Default per-connection receive and send buffer of the heap-backed stack.
+/// It is also the largest window either direction can keep in flight:
+/// 4 MiB sustains about 1.6 Gbit/s at 20 ms of round trip. Buffers are
+/// zero-allocated, so the operating system commits pages only as a
+/// connection actually fills its window.
+#[cfg(feature = "alloc")]
+pub const OWNED_BUFFER: usize = 4 << 20;
 
 #[cfg(feature = "alloc")]
 impl<const N: usize, const Q: usize> NetStack<'static, N, Q, alloc::collections::VecDeque<Packet>> {
     pub fn new(id: u64) -> Self {
-        Self::build(id, SocketSet::new(alloc::vec::Vec::new()), Pool::Owned)
+        Self::with_buffer_size(id, OWNED_BUFFER)
+    }
+
+    /// Allocate `bytes` of receive and of send buffer per connection. Above
+    /// 64 KiB the stack negotiates TCP window scaling.
+    pub fn with_buffer_size(id: u64, bytes: usize) -> Self {
+        assert!(bytes > 0, "TCP buffers must be nonzero");
+        Self::build(
+            id,
+            SocketSet::new(alloc::vec::Vec::new()),
+            Pool::Owned(bytes),
+        )
     }
 }
 
@@ -313,9 +333,9 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
         let mut socket = match &mut self.pool {
             Pool::Borrowed(free) => free.pop().ok_or("TCP session capacity reached")?,
             #[cfg(feature = "alloc")]
-            Pool::Owned => tcp::Socket::new(
-                tcp::SocketBuffer::new(vec![0; 64 * 1024]),
-                tcp::SocketBuffer::new(vec![0; 64 * 1024]),
+            Pool::Owned(bytes) => tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0; *bytes]),
+                tcp::SocketBuffer::new(vec![0; *bytes]),
             ),
         };
         socket.set_nagle_enabled(false);
@@ -329,7 +349,7 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
                 let _ = free.push(socket);
             }
             #[cfg(feature = "alloc")]
-            Pool::Owned => {}
+            Pool::Owned(_) => {}
         }
     }
 

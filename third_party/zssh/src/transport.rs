@@ -289,6 +289,15 @@ impl<'a, T: Behavior> Transport<'a, T> {
         }
     }
 
+    /// Receive-window credit not yet used by the client, or `None` after EOF
+    /// or close.
+    pub(crate) fn channel_rx_window(&mut self) -> Option<u32> {
+        match self.channel_state().rx_half {
+            HalfState::Window(amount) => Some(amount),
+            HalfState::Eof | HalfState::Close => None,
+        }
+    }
+
     pub(crate) fn channel_is_eof(&mut self) -> bool {
         matches!(
             self.channel_state().rx_half,
@@ -390,16 +399,48 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
     // Backported from 0.5: polling may overwrite the shared packet buffer, so
     // callers must obtain a window before copying their application payload.
+    /// Waits for `capacity` bytes of send window. With no receive credit
+    /// outstanding the client cannot send channel data meanwhile; if it
+    /// does anyway, that is reported rather than silently discarded.
     pub(crate) async fn channel_write_window(
         &mut self,
         capacity: usize,
     ) -> Result<usize, TransportError<T>> {
+        let (window, _) = self
+            .channel_write_window_stashing(capacity, &mut [])
+            .await?;
+        Ok(window)
+    }
+
+    /// Like `channel_write_window`, but channel data that arrives while
+    /// waiting for send credit is copied into `stash` instead of being
+    /// dropped. Returns the send window and how many bytes were stashed.
+    /// Needed whenever receive credit is outstanding during a write.
+    pub(crate) async fn channel_write_window_stashing(
+        &mut self,
+        capacity: usize,
+        stash: &mut [u8],
+    ) -> Result<(usize, usize), TransportError<T>> {
+        let mut stashed = 0;
         loop {
             match self.channel_state().tx_half {
                 HalfState::Window(amount) if wire::from_u32(amount) < capacity => {
-                    self.poll_client().await?;
+                    if let Some(payload_len) = self.poll_client().await? {
+                        let wire::Message::ChannelData {
+                            data: wire::Data::Borrowed { bytes },
+                            ..
+                        } = wire::Message::decode(&self.buffer[self.payload_range(payload_len)])?
+                        else {
+                            unreachable!("expected channel data");
+                        };
+                        let dest = stash
+                            .get_mut(stashed..stashed + bytes.len())
+                            .ok_or(ProtocolError::BufferExhausted)?;
+                        dest.copy_from_slice(bytes);
+                        stashed += bytes.len();
+                    }
                 }
-                HalfState::Window(amount) => return Ok(wire::from_u32(amount)),
+                HalfState::Window(amount) => return Ok((wire::from_u32(amount), stashed)),
                 HalfState::Eof | HalfState::Close => return Err(Error::UnexpectedEof),
             }
         }

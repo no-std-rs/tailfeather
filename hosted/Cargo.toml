@@ -36,3 +36,7 @@ strip = true
 tokio = { version = "1", features = ["test-util"] }
 serde_json = "1"
 tracing-subscriber = "0.3"
+
+[patch.crates-io]
+# Loss recovery and congestion-window fixes; see third_party/smoltcp/README.tailfeather.md.
+smoltcp = { path = "../third_party/smoltcp" }

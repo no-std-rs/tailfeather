@@ -5,8 +5,38 @@ STATE=/tmp/tailfeather-lab
 mkdir -p "$STATE/headscale" "$STATE/tailscale" "$STATE/tls-rsa"
 fail() { echo "guest-controller: FAIL: $*" >&2; exit 1; }
 
+# Comma-separated stage names, or "all". See the stage list at the bottom.
+STAGES=${1:-all}
+want() {
+    test "$STAGES" = all && return 0
+    case ",$STAGES," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+}
+want_any() {
+    for wanted in "$@"; do want "$wanted" && return 0; done
+    return 1
+}
+# Every requested stage runs even after another one failed, so one run
+# reports every regression instead of only the first.
+RESULTS="$STATE/stage-results"
+: >"$RESULTS"
+stage() {
+    name=$1 budget=$2
+    shift 2
+    want "$name" || return 0
+    echo "guest-controller: running $name"
+    started=$(date +%s)
+    if timeout "$budget" "$@" >"$STATE/$name.log" 2>&1; then
+        result=PASS
+    else
+        result="FAIL(exit $?)"
+    fi
+    elapsed=$(($(date +%s) - started))
+    echo "$name $result ${elapsed}s/${budget}s" >>"$RESULTS"
+    echo "guest-controller: $name $result in ${elapsed}s"
+}
+
 diagnostics() {
-    status=$?
+    status=${1:-$?}
     trap - EXIT
     echo "--- guest capability state ---" >&2
     uname -a >&2 || true
@@ -53,6 +83,7 @@ ip netns exec tf-preflight ip link delete wg-preflight
 ip link delete tf-veth-host
 ip netns delete tf-preflight
 
+if want_any conformance wg-example wg-harness-responder wg-harness-initiator wg-harness-rekey nostd-interop; then
 echo "guest-controller: starting headscale"
 /opt/lab/headscale serve --config /opt/lab/headscale.yaml >"$STATE/headscale.log" 2>&1 &
 for _ in $(seq 1 30); do
@@ -155,31 +186,55 @@ export TS_CONFORMANCE_HARNESS=/opt/lab/harness
 export TS_CONFORMANCE_VECTORS="$CONFORMANCE_ROOT/tests/vectors/versions.json"
 export TS_CONFORMANCE_EXPECTATIONS=/opt/lab/lab.json
 export TS_CONFORMANCE_LAB_STATE="$STATE"
-echo "guest-controller: running live conformance"
-timeout 360 /opt/lab/conformance --expect /opt/lab/lab.json >"$STATE/conformance.log" 2>&1
+fi
 
-echo "guest-controller: running WireGuard example-responder interop"
-timeout 30 /opt/lab/interop-wireguard.sh example-responder /opt/lab/responder >"$STATE/wg-example.log" 2>&1
-echo "guest-controller: running WireGuard harness-responder interop"
-timeout 30 /opt/lab/interop-wireguard.sh harness-responder /opt/lab/harness >"$STATE/wg-harness-responder.log" 2>&1
-echo "guest-controller: running WireGuard harness-initiator interop"
-timeout 30 /opt/lab/interop-wireguard.sh harness-initiator /opt/lab/harness >"$STATE/wg-harness-initiator.log" 2>&1
-echo "guest-controller: running WireGuard harness rekey interop"
-timeout 30 /opt/lab/interop-wireguard.sh harness-rekey /opt/lab/harness >"$STATE/wg-harness-rekey.log" 2>&1
-echo "guest-controller: running no-std WireGuard interop"
-timeout 180 "$CONFORMANCE_ROOT/scripts/nostd-interop.sh" /opt/lab/harness >"$STATE/nostd-interop.log" 2>&1
+# Stages sharing the host-level lab (Headscale on 127.0.0.1, tailscale0, the
+# reference client) run one after another.
+stage conformance 360 /opt/lab/conformance --expect /opt/lab/lab.json
+stage wg-example 30 /opt/lab/interop-wireguard.sh example-responder /opt/lab/responder
+stage wg-harness-responder 30 /opt/lab/interop-wireguard.sh harness-responder /opt/lab/harness
+stage wg-harness-initiator 30 /opt/lab/interop-wireguard.sh harness-initiator /opt/lab/harness
+stage wg-harness-rekey 30 /opt/lab/interop-wireguard.sh harness-rekey /opt/lab/harness
+if want nostd-interop; then
+    stage nostd-interop 180 "$CONFORMANCE_ROOT/scripts/nostd-interop.sh" /opt/lab/harness
+fi
 
+# Every stage below builds its own namespaces, Headscale and DERP, so they run
+# concurrently: the phase takes as long as its slowest stage, not their sum.
+NETWORK="/opt/lab/headscale /opt/lab/tailscale /opt/lab/tailscaled"
+# Only these jobs are awaited: Headscale, the TLS front and the reference
+# client are background jobs of this shell too, and never exit.
+JOBS=""
 for mode in nat udp-blocked hard-nat; do
-    echo "guest-controller: running SSH network acceptance ($mode)"
     budget=220
     if test "$mode" = udp-blocked; then budget=540; fi
-    timeout "$budget" bash /opt/lab/ssh-network.sh /opt/lab/headscale /opt/lab/tailscale /opt/lab/tailscaled \
-        /opt/lab/ssh-server /opt/lab/headscale.yaml "$mode" >"$STATE/ssh-network-$mode.log" 2>&1
+    # shellcheck disable=SC2086
+    stage "ssh-$mode" "$budget" bash /opt/lab/ssh-network.sh $NETWORK \
+        /opt/lab/ssh-server /opt/lab/headscale.yaml "$mode" &
+    JOBS="$JOBS $!"
 done
-
-echo "guest-controller: running shared-runtime NAT rebinding acceptance"
-timeout 300 bash /opt/lab/reactor-rebind.sh /opt/lab/headscale /opt/lab/tailscale /opt/lab/tailscaled \
-    /opt/lab/reactor-node /opt/lab/headscale.yaml /usr/sbin/conntrack >"$STATE/reactor-rebind.log" 2>&1
+# shellcheck disable=SC2086
+stage reactor-rebind 300 bash /opt/lab/reactor-rebind.sh $NETWORK \
+    /opt/lab/reactor-node /opt/lab/headscale.yaml /usr/sbin/conntrack &
+JOBS="$JOBS $!"
+(
+    export TF_NAT_JOBS="${TF_NAT_JOBS:-6}" TF_NAT_CONNTRACK=/usr/sbin/conntrack \
+        TF_NAT_SSH_SERVER=/opt/lab/ssh-server
+    # shellcheck disable=SC2086
+    stage nat-matrix 1200 bash /opt/lab/nat-matrix.sh matrix $NETWORK \
+        /opt/lab/reactor-node /opt/lab/headscale.yaml
+) &
+JOBS="$JOBS $!"
+# shellcheck disable=SC2086
+wait $JOBS
 
 trap - EXIT HUP INT TERM
-diagnostics
+echo "--- stage summary ---"
+sort "$RESULTS" | awk '{ printf "  %-22s %-14s %s\n", $1, $2, $3 }'
+test -s "$RESULTS" || { echo "guest-controller: FAIL: no stage matched '$STAGES'" >&2; exit 1; }
+diagnostics_status=0
+if grep -q ' FAIL' "$RESULTS"; then diagnostics_status=1; fi
+# The matrix report (its table, then the logs of any failing run) is the
+# evidence a reviewer wants whether it passed or not.
+if test -f "$STATE/nat-matrix.log"; then sed -n '/^== NAT matrix/,$p' "$STATE/nat-matrix.log" | head -n 600; fi
+diagnostics "$diagnostics_status"

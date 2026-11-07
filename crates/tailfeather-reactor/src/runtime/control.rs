@@ -252,8 +252,15 @@ const CONTROL_READ_AHEAD: usize = 512;
 /// The long-poll is abandoned after this long without a map event or an
 /// acknowledged endpoint update. Server keepalives arrive well within it.
 const MAP_LIVENESS_MS: u64 = 90_000;
-/// A completed STUN sweep is repeated after this long, map events or not.
-const RESWEEP_MS: u64 = 30_000;
+/// A completed STUN sweep is repeated after a random 20-26 s, map events or
+/// not: the official client's periodic re-STUN interval, jittered so a fleet
+/// does not sweep in lockstep.
+const RESWEEP_MIN_MS: u64 = 20_000;
+const RESWEEP_MAX_MS: u64 = 26_000;
+/// When a direct peer falls back to DERP our NAT mapping may have changed, so
+/// the sweep is repeated this soon after the previous one completed instead.
+/// The floor bounds the STUN traffic a flapping peer can cause.
+const TRIGGERED_RESWEEP_MS: u64 = 2_000;
 
 async fn session<P: Network, S: State, const PEERS: usize, const A: usize>(
     runtime: &Runtime<'_, P, S, PEERS, A>,
@@ -530,6 +537,8 @@ enum Wake {
     Discovered,
     /// The re-sweep deadline passed while the map stream was quiet.
     Resweep,
+    /// An early re-sweep was requested; the deadline must be recomputed.
+    Requested,
 }
 
 /// Wait on a quiet map stream until input arrives, the sweep completes, or the
@@ -542,8 +551,10 @@ async fn wait_map<C: Clock, T: MapTransport<PEERS>, D: Future, const PEERS: usiz
     completed: &mut Option<D::Output>,
     resweep_at: Option<u64>,
     dead_at: u64,
+    requested: &Signal<NoopRawMutex, ()>,
 ) -> Result<Wake, Error> {
     let mut input = core::pin::pin!(maps.wait_input());
+    let mut request = core::pin::pin!(requested.wait());
     let mut resweep = core::pin::pin!(async {
         match resweep_at {
             Some(at) => reactor.sleep_until(at).await,
@@ -570,6 +581,9 @@ async fn wait_map<C: Clock, T: MapTransport<PEERS>, D: Future, const PEERS: usiz
         }
         if resweep.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Ok(Wake::Resweep));
+        }
+        if request.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(Wake::Requested));
         }
         if dead.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Err("map timeout"));
@@ -603,7 +617,21 @@ where
     let mut bootstrapped = false;
     // Interrupting a quiet read for discovery does not extend map liveness.
     let mut alive_at = reactor.clock_millis();
+    // When the current sweep's successor is due, relative to its completion.
+    let resweep_after = || {
+        if runtime.restun_requested.get() {
+            return TRIGGERED_RESWEEP_MS;
+        }
+        let mut jitter = [0; 2];
+        Rng::fill_bytes(&mut runtime.network.rng(), &mut jitter);
+        RESWEEP_MIN_MS
+            + u64::from(u16::from_le_bytes(jitter)) % (RESWEEP_MAX_MS - RESWEEP_MIN_MS + 1)
+    };
     loop {
+        // This sweep observes the network as of now: any earlier request is
+        // answered by it.
+        runtime.restun_requested.set(false);
+        let mut interval = resweep_after();
         // One sweep remains pinned across map reads and endpoint writes. Its
         // body is not polled until the initial map's fallback home/local
         // endpoints have been published successfully.
@@ -615,9 +643,12 @@ where
         let mut completed = None;
         loop {
             let wake = if bootstrapped {
+                if runtime.restun_requested.get() {
+                    interval = interval.min(TRIGGERED_RESWEEP_MS);
+                }
                 let resweep_at = completed
                     .as_ref()
-                    .map(|(_, at): &(u16, u64)| at.saturating_add(RESWEEP_MS));
+                    .map(|(_, at): &(u16, u64)| at.saturating_add(interval));
                 wait_map(
                     reactor,
                     maps,
@@ -625,6 +656,7 @@ where
                     &mut completed,
                     resweep_at,
                     alive_at.saturating_add(MAP_LIVENESS_MS),
+                    &runtime.restun,
                 )
                 .await?
             } else {
@@ -632,6 +664,7 @@ where
             };
             match wake {
                 Wake::Resweep => break,
+                Wake::Requested => continue,
                 // Input was neither buffered nor queued, so no newer map is
                 // staged: the active map is a coherent snapshot to publish from.
                 Wake::Discovered => debug_assert!(!maps.has_pending_update()),
@@ -727,7 +760,7 @@ where
             }
             if completed
                 .as_ref()
-                .is_some_and(|(_, at)| reactor.clock_millis() >= at.saturating_add(RESWEEP_MS))
+                .is_some_and(|(_, at)| reactor.clock_millis() >= at.saturating_add(interval))
             {
                 break;
             }
@@ -891,6 +924,8 @@ mod tests {
             finished: Cell<usize>,
             mapping: Cell<u16>,
             unfinished: Cell<bool>,
+            /// Raise the runtime's early re-sweep request before the next poll.
+            restun: Cell<bool>,
         }
 
         impl Fixture {
@@ -944,6 +979,7 @@ mod tests {
                         finished: Cell::new(0),
                         mapping: Cell::new(45_000),
                         unfinished: Cell::new(false),
+                        restun: Cell::new(false),
                     };
                     let mut maps = ScriptedMaps {
                         staging: Box::new(tailfeather::netmap::Netmap::new()),
@@ -983,6 +1019,10 @@ mod tests {
                     // Poll past cooperative yields until the session blocks.
                     let mut poll = || {
                         network.0.set(fixture.clock.get());
+                        if fixture.restun.take() {
+                            runtime.restun_requested.set(true);
+                            runtime.restun.signal(());
+                        }
                         for _ in 0..16 {
                             if let Poll::Ready(result) = session.as_mut().poll(&mut context) {
                                 return Poll::Ready(result);
@@ -1027,10 +1067,10 @@ mod tests {
                 assert_eq!(fixture.started.get(), 1);
                 // The NAT mapping changes after the first sweep.
                 fixture.mapping.set(46_000);
-                fixture.clock.set(RESWEEP_MS - 1);
+                fixture.clock.set(RESWEEP_MIN_MS - 1);
                 assert!(poll().is_pending());
                 assert_eq!(fixture.started.get(), 1);
-                fixture.clock.set(RESWEEP_MS);
+                fixture.clock.set(RESWEEP_MAX_MS);
                 assert!(poll().is_pending());
                 assert_eq!(
                     fixture.started.get(),
@@ -1043,6 +1083,40 @@ mod tests {
                     fixture.log().last().unwrap(),
                     "publish \"Endpoints\":[\"198.18.0.3:46000\"]"
                 );
+                assert_eq!(fixture.map_events(), 1);
+            });
+        }
+
+        #[test]
+        fn a_lost_direct_path_re_sweeps_early_and_publishes_the_new_mapping() {
+            with_session(|poll, fixture| {
+                fixture.finished.set(1);
+                assert!(poll().is_pending());
+                assert_eq!(fixture.started.get(), 1);
+                // The NAT moves us; a direct peer falls back to DERP.
+                fixture.mapping.set(46_000);
+                fixture.clock.set(1_000);
+                fixture.restun.set(true);
+                assert!(poll().is_pending());
+                // The early sweep still keeps its floor after the last one.
+                assert_eq!(fixture.started.get(), 1);
+                fixture.clock.set(TRIGGERED_RESWEEP_MS);
+                assert!(poll().is_pending());
+                assert_eq!(
+                    fixture.started.get(),
+                    2,
+                    "a lost direct path must not wait for the periodic re-sweep"
+                );
+                fixture.finished.set(2);
+                assert!(poll().is_pending());
+                assert_eq!(
+                    fixture.log().last().unwrap(),
+                    "publish \"Endpoints\":[\"198.18.0.3:46000\"]"
+                );
+                // The request was answered: the next sweep is periodic again.
+                fixture.clock.set(TRIGGERED_RESWEEP_MS * 3);
+                assert!(poll().is_pending());
+                assert_eq!(fixture.started.get(), 2);
                 assert_eq!(fixture.map_events(), 1);
             });
         }
@@ -1072,7 +1146,7 @@ mod tests {
                 fixture.finished.set(usize::MAX);
                 assert!(poll().is_pending());
                 let publications = fixture.log().len();
-                for now in (RESWEEP_MS..MAP_LIVENESS_MS).step_by(10_000) {
+                for now in (RESWEEP_MAX_MS..MAP_LIVENESS_MS).step_by(10_000) {
                     fixture.clock.set(now);
                     assert!(poll().is_pending());
                 }

@@ -414,3 +414,89 @@ fn non_contributory_curve25519_keys_fail_before_installing_session_keys() {
         }
     }
 }
+
+#[test]
+fn input_arriving_while_a_write_waits_for_credit_is_stashed() {
+    // The reader holds outstanding receive credit (a chunked read returned
+    // after the first packet of its grant) while the send window is empty:
+    // data that the client sends before its window adjust must survive.
+    let mut buffer = [0; 1024];
+    let data = |bytes: &'static [u8]| wire::Message::ChannelData {
+        recipient_channel: 0,
+        data: wire::Data::Borrowed { bytes },
+    };
+    let adjust = wire::Message::ChannelWindowAdjust {
+        recipient_channel: 0,
+        bytes_to_add: 8,
+    };
+    let mut transport = authenticated(&mut buffer, &[data(b"ab"), data(b"cde"), adjust]);
+    active(&mut transport, 0);
+    transport.active_channel.as_mut().unwrap().rx_half = HalfState::Window(6);
+    let mut stash = [0; 6];
+    {
+        let mut channel = Channel::new(&mut transport);
+        let (mut writer, stashed) = blocking(channel.stdout_stashing(&mut stash)).unwrap();
+        assert_eq!(&stash[..stashed], b"abcde");
+        writer.buffer()[..2].copy_from_slice(b"ok");
+        blocking(writer.write_all(2)).unwrap();
+    }
+    assert_eq!(
+        payloads(&transport.behavior.stream.output, Pipe::Stdout),
+        b"ok"
+    );
+    assert_eq!(transport.channel_rx_window(), Some(1));
+}
+
+#[test]
+fn chunked_reads_return_each_packet_and_regrant_only_when_spent() {
+    let mut buffer = [0; 1024];
+    let data = |bytes: &'static [u8]| wire::Message::ChannelData {
+        recipient_channel: 0,
+        data: wire::Data::Borrowed { bytes },
+    };
+    let mut transport = authenticated(&mut buffer, &[data(b"a"), data(b"bcd"), data(b"efgh")]);
+    active(&mut transport, 0);
+    let mut chunk = [0; 4];
+    {
+        let mut channel = Channel::new(&mut transport);
+        // One grant of four bytes, consumed by two packets.
+        assert_eq!(blocking(channel.read_stdin(&mut chunk)).unwrap(), 1);
+        assert_eq!(&chunk[..1], b"a");
+        assert_eq!(blocking(channel.read_stdin(&mut chunk)).unwrap(), 3);
+        assert_eq!(&chunk[..3], b"bcd");
+        // Spent: the next read grants four more before reading.
+        assert_eq!(blocking(channel.read_stdin(&mut chunk)).unwrap(), 4);
+        assert_eq!(&chunk, b"efgh");
+    }
+    let mut output = &transport.behavior.stream.output[..];
+    let mut grants = Vec::new();
+    while !output.is_empty() {
+        let len = u32::from_be_bytes(output[..4].try_into().unwrap()) as usize;
+        let padding = usize::from(output[4]);
+        match wire::Message::decode(&output[5..4 + len - padding]).unwrap() {
+            wire::Message::ChannelWindowAdjust {
+                recipient_channel: 4,
+                bytes_to_add,
+            } => grants.push(bytes_to_add),
+            other => panic!("unexpected output: {other:?}"),
+        }
+        output = &output[4 + len..];
+    }
+    assert_eq!(grants, [4, 4]);
+}
+
+#[test]
+fn chunked_reads_skip_empty_data_packets() {
+    let mut buffer = [0; 1024];
+    let data = |bytes: &'static [u8]| wire::Message::ChannelData {
+        recipient_channel: 0,
+        data: wire::Data::Borrowed { bytes },
+    };
+    let mut transport = authenticated(&mut buffer, &[data(b""), data(b"ab")]);
+    active(&mut transport, 0);
+    let mut chunk = [0; 4];
+    let mut channel = Channel::new(&mut transport);
+    // Zero is reserved for EOF: the empty packet must not end the input.
+    assert_eq!(blocking(channel.read_stdin(&mut chunk)).unwrap(), 2);
+    assert_eq!(&chunk[..2], b"ab");
+}

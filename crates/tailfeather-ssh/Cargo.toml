@@ -9,6 +9,13 @@ description = "Small allocation-free SSH console for a Tailscale-compatible node
 readme = "README.md"
 publish = false
 
+[features]
+default = ["chunked-input"]
+# Read console input in INPUT_CHUNK-byte window grants instead of one byte per
+# round trip (paste ~250x faster). Off saves ~0.7 KiB of firmware code and
+# INPUT_CHUNK bytes of session future.
+chunked-input = []
+
 [dependencies]
 base64 = { version = "0.22", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }

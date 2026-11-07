@@ -143,6 +143,12 @@ impl Network for TokioNetwork {
             .map(|_| ())
             .map_err(|_| "UDP send")
     }
+    async fn send_batch<'p>(
+        &self,
+        packets: impl Iterator<Item = (&'p [u8], SocketAddrV4)>,
+    ) -> Result<(), Error> {
+        self.udp.send_batch(packets).await.map_err(|_| "UDP send")
+    }
 }
 
 pub struct FileState {

@@ -14,6 +14,8 @@ rust_library(
     aliases = aliases(),
     crate_name = "tailfeather_ssh",
     compile_data = ["README.md"],
+    # Cargo's default features; Bazel does not apply them implicitly.
+    crate_features = ["chunked-input"],
     edition = "2024",
     deps = all_crate_deps(normal = True),
 )
@@ -23,6 +25,17 @@ rust_test(
     crate = ":tailfeather_ssh",
     aliases = aliases(),
     deps = all_crate_deps(normal_dev = True),
+)
+
+# The same unit tests with `default-features = false`: one-byte input.
+rust_test(
+    name = "unit_test_byte_input",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tailfeather_ssh",
+    compile_data = ["README.md"],
+    edition = "2024",
+    deps = all_crate_deps(normal = True, normal_dev = True),
 )
 
 rust_test(

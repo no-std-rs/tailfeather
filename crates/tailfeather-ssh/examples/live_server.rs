@@ -35,10 +35,15 @@ const PEERS: usize = tailfeather::netmap::MAX_PEERS;
 type SharedNode = Rc<RefCell<Node<PEERS>>>;
 type SharedTcp = Rc<RefCell<Stack<'static, 2>>>;
 
-struct Random(std::fs::File);
+/// The kernel CSPRNG, read in blocks: SSH draws padding for every packet,
+/// and one system call per draw dominated the console's echo path.
+struct Random(std::io::BufReader<std::fs::File>);
 impl Random {
     fn new() -> Self {
-        Self(std::fs::File::open("/dev/urandom").unwrap())
+        Self(std::io::BufReader::with_capacity(
+            4096,
+            std::fs::File::open("/dev/urandom").unwrap(),
+        ))
     }
 }
 impl rand_core::RngCore for Random {
@@ -831,6 +836,8 @@ fn main() {
             "live test deadline"
         );
         let now = start.elapsed().as_millis() as u64;
+        // Sleep only after an iteration that moved no packet.
+        let mut busy = false;
         while let Ok(mut update) = rx.try_recv() {
             apply_map(&mut node.borrow_mut(), &mut update, published).unwrap();
             if debug_network {
@@ -849,6 +856,7 @@ fn main() {
         }
         relays.home(node.borrow().netmap().home_derp);
         while let Some(event) = relays.poll() {
+            busy = true;
             use tailfeather::node::DerpEvent;
             let action = match event {
                 network::RelayEvent::Connected(region) => {
@@ -907,6 +915,7 @@ fn main() {
             }
         }
         while let Ok((len, source)) = udp.recv_from(&mut datagram) {
+            busy = true;
             if debug_network {
                 println!("UDP_RX source={source} len={len}");
             }
@@ -1062,6 +1071,7 @@ fn main() {
             if poll.transmitted == 0 {
                 break;
             }
+            busy = true;
             let destination = Ipv4Addr::new(output[16], output[17], output[18], output[19]);
             let peer = node
                 .borrow()
@@ -1137,7 +1147,9 @@ fn main() {
                 break;
             }
         }
-        std::thread::sleep(Duration::from_millis(1));
+        if !busy {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 

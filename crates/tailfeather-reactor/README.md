@@ -181,3 +181,32 @@ uses Tokio; code generation and host load can affect these comparisons. These
 measurements support gigabit-class local packet processing, not a physical NIC
 wirespeed claim or a 10 Gbit/s guarantee. Use the complete-runtime figures when
 budgeting SDK throughput; transport-only numbers omit routing and actor work.
+
+Over real UDP, the NAT matrix (`tests/README.md`) measures the node against the
+official client. On Linux the native adapter sizes the data socket's buffers
+as wireguard-go does (7 MiB), receives with `recvmmsg` and UDP GRO, and sends
+runs of equal-sized datagrams to one peer with UDP GSO, all through
+`quinn-udp`. Segmentation is local, so the wire carries ordinary datagrams.
+Relay and control sockets disable Nagle. The heap-backed TCP stack gives each
+connection 4 MiB of window (`OWNED_BUFFER`, committed by the OS only as it
+fills) and Reno congestion control, from a [patched smoltcp](../../third_party/smoltcp/README.tailfeather.md)
+whose congestion window bounds data in flight and whose loss recovery
+retransmits one segment per hole (NewReno). Large values built inside an
+`async fn` become part of its poll function's stack frame; construct
+runtimes, stacks and buffers before entering the executor, as
+`examples/lab_node.rs` does.
+
+On a 24-core Ryzen host, in the lab topology (veth, bridges, iptables NAT),
+median of three 256 MiB transfers, with `accelerated-crypto`. CPU is the
+receiving or sending side B's share of one core:
+
+| Path | Official client | Tailfeather |
+| --- | ---: | ---: |
+| Direct, ~0 ms: up / down | 4.4 / 4.3 Gbit/s on 1.8 cores | 3.3 / 4.3 Gbit/s on 0.7 cores |
+| Direct, 20 ms RTT: up / down | 866 / 1310 Mbit/s | 857 / 1230 Mbit/s |
+| DERP relay: up / down | 567 / 645 Mbit/s | 516 / 718 Mbit/s |
+| DERP relay, two CPUs: up / down | 220 / 267 Mbit/s | 211 / 334 Mbit/s |
+
+Before the smoltcp patch, the relay download was 346 Mbit/s, and with two
+CPUs it stalled: the relay dropped queued packets and upstream recovery
+backed off to a 60 s timeout.

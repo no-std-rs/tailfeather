@@ -542,6 +542,9 @@ pub struct Node<const PEERS: usize = 32> {
     derp_disconnecting: Vec<u16, 2>,
     derp_last_failed: Option<u16>,
     active_peer_derp: Option<u16>,
+    /// A peer we were reaching directly has started reaching us over DERP.
+    /// See [`Node::take_direct_path_lost`].
+    direct_path_lost: bool,
     pending_derp: Option<PendingDerp>,
     reconnect_at_ms: u64,
     reconnect_backoff_s: u8,
@@ -588,6 +591,7 @@ impl<const PEERS: usize> Node<PEERS> {
             derp_disconnecting: Vec::new(),
             derp_last_failed: None,
             active_peer_derp: None,
+            direct_path_lost: false,
             pending_derp: None,
             reconnect_at_ms: 0,
             reconnect_backoff_s: 1,
@@ -1190,6 +1194,7 @@ impl<const PEERS: usize> Node<PEERS> {
             .iter_mut()
             .find(|path| path.key == peer)
             .ok_or(NodeError::InvalidState)?;
+        self.direct_path_lost |= path.direct_healthy;
         // An authenticated WireGuard packet arriving over DERP is stronger
         // reachability evidence than a direct endpoint learned earlier. The
         // peer may have just lost UDP; keep the response on the working relay
@@ -1248,6 +1253,17 @@ impl<const PEERS: usize> Node<PEERS> {
         path.direct_healthy = false;
         path.direct_probe_pending = false;
         Ok(())
+    }
+
+    /// Whether, since the last call, a peer whose direct path we considered
+    /// healthy has reached us over DERP instead: authenticated WireGuard, a
+    /// disco ping or a CallMeMaybe. A standard client only does that once its
+    /// own direct probes to us went unanswered, and the commonest cause is
+    /// that our NAT gave us a new public mapping. Adapters answer by repeating
+    /// their STUN sweep now rather than at the next periodic one, so the new
+    /// endpoint reaches control (and the peer) seconds after the change.
+    pub fn take_direct_path_lost(&mut self) -> bool {
+        core::mem::take(&mut self.direct_path_lost)
     }
 
     /// Ask an authenticated peer to probe our current endpoints. CallMeMaybe
@@ -1627,7 +1643,11 @@ impl<const PEERS: usize> Node<PEERS> {
             .ok_or(NodeError::UnknownPeer)?;
         let mut plaintext = [0; crate::disco::MAX_PACKET];
         let opened = crate::disco::open(&self.identity.disco, &claimed, datagram, &mut plaintext)?;
-        match crate::disco::Message::decode(&plaintext[..opened.len])? {
+        let message = crate::disco::Message::decode(&plaintext[..opened.len])?;
+        if !matches!(message, crate::disco::Message::Pong(_)) {
+            self.direct_path_lost |= self.paths[index].direct_healthy;
+        }
+        match message {
             // A relay-only node has nothing to probe a candidate with.
             crate::disco::Message::CallMeMaybe(_) if !self.direct_paths => Ok(None),
             crate::disco::Message::CallMeMaybe(call) => {
@@ -2636,6 +2656,110 @@ mod tests {
             Some(NodeAction::DirectTransmit { endpoint: got, .. })
                 if got == SocketAddr::V4(endpoint)
         ));
+    }
+
+    #[test]
+    fn a_direct_peer_reaching_us_over_derp_reports_a_lost_direct_path() {
+        on_node_test_stack(a_direct_peer_reaching_us_over_derp_reports_a_lost_direct_path_fixture);
+    }
+
+    fn a_direct_peer_reaching_us_over_derp_reports_a_lost_direct_path_fixture() {
+        let mut node = Node::<2>::factory_reset(Identity::generate(&mut Counter(1)), 1);
+        persisted(&mut node);
+        let peer_key = NodePrivate::from_bytes([77; 32]).public();
+        let peer_disco = DiscoPrivate::from_bytes([88; 32]);
+        let mut lease = Netmap::<2>::new();
+        let mut peer = Peer::new(7, peer_key);
+        peer.disco_key = Some(peer_disco.public());
+        peer.home_derp = 9;
+        lease.peers.upsert(peer).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut lease,
+            result: Ok(()),
+        })
+        .unwrap();
+        let seal = |message: crate::disco::Message, node: &Node<2>, datagram: &mut [u8]| {
+            let mut plaintext = [0; crate::disco::MAX_PACKET];
+            let len = message.encode(&mut plaintext).unwrap();
+            crate::disco::seal(
+                &peer_disco,
+                &peer_disco.public(),
+                &node.identity.disco.public(),
+                &plaintext[..len],
+                &mut Counter(20),
+                datagram,
+            )
+            .unwrap()
+        };
+        let ping = || {
+            crate::disco::Message::Ping(crate::disco::Ping {
+                tx_id: [3; 12],
+                node_key: Some(peer_key),
+            })
+        };
+        let mut datagram = [0; crate::disco::MAX_PACKET];
+
+        // While the path is still being discovered, a relayed ping is the
+        // normal rendezvous and says nothing about our own mapping.
+        let len = seal(ping(), &node, &mut datagram);
+        node.handle_derp_event(
+            DerpEvent::Packet {
+                region: 9,
+                peer: peer_key,
+                payload: &datagram[..len],
+            },
+            10,
+            &mut Counter(50),
+        )
+        .unwrap();
+        assert!(!node.take_direct_path_lost());
+
+        // The same ping over DERP after a working direct path: the peer's own
+        // direct probes to us stopped being answered.
+        node.paths[0].direct = Some("198.51.100.10:50123".parse().unwrap());
+        node.paths[0].direct_healthy = true;
+        let len = seal(ping(), &node, &mut datagram);
+        node.handle_derp_event(
+            DerpEvent::Packet {
+                region: 9,
+                peer: peer_key,
+                payload: &datagram[..len],
+            },
+            20,
+            &mut Counter(60),
+        )
+        .unwrap();
+        assert!(node.take_direct_path_lost());
+        assert!(!node.take_direct_path_lost(), "the report is consumed once");
+
+        // A relayed CallMeMaybe from a direct peer is the same evidence.
+        let mut endpoints = heapless::Vec::new();
+        endpoints
+            .push("203.0.113.20:41641".parse().unwrap())
+            .unwrap();
+        let len = seal(
+            crate::disco::Message::CallMeMaybe(crate::disco::CallMeMaybe { endpoints }),
+            &node,
+            &mut datagram,
+        );
+        node.handle_derp_event(
+            DerpEvent::Packet {
+                region: 9,
+                peer: peer_key,
+                payload: &datagram[..len],
+            },
+            30,
+            &mut Counter(70),
+        )
+        .unwrap();
+        assert!(node.take_direct_path_lost());
+
+        // Authenticated WireGuard over DERP from a direct peer, too.
+        node.observe_relay(peer_key, 9).unwrap();
+        assert!(node.take_direct_path_lost());
+        // Once on the relay, further relayed traffic is not new evidence.
+        node.observe_relay(peer_key, 9).unwrap();
+        assert!(!node.take_direct_path_lost());
     }
 
     #[test]

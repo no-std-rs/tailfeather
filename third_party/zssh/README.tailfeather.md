@@ -34,5 +34,12 @@ Local changes:
   payload. This local API change requires `channel.stdout().await?` (likewise
   `stderr` and `writer`); the Tailfeather wrapper uses copying writes.
 
+- Add `Channel::read_stdin`, which grants receive window one caller-sized
+  chunk at a time and returns each data packet as it arrives, and
+  `Channel::stdout_stashing`, which copies channel data that arrives while a
+  write waits for send credit into a caller buffer instead of discarding it.
+  The plain send-credit wait now reports such data (sent without credit) as
+  an error rather than silently dropping it.
+
 `//crates/tailfeather-ssh:openssh_test` covers a response larger than OpenSSH's
 initial receive window, short underlying writes, and normal console operation.
