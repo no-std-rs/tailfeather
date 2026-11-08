@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.3.0...tailfeather-v0.3.1) (2026-11-08)
+
+
+### Performance Improvements
+
+* **firmware:** emulated ESP32 exit-node lab, larger forwarding windows, measured stack floor ([#42](https://github.com/no-std-rs/tailfeather/issues/42)) ([b4bab6e](https://github.com/no-std-rs/tailfeather/commit/b4bab6ebc9dc38b78364df741e3ec779fb1decba))
+* real-network throughput, NewReno smoltcp, chunked SSH input, NAT matrix ([#40](https://github.com/no-std-rs/tailfeather/issues/40)) ([c29f167](https://github.com/no-std-rs/tailfeather/commit/c29f16730d8372f548be4343477bba6b6cab8833))
+
 ## [0.3.0](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.2.1...tailfeather-v0.3.0) (2026-11-03)
 
 
