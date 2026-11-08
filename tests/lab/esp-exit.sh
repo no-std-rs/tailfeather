@@ -363,14 +363,25 @@ down_multi=$(parallel down "$STREAMS")
 # typical page: many small assets, a few large ones. 24 objects, ~1.1 MiB.
 PAGE_OBJECTS="2048 4096 8192 1024 16384 32768 65536 3072 12288 24576 131072 2048
     6144 49152 1536 262144 8192 4096 16384 98304 2048 196608 12288 4096"
-# fetch BYTES: print BYTES if the object arrived whole, else 0.
+# fetch BYTES: print BYTES if the object arrived whole, else 0, and record how
+# a failed fetch ended in $WORK/web-errors.
 fetch() {
-    local got
-    got=$(printf '%s\n' "$1" | ns client timeout 60 socat -t 30 - TCP:10.79.0.2:5003,connect-timeout=10 2>/dev/null | wc -c)
-    if test "$got" -eq "$1"; then echo "$1"; else echo 0; fi
+    local got err start
+    err=$(mktemp "$WORK/fetch.XXXXXX")
+    start=$EPOCHREALTIME
+    got=$(printf '%s\n' "$1" | ns client timeout 60 socat -t 30 - TCP:10.79.0.2:5003,connect-timeout=10 2>"$err" | wc -c)
+    if test "$got" -eq "$1"; then
+        echo "$1"
+    else
+        echo 0
+        printf 'want=%s got=%s after=%ss %s\n' "$1" "$got" \
+            "$(awk -v s="$start" -v e="$EPOCHREALTIME" 'BEGIN { printf "%.2f", e - s }')" \
+            "$(tr '\n' ' ' <"$err")" >>"$WORK/web-errors"
+    fi
+    rm -f "$err"
 }
 export -f fetch ns
-export PREFIX
+export PREFIX WORK
 # page_load N: seconds for one page load; failed objects go to $WORK/web-failed.
 page_load() {
     local start end html
@@ -440,7 +451,8 @@ printf 'METRIC esp_exit_dns_queries_at_resolver=%s\n' "$dns_seen"
 grep -E 'forward-budget|metric=|WARN|ERROR|panic' "$WORK/esp.log" | grep -v 'metric=heap' | tail -n 40 || true
 grep 'metric=heap' "$WORK/esp.log" | tail -n 1 || true
 
-test "$web_failed" -eq 0 || fail "$web_failed web objects failed: $(tr '\n' ' ' <"$WORK/web-failed")"
+test "$web_failed" -eq 0 || fail "$web_failed web objects failed: $(tr '\n' ' ' <"$WORK/web-failed")
+$(cat "$WORK/web-errors" 2>/dev/null)"
 test "$dns_ok" -eq "$DNS_BURST" || fail "only $dns_ok of $DNS_BURST concurrent DNS lookups were answered"
 for metric in "$up" "$down"; do
     awk -v m="$metric" -v f="$MIN_MBPS" 'BEGIN { exit !(m > 0 && m >= f) }' ||
