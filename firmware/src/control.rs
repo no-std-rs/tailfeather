@@ -1412,17 +1412,18 @@ async fn open_link<'a>(
         );
         // Production images inline the only branch they have; that is the
         // shallowest stack, and the TLS lab image keeps that exact shape so it
-        // measures production. The plaintext lab image polls this branch from
+        // measures production. Plaintext-capable lab images poll this branch from
         // a frame of its own as well (see [`OwnFrame`]), so `open_link` holds
         // neither branch's temporaries.
-        #[cfg(emulab_plain)]
+        #[cfg(feature = "test-insecure-control")]
         let secure = OwnFrame(secure);
         secure.await
     } else {
-        // Only the plaintext lab image speaks Noise over bare TCP. The TLS lab
+        // Only images built with `test-insecure-control` (the plaintext emulator
+        // lab and the hardware lab) speak Noise over bare TCP. The TLS lab
         // image refuses here exactly as production does, so its control path
         // is production's, frame for frame.
-        #[cfg(emulab_plain)]
+        #[cfg(feature = "test-insecure-control")]
         {
             // Inlined, this branch's Noise and HTTP/2 temporaries did not
             // share stack slots with the TLS branch's: `open_link`'s poll
@@ -1439,7 +1440,7 @@ async fn open_link<'a>(
             ))
             .await
         }
-        #[cfg(not(emulab_plain))]
+        #[cfg(not(feature = "test-insecure-control"))]
         {
             let _ = (
                 socket,
@@ -1516,7 +1517,7 @@ async fn open_secure_link<'a>(
     Ok(Link::Secure(http2))
 }
 
-#[cfg(emulab_plain)]
+#[cfg(feature = "test-insecure-control")]
 async fn open_plain_link<'a>(
     socket: TcpSocket<'a>,
     authority: &str,
@@ -1542,10 +1543,10 @@ async fn open_plain_link<'a>(
 ///
 /// The compiler otherwise inlines a nested future's poll into its parent's,
 /// and the parent's frame then holds the temporaries of every branch at once.
-#[cfg(emulab_plain)]
+#[cfg(feature = "test-insecure-control")]
 struct OwnFrame<F>(F);
 
-#[cfg(emulab_plain)]
+#[cfg(feature = "test-insecure-control")]
 impl<F: core::future::Future> core::future::Future for OwnFrame<F> {
     type Output = F::Output;
 

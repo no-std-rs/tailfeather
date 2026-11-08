@@ -458,4 +458,9 @@ for metric in "$up" "$down"; do
     awk -v m="$metric" -v f="$MIN_MBPS" 'BEGIN { exit !(m > 0 && m >= f) }' ||
         fail "a single-stream direction ran at $metric Mbit/s (floor $MIN_MBPS)"
 done
+# `parallel` reports 0 when any of its transfers fell short.
+for metric in "$up_multi" "$down_multi"; do
+    awk -v m="$metric" 'BEGIN { exit !(m > 0) }' ||
+        fail "a $STREAMS-stream transfer failed (aggregate $metric Mbit/s)"
+done
 log "PASS in $(elapsed)s"

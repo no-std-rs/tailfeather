@@ -121,9 +121,8 @@ EMULAB_VARIANTS = {
         "-Clink-arg=-Tlinkall.x",
         "--cfg=tailfeather_emulab",
         "--check-cfg=cfg(tailfeather_emulab)",
-        "--check-cfg=cfg(emulab_plain)",
         "--check-cfg=cfg(feature, values(\"test-insecure-control\"))",
-    ] + (["--cfg=emulab_plain"] if variant == "emulab" else []),
+    ],
     tags = ["manual"],
     deps = third_party_deps() + [
         "//crates/tailfeather:tailfeather_firmware",
