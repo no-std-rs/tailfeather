@@ -82,7 +82,7 @@ impl DerpCertName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerpRegion {
     pub id: u16,
-    pub code: heapless::String<16>,
+    pub code: heapless::String<{ crate::netmap::MAX_DERP_REGION_CODE }>,
     /// Exclude from measurement and home selection, but allow peer-directed
     /// connections when a peer advertises this region as its home.
     pub no_measure_no_home: bool,

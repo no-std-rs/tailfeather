@@ -12,7 +12,14 @@
     holding buffers for the duration of a data transfer."
 )]
 
-#[cfg(all(feature = "test-insecure-control", not(debug_assertions)))]
+// The ESP exit-node lab images (firmware/BUILD.bazel, emulab*) are the one
+// optimized use: they measure production throughput and stack depth, which a
+// debug build cannot, and only those targets pass `--cfg tailfeather_emulab`.
+#[cfg(all(
+    feature = "test-insecure-control",
+    not(debug_assertions),
+    not(tailfeather_emulab)
+))]
 compile_error!("test-insecure-control cannot be compiled in a release build");
 
 mod control;
@@ -44,10 +51,32 @@ esp_bootloader_esp_idf::esp_app_desc!();
 pub const WIFI_SSID: &str = env!("WIFI_SSID");
 pub const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 pub const TS_AUTH_KEY: &str = env!("TS_AUTH_KEY");
+
+/// The key presented at first registration.
+///
+/// Production images use [`TS_AUTH_KEY`] as baked. Emulator lab images may instead
+/// carry a key written by the emulator lab into an unpartitioned flash sector
+/// (see [`flash::LAB_AUTH_KEY_ADDRESS`]), so one cached image enrolls against
+/// a freshly minted Headscale key without being rebuilt.
+pub fn ts_auth_key() -> &'static str {
+    #[cfg(tailfeather_emulab)]
+    if let Some(key) = flash::lab_auth_key() {
+        return key;
+    }
+    TS_AUTH_KEY
+}
 pub const TS_CONTROL_URL: &str = env!("TS_CONTROL_URL");
 pub const TS_HOSTNAME: &str = env!("TS_HOSTNAME");
 pub const TS_CONTROL_CA_DER: &[u8] = include_bytes!(env!("TS_CONTROL_CA_DER"));
 pub const BUILD_TIME_FLOOR: u64 = decimal_u64(env!("TS_BUILD_TIME_FLOOR"));
+
+/// A build-time count from an optional environment variable, or `default`.
+pub(crate) const fn build_count(text: Option<&str>, default: usize) -> usize {
+    match text {
+        Some(text) => decimal_u64(text) as usize,
+        None => default,
+    }
+}
 
 const fn decimal_u64(text: &str) -> u64 {
     let bytes = text.as_bytes();
@@ -78,6 +107,10 @@ static STACK_RESOURCES: StaticCell<StackResources<10>> = StaticCell::new();
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger(LevelFilter::Info);
+    #[cfg(tailfeather_emulab)]
+    stack::paint();
+    #[cfg(tailfeather_emulab)]
+    control::log_type_sizes();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -100,9 +133,12 @@ async fn main(spawner: Spawner) -> ! {
     // receive-window burst once an encrypted ACK or control packet arrives at
     // the same time. Keep the radio driver's bounded buffer pools unchanged,
     // but let their host-side queues absorb both traffic classes without
-    // discarding a frame before smoltcp can apply its own backpressure.
+    // discarding a frame before smoltcp can apply its own backpressure. The
+    // RX queue holds only frame handles: at 20, the ESP exit lab's burst of 20
+    // concurrent exit-node DNS queries loses 1 instead of 4 (at 10), with the
+    // radio heap's low-water mark unchanged.
     let radio_config = esp_radio::wifi::ControllerConfig::default()
-        .with_rx_queue_size(10)
+        .with_rx_queue_size(20)
         .with_tx_queue_size(6);
     let (wifi_controller, interfaces) = esp_radio::wifi::new(peripherals.WIFI, radio_config)
         .expect("Failed to initialize Wi-Fi controller");
@@ -162,6 +198,15 @@ async fn ipv6_status(stack: embassy_net::Stack<'static>) {
             }
             previous = current;
         }
+        #[cfg(tailfeather_emulab)]
+        info!(
+            "metric=heap free={} used={} stack_deepest={} stack_total={} wg_rx={}",
+            esp_alloc::HEAP.free(),
+            esp_alloc::HEAP.used(),
+            stack::deepest(),
+            stack::total(),
+            tunnel::WG_RX_DATAGRAMS.load(core::sync::atomic::Ordering::Relaxed)
+        );
         embassy_time::Timer::after_secs(1).await;
     }
 }

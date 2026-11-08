@@ -69,3 +69,47 @@ pub fn log_used(label: &str) {
         total()
     );
 }
+
+/// Lab-only high-water instrumentation.
+///
+/// Unlike the earlier painter described above, this leaves the bottom
+/// [`PAINT_FLOOR_MARGIN`] bytes alone (they hold esp-rtos' stack guard word)
+/// and paints only below the live stack pointer, which on this single shared
+/// stack is free by definition: an interrupt that lands mid-paint uses the
+/// region and is gone before the loop resumes.
+#[cfg(tailfeather_emulab)]
+mod high_water {
+    const PATTERN: u32 = 0xA5C3_5A3C;
+    pub const PAINT_FLOOR_MARGIN: usize = 1024;
+    const SP_MARGIN: usize = 512;
+
+    /// Paint the unused stack. Call once, as early as possible.
+    pub fn paint() {
+        let (floor, _) = super::bounds();
+        let start = (floor + PAINT_FLOOR_MARGIN + 3) & !3;
+        let end = (super::stack_pointer() - SP_MARGIN) & !3;
+        let mut address = start;
+        while address < end {
+            // SAFETY: `start..end` lies inside the main stack, above its guard
+            // word and below every live frame.
+            unsafe { (address as *mut u32).write_volatile(PATTERN) };
+            address += 4;
+        }
+    }
+
+    /// Deepest stack use since [`paint`], in bytes from the top.
+    pub fn deepest() -> usize {
+        let (floor, top) = super::bounds();
+        let mut address = (floor + PAINT_FLOOR_MARGIN + 3) & !3;
+        while address < top {
+            // SAFETY: reads within the main stack.
+            if unsafe { (address as *const u32).read_volatile() } != PATTERN {
+                break;
+            }
+            address += 4;
+        }
+        top - address
+    }
+}
+#[cfg(tailfeather_emulab)]
+pub use high_water::{deepest, paint};

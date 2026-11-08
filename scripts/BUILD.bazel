@@ -43,6 +43,12 @@ krunfw_kernel(
         "-e", "NETFILTER_XT_NAT",
         "-e", "NETFILTER_XT_MARK",
         "-e", "NETFILTER_XT_MATCH_U32",
+        # A stock client using an exit node keeps its own control, DERP and
+        # WireGuard sockets off the tunnel's default route with fwmark policy
+        # rules (the ESP exit lab).
+        "-e", "IP_ADVANCED_ROUTER",
+        "-e", "IP_MULTIPLE_TABLES",
+        "-e", "IPV6_MULTIPLE_TABLES",
         # The NAT matrix's wide-area throughput case delays the public
         # segment with netem.
         "-e", "NET_SCHED",

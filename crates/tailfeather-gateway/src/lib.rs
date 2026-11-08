@@ -242,6 +242,31 @@ mod tests {
     }
 
     #[test]
+    fn full_udp_table_reclaims_finished_exchanges_before_quiet_ones() {
+        let mut table = nat::Table::new();
+        let server = [2, 2, 2, 2];
+        for slot in 0..nat::SLOTS {
+            table.slot_for([1, 1, 1, slot as u8], 1000 + slot as u16, server, 53, 0);
+        }
+        // Answer slot 7 at 100 ms (a finished DNS lookup).
+        let mut reply = [0; 64];
+        let len = nat::build_udp4(server, 53, [10, 0, 0, 1], nat::EXT_PORT_BASE + 7, b"a", &mut reply)
+            .unwrap();
+        let parsed = nat::parse_udp4(&reply[..len]).unwrap();
+        assert!(table.reverse_udp(&parsed, [10, 0, 0, 1], 100).is_some());
+
+        // Within its answered grace nothing is reclaimable.
+        assert_eq!(table.slot_for([9; 4], 9, [8; 4], 8, 100 + nat::ANSWERED_IDLE_MS - 1), None);
+        // After it, the finished exchange goes first, ahead of older ones.
+        assert_eq!(table.slot_for([9; 4], 9, [8; 4], 8, 100 + nat::ANSWERED_IDLE_MS), Some(7));
+        // A fresh tuple in a reused slot is not considered answered.
+        assert!(!table.get(7).unwrap().answered);
+        // Unanswered flows become reclaimable only once quiet for a while.
+        assert_eq!(table.slot_for([9; 4], 10, [8; 4], 8, nat::PRESSURE_IDLE_MS - 1), None);
+        assert_eq!(table.slot_for([9; 4], 10, [8; 4], 8, nat::PRESSURE_IDLE_MS), Some(0));
+    }
+
+    #[test]
     fn tcp_table_scales_to_48_and_expires_idle_entries() {
         let mut table = nat::TcpTable::new();
         let slot = table.slot_for([1; 4], 111, [2; 4], 222, 0).unwrap();
@@ -428,6 +453,75 @@ mod tests {
                 .slot_for([8; 4], 8, [9; 4], 9, 20 + nat::TCP_CLOSED_GRACE_MS + 1,)
                 .is_none()
         );
+    }
+
+    /// An IPv4 TCP segment with a 20-byte header and `payload` zero bytes.
+    fn tcp_segment(
+        src: ([u8; 4], u16),
+        dst: ([u8; 4], u16),
+        flags: u8,
+        sequence: u32,
+        acknowledgement: u32,
+        payload: usize,
+        out: &mut [u8; 1500],
+    ) -> usize {
+        let len = 40 + payload;
+        out[..len].fill(0);
+        out[0] = 0x45;
+        out[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        out[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        out[8] = 64;
+        out[9] = 6;
+        out[12..16].copy_from_slice(&src.0);
+        out[16..20].copy_from_slice(&dst.0);
+        out[20..22].copy_from_slice(&src.1.to_be_bytes());
+        out[22..24].copy_from_slice(&dst.1.to_be_bytes());
+        out[24..28].copy_from_slice(&sequence.to_be_bytes());
+        out[28..32].copy_from_slice(&acknowledgement.to_be_bytes());
+        out[32] = 0x50;
+        out[33] = flags;
+        out[34..36].copy_from_slice(&4096u16.to_be_bytes());
+        let ip_sum = checksum(&out[..20]);
+        out[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+        write_tcp_checksum(&mut out[..len]);
+        len
+    }
+
+    #[test]
+    fn tcp_fin_is_recognized_after_upstream_loss_and_reordering() {
+        const SYN: u8 = 0x02;
+        const ACK: u8 = 0x10;
+        const FIN_ACK: u8 = 0x11;
+        let client = ([100, 64, 0, 2], 40_000);
+        let server = ([10, 79, 0, 2], 5003);
+        let uplink = ([192, 168, 4, 2], nat::TCP_EXT_PORT_BASE);
+        let mut table = nat::TcpTable::new();
+        let mut buffer = [0u8; 1500];
+        let mut outbound = |table: &mut nat::TcpTable, flags, seq, ack, payload| {
+            let len = tcp_segment(client, server, flags, seq, ack, payload, &mut buffer);
+            let info = nat::parse_tcp4(&buffer[..len]).unwrap();
+            let slot = table.slot_for_packet(&info, 0).unwrap();
+            table.observe_outbound(slot, &info, 0);
+            slot
+        };
+        let slot = outbound(&mut table, SYN, 1000, 0, 0);
+        let mut inbound_buffer = [0u8; 1500];
+        let mut inbound = |table: &mut nat::TcpTable, flags, seq, payload| {
+            let len = tcp_segment(server, uplink, flags, seq, 1001, payload, &mut inbound_buffer);
+            table.observe_inbound(slot, &nat::parse_tcp4(&inbound_buffer[..len]).unwrap(), 0);
+        };
+        inbound(&mut table, SYN | ACK, 5000, 0);
+        inbound(&mut table, ACK, 5001, 100);
+        // 5101..5201 is lost upstream; the segment after it arrives first.
+        inbound(&mut table, ACK, 5201, 100);
+        inbound(&mut table, ACK, 5101, 100);
+        // A FIN far outside any window is not the server's.
+        inbound(&mut table, FIN_ACK, 5301 + 200_000, 0);
+        assert_eq!(table.closure(slot), Some((false, false, None)));
+        inbound(&mut table, FIN_ACK, 5301, 0);
+        assert_eq!(table.closure(slot), Some((false, true, None)));
+        outbound(&mut table, FIN_ACK, 1001, 5302, 0);
+        assert_eq!(table.closure(slot), Some((true, true, Some(0))));
     }
 
     #[test]

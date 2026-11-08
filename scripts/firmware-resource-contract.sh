@@ -16,9 +16,19 @@ RAM_BASELINE=296176
 IMAGE_LIMIT=3499303
 # .stack is whatever RAM is left after .data/.bss, so static growth silently
 # eats stack headroom. Assert a floor so a regression fails CI instead of
-# panicking mid-TLS-handshake on device: the control path peaks around 128 KiB,
-# and 80bfa07 grew .bss until the 126,864-byte stack overflowed by 1,264 bytes.
-STACK_FLOOR=129024
+# panicking mid-TLS-handshake on device (80bfa07 grew .bss until the stack
+# overflowed by 1,264 bytes).
+#
+# The floor is the measured peak plus margin, not an estimate. The ESP exit lab
+# (tests/lab/esp-exit-local.sh with TF_ESP_EXIT_TLS=1, //tests/lab:esp_exit_tls)
+# runs this production build in ESP-EMU through enrollment, verified TLS
+# control and DERP, and exit-node traffic, and paints the stack: the deepest
+# point is the Noise handshake over TLS at 100,508 bytes. Boot used to be
+# deeper (117 KB, from Node temporaries in tunnel::provision) until the node was
+# restored in place. 14 KiB of margin covers paths the lab does not reach, such
+# as node-key rotation; re-measure before lowering it, and spend what is above
+# it on forwarding buffers (TS_FWD_UP_PACKETS / TS_FWD_DOWN_PACKETS).
+STACK_FLOOR=114688
 # The radio heap and .stack share one pool that must end at 0x4087e610 -- the
 # 6,640 bytes above that are ROM scratch that ROM flash code reuses at runtime
 # -- so stack headroom is bought 1:1 from the heap. Take only what the control

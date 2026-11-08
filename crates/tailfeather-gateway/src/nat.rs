@@ -8,8 +8,9 @@
 use crate::checksum;
 
 /// Concurrent UDP flows. All mappings share one raw socket, so entries cost
-/// only tuple state rather than a separately buffered socket.
-pub const SLOTS: usize = 32;
+/// only tuple state rather than a separately buffered socket. Every DNS lookup
+/// arrives from a fresh source port, so a page load spends several at once.
+pub const SLOTS: usize = 64;
 
 /// External ports are assigned one per slot, so a reply's destination port
 /// identifies its flow before the table is consulted.
@@ -17,6 +18,16 @@ pub const EXT_PORT_BASE: u16 = 40000;
 
 /// Drop a flow that has been idle this long, freeing its slot.
 pub const IDLE_TIMEOUT_MS: u64 = 30_000;
+
+/// With no free or expired slot, a flow that has been answered and then gone
+/// quiet this long is reclaimed for a new one. A request/response exchange
+/// (DNS, NTP, STUN) is finished at that point; holding it the full idle timeout
+/// let two bursts of lookups lock every later one out for 30 seconds.
+pub const ANSWERED_IDLE_MS: u64 = 2_000;
+
+/// With no better candidate, any flow idle this long is reclaimed. A live
+/// stream (QUIC, voice) is never this quiet and is never evicted.
+pub const PRESSURE_IDLE_MS: u64 = 10_000;
 
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMP: u8 = 1;
@@ -196,11 +207,18 @@ pub struct Flow {
     pub server_ip: [u8; 4],
     pub server_port: u16,
     pub last_used_ms: u64,
+    /// A reply has come back through this mapping.
+    pub answered: bool,
 }
 
-#[derive(Default)]
 pub struct Table {
     flows: [Option<Flow>; SLOTS],
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Table {
@@ -253,19 +271,24 @@ impl Table {
         }
 
         // Prefer a free slot, then the least recently used one that has gone
-        // idle. A busy table never evicts a live flow, it just refuses.
-        let victim = self.flows.iter().position(Option::is_none).or_else(|| {
+        // idle, then -- only because the table is full -- a finished exchange,
+        // then anything quiet for a while. A busy table never evicts a live
+        // flow, it just refuses.
+        let idle = |f: &Flow| now_ms.saturating_sub(f.last_used_ms);
+        let oldest = |eligible: &dyn Fn(&Flow) -> bool| {
             self.flows
                 .iter()
                 .enumerate()
-                .filter(|(_, f)| {
-                    f.is_some_and(|f| now_ms.saturating_sub(f.last_used_ms) >= IDLE_TIMEOUT_MS)
-                })
-                .min_by_key(|(_, f)| f.map(|f| f.last_used_ms).unwrap_or(0))
+                .filter_map(|(i, f)| f.filter(|f| eligible(f)).map(|f| (i, f.last_used_ms)))
+                .min_by_key(|(_, last_used)| *last_used)
                 .map(|(i, _)| i)
-        })?;
-
-        Some(victim)
+        };
+        self.flows
+            .iter()
+            .position(Option::is_none)
+            .or_else(|| oldest(&|f| idle(f) >= IDLE_TIMEOUT_MS))
+            .or_else(|| oldest(&|f| f.answered && idle(f) >= ANSWERED_IDLE_MS))
+            .or_else(|| oldest(&|f| idle(f) >= PRESSURE_IDLE_MS))
     }
 
     /// Commit a successfully enqueued outbound UDP datagram.
@@ -281,12 +304,21 @@ impl Table {
         if slot >= SLOTS {
             return;
         }
+        // The same tuple keeps its answered state; a new tuple starts fresh.
+        let answered = self.flows[slot].is_some_and(|f| {
+            f.answered
+                && f.client_ip == client_ip
+                && f.client_port == client_port
+                && f.server_ip == server_ip
+                && f.server_port == server_port
+        });
         self.flows[slot] = Some(Flow {
             client_ip,
             client_port,
             server_ip,
             server_port,
             last_used_ms: now_ms,
+            answered,
         });
     }
 
@@ -312,7 +344,10 @@ impl Table {
         {
             return None;
         }
-        self.touch(slot, now_ms);
+        if let Some(Some(flow)) = self.flows.get_mut(slot) {
+            flow.last_used_ms = now_ms;
+            flow.answered = true;
+        }
         Some(flow)
     }
 }
@@ -374,6 +409,19 @@ struct TcpFlow {
     /// both SYNs offer it, so the pair must be kept, not just the values.
     client_window_scale: Option<u8>,
     server_window_scale: Option<u8>,
+}
+
+/// Slot usage of a [`TcpTable`] by connection state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpOccupancy {
+    /// Both directions are established and neither has sent FIN.
+    pub open: usize,
+    /// The client's SYN was forwarded but the server has not answered.
+    pub embryonic: usize,
+    /// One direction has sent FIN.
+    pub half_closed: usize,
+    /// Both FINs seen; reclaimable at once.
+    pub closed: usize,
 }
 
 pub struct TcpTable {
@@ -457,6 +505,8 @@ impl TcpTable {
                 server_ip,
                 server_port,
                 last_used_ms: now_ms,
+                // TCP closes explicitly; this UDP eviction hint is unused.
+                answered: false,
             },
             external_port,
             client_fin: false,
@@ -690,14 +740,25 @@ impl TcpTable {
             return;
         }
 
+        // `own_next` is the highest sequence this direction has reached. A
+        // segment is accepted when it lies within the largest window that can
+        // be in flight -- the gateway strips window scaling on the wire, so no
+        // more than 65,535 bytes -- of that mark, and an accepted segment
+        // advances it. Requiring the exact next sequence instead lost track
+        // for good at the first segment dropped or reordered upstream (the
+        // following ones arrive "early"), so the flow's FIN was never
+        // recognized and a busy exit node filled its table with half-closed
+        // flows that sat out the full idle timeout.
         let next = packet.next_sequence();
         let sequence_valid = match *own_next {
             None if outbound || !packet.is_ack || peer_next == Some(packet.acknowledgement) => {
                 *own_next = Some(next);
                 true
             }
-            Some(expected) if packet.sequence == expected => {
-                *own_next = Some(next);
+            Some(high) if within_window(packet.sequence, high) => {
+                if sequence_before(high, next) {
+                    *own_next = Some(next);
+                }
                 true
             }
             _ => false,
@@ -713,6 +774,23 @@ impl TcpTable {
                 flow.closed_at_ms = Some(now_ms);
             }
         }
+    }
+
+    /// How the table's slots are spent, for capacity diagnostics.
+    pub fn occupancy(&self) -> TcpOccupancy {
+        let mut occupancy = TcpOccupancy::default();
+        for flow in self.flows.iter().flatten() {
+            if flow.closed_at_ms.is_some() {
+                occupancy.closed += 1;
+            } else if flow.server_next_seq.is_none() {
+                occupancy.embryonic += 1;
+            } else if flow.client_fin || flow.server_fin {
+                occupancy.half_closed += 1;
+            } else {
+                occupancy.open += 1;
+            }
+        }
+        occupancy
     }
 
     pub fn closure(&self, slot: usize) -> Option<(bool, bool, Option<u64>)> {
@@ -771,6 +849,20 @@ impl TcpTable {
     }
 }
 
+/// The largest unscaled TCP window: everything in flight for one direction of
+/// a translated flow lies within this distance of its highest sequence.
+const MAX_TRACKED_WINDOW: u32 = u16::MAX as u32;
+
+/// `left` precedes `right` in 32-bit sequence space.
+fn sequence_before(left: u32, right: u32) -> bool {
+    (left.wrapping_sub(right) as i32) < 0
+}
+
+/// `sequence` is within one maximal window either side of `high`.
+fn within_window(sequence: u32, high: u32) -> bool {
+    sequence.wrapping_sub(high).wrapping_add(MAX_TRACKED_WINDOW) <= 2 * MAX_TRACKED_WINDOW
+}
+
 /// Portable view of an unfragmented inner TCP segment.
 pub struct TcpInfo<'a> {
     pub src_port: u16,
@@ -792,7 +884,8 @@ pub struct TcpInfo<'a> {
 }
 
 impl TcpInfo<'_> {
-    fn opens_connection(&self) -> bool {
+    /// An initial SYN: the only segment that may claim a NAT slot.
+    pub fn opens_connection(&self) -> bool {
         self.is_syn && !self.is_ack && !self.is_fin && !self.is_rst
     }
 

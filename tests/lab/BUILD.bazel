@@ -3,6 +3,10 @@ load("@rules_shell//shell:sh_test.bzl", "sh_test")
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
+    "esp-tls/ca.der",
+    "esp-tls/ca.pem",
+    "esp-tls/control.key",
+    "esp-tls/control.pem",
     "guest-controller.sh",
     "headscale.yaml",
     "nat-matrix.sh",
@@ -38,6 +42,8 @@ sh_test(
 
 APK_FILES = [
     "@apk_bash//file",
+    "@apk_dnsmasq//file",
+    "@apk_dnsmasq_common//file",
     "@apk_conntrack_tools//file",
     "@apk_ethtool//file",
     "@apk_iproute2_minimal//file",
@@ -163,5 +169,62 @@ sh_test(
     size = "enormous",
     tags = VM_TAGS,
     # The guest bounds the matrix stage at 1200s.
+    timeout = "eternal",
+)
+
+# The production ESP32-C6 firmware in ESP-EMU as a Headscale exit node, with
+# IPv4 TCP throughput through it. Build with --config=optimized so the
+# firmware runs at production optimization:
+#
+#   bazel test --config=optimized //tests/lab:esp_exit --test_output=streamed
+#
+# TF_ESP_EXIT_* knobs (see esp-exit.sh) pass through --test_env.
+sh_test(
+    name = "esp_exit",
+    srcs = ["privileged-smolvm.sh"],
+    args = VM_ARGS + [
+        "--stages=esp-exit",
+        "--esp-emu=$(rootpath @esp_emu_0_50_0_linux_x86_64//:esp-emu)",
+        "--esp-flash=$(rootpath //firmware:emulab_flash)",
+        "--esp-elf=$(rootpath //firmware:esp_gateway_firmware_emulab)",
+        "--esp-exit=$(rootpath :esp-exit.sh)",
+    ],
+    data = VM_DATA + [
+        "esp-exit.sh",
+        "//firmware:emulab_flash",
+        "//firmware:esp_gateway_firmware_emulab",
+        "@esp_emu_0_50_0_linux_x86_64//:esp-emu",
+    ],
+    size = "enormous",
+    tags = VM_TAGS + ["manual"],
+    timeout = "eternal",
+)
+
+# The same stage against the production build (//firmware:emulab_tls_flash):
+# NTP time bootstrap, TLS 1.3 control and DERP verified against the pinned lab
+# CA in esp-tls/, Noise, HTTP/2. Its stack high-water mark is what the
+# firmware resource contract's STACK_FLOOR is measured from.
+sh_test(
+    name = "esp_exit_tls",
+    srcs = ["privileged-smolvm.sh"],
+    args = VM_ARGS + [
+        "--stages=esp-exit-tls",
+        "--esp-emu=$(rootpath @esp_emu_0_50_0_linux_x86_64//:esp-emu)",
+        "--esp-flash=$(rootpath //firmware:emulab_tls_flash)",
+        "--esp-elf=$(rootpath //firmware:esp_gateway_firmware_emulab_tls)",
+        "--esp-exit=$(rootpath :esp-exit.sh)",
+        "--esp-tls=$(rootpath :esp-tls/control.pem)",
+    ],
+    data = VM_DATA + [
+        "esp-exit.sh",
+        "esp-tls/ca.pem",
+        "esp-tls/control.key",
+        "esp-tls/control.pem",
+        "//firmware:emulab_tls_flash",
+        "//firmware:esp_gateway_firmware_emulab_tls",
+        "@esp_emu_0_50_0_linux_x86_64//:esp-emu",
+    ],
+    size = "enormous",
+    tags = VM_TAGS + ["manual"],
     timeout = "eternal",
 )

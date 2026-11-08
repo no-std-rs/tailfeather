@@ -231,3 +231,13 @@ test_suite(
     name = "nat_matrix",
     tests = ["//tests/lab:nat_matrix"],
 )
+
+# The emulated ESP32-C6 as a Headscale exit node, plaintext and production TLS
+# builds (.github/workflows/esp-exit-lab.yml).
+test_suite(
+    name = "esp_exit_lab",
+    tests = [
+        "//tests/lab:esp_exit",
+        "//tests/lab:esp_exit_tls",
+    ],
+)

@@ -7,6 +7,7 @@ runfile() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$PWD" "$
 ROOTFS="" SMOLVM="" LIBKRUNFW="" GUEST="" HEADSCALE="" TAILSCALE="" TAILSCALED=""
 CONFORMANCE="" HARNESS="" RESPONDER="" INTEROP="" NOSTD_INTEROP="" EXPECTATIONS="" VECTORS=""
 HEADSCALE_CONFIG="" SSH_SERVER="" SSH_NETWORK="" REACTOR_NODE="" REACTOR_REBIND="" NAT_MATRIX=""
+ESP_EMU="" ESP_FLASH="" ESP_ELF="" ESP_EXIT="" ESP_TLS=""
 STAGES=all
 APKS=()
 for arg in "$@"; do
@@ -31,6 +32,11 @@ for arg in "$@"; do
         --reactor-rebind=*) REACTOR_REBIND=$(runfile "${arg#*=}") ;;
         --headscale-config=*) HEADSCALE_CONFIG=$(runfile "${arg#*=}") ;;
         --nat-matrix=*) NAT_MATRIX=$(runfile "${arg#*=}") ;;
+        --esp-emu=*) ESP_EMU=$(runfile "${arg#*=}") ;;
+        --esp-flash=*) ESP_FLASH=$(runfile "${arg#*=}") ;;
+        --esp-elf=*) ESP_ELF=$(runfile "${arg#*=}") ;;
+        --esp-exit=*) ESP_EXIT=$(runfile "${arg#*=}") ;;
+        --esp-tls=*) ESP_TLS=$(runfile "${arg#*=}") ;;
         --stages=*) STAGES=${arg#*=} ;;
         --apk=*) APKS+=("$(runfile "${arg#*=}")") ;;
         *) fail "unknown argument: $arg" ;;
@@ -95,6 +101,15 @@ stage_input "$SSH_NETWORK" ssh-network.sh
 stage_input "$REACTOR_NODE" reactor-node
 stage_input "$REACTOR_REBIND" reactor-rebind.sh
 stage_input "$NAT_MATRIX" nat-matrix.sh
+stage_input "$ESP_EMU" esp-emu
+stage_input "$ESP_FLASH" esp-flash.bin
+stage_input "$ESP_ELF" esp-firmware.elf
+stage_input "$ESP_EXIT" esp-exit.sh
+if test -n "$ESP_TLS"; then
+    mkdir -p "$GUEST_ROOT/opt/lab/esp-tls"
+    cp -L "$(dirname "$ESP_TLS")"/control.pem "$(dirname "$ESP_TLS")"/control.key \
+        "$(dirname "$ESP_TLS")"/ca.pem "$GUEST_ROOT/opt/lab/esp-tls/"
+fi
 stage_input "$RESPONDER" responder
 stage_input "$INTEROP" interop-wireguard.sh
 stage_input "$NOSTD_INTEROP" nostd-interop.sh
@@ -141,7 +156,8 @@ SMOLVM_BOOT_DEBUG=1 \
     --mem 6144 \
     --timeout 2400s \
     --no-init-cache \
-    -- /opt/lab/guest-controller.sh "$STAGES" || status=$?
+    -- /usr/bin/env $(env | grep -E '^TF_ESP_EXIT_[A-Z_]+=[A-Za-z0-9.]*$' | tr '\n' ' ') \
+    /opt/lab/guest-controller.sh "$STAGES" || status=$?
 
 if test "$status" -ne 0; then
     echo "--- smolVM diagnostics ---" >&2
