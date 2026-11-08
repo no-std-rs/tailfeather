@@ -1040,7 +1040,7 @@ async fn register(
         version: tailfeather::control::CAPABILITY_VERSION,
         node_key: &node_key,
         old_node_key: node.rotation_old_node_key(),
-        auth_key: node.registration_auth_key(crate::TS_AUTH_KEY),
+        auth_key: node.registration_auth_key(crate::ts_auth_key()),
         hostinfo: Hostinfo {
             hostname: crate::TS_HOSTNAME,
             routable_ips: crate::tunnel::exit_routes(),
@@ -1397,67 +1397,49 @@ async fn open_link<'a>(
     );
     crate::stack::log_used("noise-connect-connected");
     if control.is_secure() {
-        info!(
-            "control stage={} state=start",
-            ControlStage::NoiseTls.as_str()
-        );
-        let tls = verified_tls(
+        let secure = open_secure_link(
             socket,
             control,
+            authority,
+            server_key,
+            identity,
+            rng,
             tls_read,
             tls_write,
+            h2_read,
+            h2_connection,
             rsa,
-            ControlStage::NoiseTls,
-        )
-        .await?;
-        info!(
-            "control stage={} state=verified",
-            ControlStage::NoiseTls.as_str()
         );
-        crate::stack::log_used("noise-tls-verified");
-        info!(
-            "control stage={} state=start",
-            ControlStage::NoiseHandshake.as_str()
-        );
-        let noise =
-            tailfeather::control::transport::establish(tls, authority, identity, server_key, rng)
-                .await
-                .map_err(|error| transport_failure(ControlStage::NoiseHandshake, error))?;
-        info!(
-            "control stage={} state=complete",
-            ControlStage::NoiseHandshake.as_str()
-        );
-        crate::stack::log_used("noise-handshake-complete");
-        info!(
-            "control stage={} state=start",
-            ControlStage::Http2Start.as_str()
-        );
-        let http2 = noise
-            .into_https2_with_storage(h2_read, h2_connection)
-            .await
-            .map_err(|error| transport_failure(ControlStage::Http2Start, error))?;
-        info!(
-            "control stage={} state=complete",
-            ControlStage::Http2Start.as_str()
-        );
-        crate::stack::log_used("http2-start-complete");
-        Ok(Link::Secure(http2))
+        // Production images inline the only branch they have; that is the
+        // shallowest stack, and the TLS lab image keeps that exact shape so it
+        // measures production. The plaintext lab image polls this branch from
+        // a frame of its own as well (see [`OwnFrame`]), so `open_link` holds
+        // neither branch's temporaries.
+        #[cfg(emulab_plain)]
+        let secure = OwnFrame(secure);
+        secure.await
     } else {
-        #[cfg(feature = "test-insecure-control")]
+        // Only the plaintext lab image speaks Noise over bare TCP. The TLS lab
+        // image refuses here exactly as production does, so its control path
+        // is production's, frame for frame.
+        #[cfg(emulab_plain)]
         {
-            let noise = tailfeather::control::transport::establish(
-                socket, authority, identity, server_key, rng,
-            )
-            .await
-            .map_err(|error| plain_transport_failure(ControlStage::NoiseHandshake, error))?;
-            Ok(Link::Plain(
-                noise
-                    .into_http2_with_storage(h2_read, h2_connection)
-                    .await
-                    .map_err(|error| plain_transport_failure(ControlStage::Http2Start, error))?,
+            // Inlined, this branch's Noise and HTTP/2 temporaries did not
+            // share stack slots with the TLS branch's: `open_link`'s poll
+            // frame doubled to ~99 KB and overflowed the main stack into
+            // `.bss` (the Wi-Fi driver's state) on the first lab enrollment.
+            OwnFrame(open_plain_link(
+                socket,
+                authority,
+                identity,
+                server_key,
+                rng,
+                h2_read,
+                h2_connection,
             ))
+            .await
         }
-        #[cfg(not(feature = "test-insecure-control"))]
+        #[cfg(not(emulab_plain))]
         {
             let _ = (
                 socket,
@@ -1470,6 +1452,111 @@ async fn open_link<'a>(
             );
             Err(Failure::protocol(ControlStage::NoiseHandshake))
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_secure_link<'a>(
+    socket: TcpSocket<'a>,
+    control: &Authority,
+    authority: &str,
+    server_key: &tailfeather::keys::MachinePublic,
+    identity: &tailfeather::keys::Identity,
+    rng: &mut HwRng,
+    tls_read: &'a mut [u8],
+    tls_write: &'a mut [u8],
+    h2_read: &'a mut [u8; H2_BUFFER],
+    h2_connection: &'a mut micro_h2::Connection,
+    rsa: &'a mut RsaWorkspace,
+) -> Result<Link<'a>, Failure> {
+    info!(
+        "control stage={} state=start",
+        ControlStage::NoiseTls.as_str()
+    );
+    let tls = verified_tls(
+        socket,
+        control,
+        tls_read,
+        tls_write,
+        rsa,
+        ControlStage::NoiseTls,
+    )
+    .await?;
+    info!(
+        "control stage={} state=verified",
+        ControlStage::NoiseTls.as_str()
+    );
+    crate::stack::log_used("noise-tls-verified");
+    info!(
+        "control stage={} state=start",
+        ControlStage::NoiseHandshake.as_str()
+    );
+    let noise =
+        tailfeather::control::transport::establish(tls, authority, identity, server_key, rng)
+            .await
+            .map_err(|error| transport_failure(ControlStage::NoiseHandshake, error))?;
+    info!(
+        "control stage={} state=complete",
+        ControlStage::NoiseHandshake.as_str()
+    );
+    crate::stack::log_used("noise-handshake-complete");
+    info!(
+        "control stage={} state=start",
+        ControlStage::Http2Start.as_str()
+    );
+    let http2 = noise
+        .into_https2_with_storage(h2_read, h2_connection)
+        .await
+        .map_err(|error| transport_failure(ControlStage::Http2Start, error))?;
+    info!(
+        "control stage={} state=complete",
+        ControlStage::Http2Start.as_str()
+    );
+    crate::stack::log_used("http2-start-complete");
+    Ok(Link::Secure(http2))
+}
+
+#[cfg(emulab_plain)]
+async fn open_plain_link<'a>(
+    socket: TcpSocket<'a>,
+    authority: &str,
+    identity: &tailfeather::keys::Identity,
+    server_key: &tailfeather::keys::MachinePublic,
+    rng: &mut HwRng,
+    h2_read: &'a mut [u8; H2_BUFFER],
+    h2_connection: &'a mut micro_h2::Connection,
+) -> Result<Link<'a>, Failure> {
+    let noise =
+        tailfeather::control::transport::establish(socket, authority, identity, server_key, rng)
+            .await
+            .map_err(|error| plain_transport_failure(ControlStage::NoiseHandshake, error))?;
+    Ok(Link::Plain(
+        noise
+            .into_http2_with_storage(h2_read, h2_connection)
+            .await
+            .map_err(|error| plain_transport_failure(ControlStage::Http2Start, error))?,
+    ))
+}
+
+/// Polls a future from a stack frame of its own.
+///
+/// The compiler otherwise inlines a nested future's poll into its parent's,
+/// and the parent's frame then holds the temporaries of every branch at once.
+#[cfg(emulab_plain)]
+struct OwnFrame<F>(F);
+
+#[cfg(emulab_plain)]
+impl<F: core::future::Future> core::future::Future for OwnFrame<F> {
+    type Output = F::Output;
+
+    #[inline(never)]
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<F::Output> {
+        // SAFETY: the inner future is structurally pinned; it is never moved
+        // out of `self`.
+        unsafe { self.map_unchecked_mut(|own| &mut own.0) }.poll(cx)
     }
 }
 
@@ -1490,6 +1577,30 @@ pub fn emit_action(action: Option<&NodeAction>) {
 /// bootstrap and streaming in this task means Embassy reserves one maximum
 /// control frame instead of retaining a bootstrap frame in the packet actor
 /// alongside a second long-poll frame.
+#[cfg(tailfeather_emulab)]
+pub fn log_type_sizes() {
+    use core::mem::size_of;
+    info!(
+        "sizes link={} secure_h2={} secure_stream={} noise_tcp={} node={} netmap={}",
+        size_of::<Link<'static>>(),
+        size_of::<SecureHttp2<'static>>(),
+        size_of::<SecureStream<'static>>(),
+        size_of::<tailfeather::control::transport::NoiseStream<TcpSocket<'static>>>(),
+        size_of::<Node<PEERS>>(),
+        size_of::<Netmap<PEERS>>(),
+    );
+    use tailfeather::netmap as n;
+    info!(
+        "sizes netmap_parts peers={} peer={} derp={} dns={} policy={} rule={}",
+        size_of::<n::PeerTable<PEERS>>(),
+        size_of::<n::Peer>(),
+        size_of::<n::DerpMap>(),
+        size_of::<n::DnsConfig>(),
+        size_of::<n::PacketPolicy>(),
+        size_of::<n::FilterRule>(),
+    );
+}
+
 #[embassy_executor::task]
 pub async fn run(
     stack: Stack<'static>,

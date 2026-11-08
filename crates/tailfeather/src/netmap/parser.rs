@@ -285,7 +285,7 @@ impl Pending {
 #[derive(Default)]
 struct PendingRegion {
     id: u16,
-    code: heapless::String<16>,
+    code: heapless::String<{ crate::netmap::MAX_DERP_REGION_CODE }>,
     no_measure_no_home: bool,
     nodes: crate::BoundedVec<DerpNode, { crate::netmap::MAX_DERP_NODES }>,
     stun_fallback: Option<DerpNode>,

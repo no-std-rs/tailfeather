@@ -63,12 +63,31 @@ const WG_DATAGRAM_LEN: usize = wirefeather::MAX_DATAGRAM_LEN;
 // replies that must receive PTB. main checks the actual driver MTU at startup.
 pub(crate) const UPLINK_IP_MTU: usize = 1500;
 const _: () = assert!(WG_DATAGRAM_LEN <= UPLINK_IP_MTU);
-const WG_RX_PACKETS: usize = 2;
+/// Forwarding window budget, in full-size packets. A build may raise either
+/// with `--action_env=TS_FWD_UP_PACKETS=N` / `TS_FWD_DOWN_PACKETS=N`; every
+/// buffer that must absorb the resulting burst is sized from these, so the
+/// advertised windows can never outrun the arenas behind them.
+///
+/// Up: the server window the client sees, so client-to-internet segments in
+/// flight, all of which land in the WireGuard RX ring (plus one slot for an
+/// ACK or control message arriving behind them).
+const FWD_UP_PACKETS: usize = crate::build_count(option_env!("TS_FWD_UP_PACKETS"), 4);
+/// Down: the client window the server sees, so internet-to-client segments in
+/// flight, all of which land in the uplink raw socket's TCP arena.
+const FWD_DOWN_PACKETS: usize = crate::build_count(option_env!("TS_FWD_DOWN_PACKETS"), 8);
+const _: () = assert!(FWD_UP_PACKETS >= 1 && FWD_DOWN_PACKETS >= 1);
+const WG_RX_PACKETS: usize = FWD_UP_PACKETS + 1;
+/// Metadata slots for the WireGuard RX ring. smoltcp drops a datagram when
+/// either the slots or the byte arena run out, and small datagrams -- DNS,
+/// TCP ACKs, keepalives -- exhaust a slot-per-full-packet ring long before its
+/// bytes: ten concurrent DNS queries overflowed the five-slot ring. Slots cost
+/// a few dozen bytes each, so absorb small-packet bursts with slots, not RAM.
+const WG_RX_SLOTS: usize = if WG_RX_PACKETS * 4 > 16 { WG_RX_PACKETS * 4 } else { 16 };
 const WG_TX_PACKETS: usize = 1;
 const WG_RX_BUFFER_LEN: usize = WG_RX_PACKETS * WG_DATAGRAM_LEN;
 const WG_TX_BUFFER_LEN: usize = WG_TX_PACKETS * WG_DATAGRAM_LEN;
 
-static WG_RX_META: StaticCell<[PacketMetadata; WG_RX_PACKETS]> = StaticCell::new();
+static WG_RX_META: StaticCell<[PacketMetadata; WG_RX_SLOTS]> = StaticCell::new();
 static WG_TX_META: StaticCell<[PacketMetadata; WG_TX_PACKETS]> = StaticCell::new();
 static WG_RX_BUFFER: StaticCell<[u8; WG_RX_BUFFER_LEN]> = StaticCell::new();
 static WG_TX_BUFFER: StaticCell<[u8; WG_TX_BUFFER_LEN]> = StaticCell::new();
@@ -77,15 +96,18 @@ static WG_TX_BUFFER: StaticCell<[u8; WG_TX_BUFFER_LEN]> = StaticCell::new();
 /// metadata entries absorb a simultaneous SYN/SYN-ACK burst, while the RX
 /// payload arena retains the four full packets permitted by the advertised
 /// client receive window. TX remains a single-packet, backpressured queue.
-const TCP_RAW_RX_ARENA_PACKETS: usize = 4;
-const TCP_CLIENT_WINDOW_PACKETS: u16 = 4;
+const TCP_RAW_RX_ARENA_PACKETS: usize = FWD_DOWN_PACKETS;
+const TCP_CLIENT_WINDOW_PACKETS: u16 = FWD_DOWN_PACKETS as u16;
 const TCP_RAW_RX_BUFFER_LEN: usize = TCP_RAW_RX_ARENA_PACKETS * wirefeather::budget::INNER_MTU;
-const TCP_RAW_PACKETS: usize = 24;
+const TCP_RAW_PACKETS: usize = if FWD_DOWN_PACKETS > 24 { FWD_DOWN_PACKETS } else { 24 };
 const CLIENT_TCP_RECEIVE_WINDOW: u16 = TCP_CLIENT_WINDOW_PACKETS * nat::MAX_MSS;
-const SERVER_TCP_RECEIVE_WINDOW: u16 = nat::MAX_MSS;
+const SERVER_TCP_RECEIVE_WINDOW: u16 = FWD_UP_PACKETS as u16 * nat::MAX_MSS;
 
 const _: () = assert!(CLIENT_TCP_RECEIVE_WINDOW as usize <= TCP_RAW_RX_BUFFER_LEN);
-const _: () = assert!(SERVER_TCP_RECEIVE_WINDOW as usize <= WG_DATAGRAM_LEN);
+const _: () = assert!(FWD_UP_PACKETS * nat::MAX_MSS as usize <= u16::MAX as usize);
+const _: () = assert!(FWD_DOWN_PACKETS * nat::MAX_MSS as usize <= u16::MAX as usize);
+const _: () =
+    assert!(SERVER_TCP_RECEIVE_WINDOW as usize <= (WG_RX_PACKETS - 1) * WG_DATAGRAM_LEN);
 
 /// All 32 UDP mappings share this raw socket. This replaces four independently
 /// buffered datagram sockets and funds the peer API's bounded connection state.
@@ -123,6 +145,12 @@ static NTP_RX_BUFFER: StaticCell<[u8; NTP_BUFFER_LEN]> = StaticCell::new();
 static NTP_TX_BUFFER: StaticCell<[u8; NTP_BUFFER_LEN]> = StaticCell::new();
 
 static NODE: StaticCell<Node<PEERS>> = StaticCell::new();
+
+/// Lab-only: WireGuard datagrams delivered to the tunnel task, so the lab can
+/// tell radio-side loss from loss inside the firmware.
+#[cfg(tailfeather_emulab)]
+pub(crate) static WG_RX_DATAGRAMS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 static SCRATCH: StaticCell<Scratch> = StaticCell::new();
 static PEER_API: StaticCell<tailfeather_gateway::peerapi::Server> = StaticCell::new();
 
@@ -143,6 +171,7 @@ struct Diagnostics {
     udp_capacity_drops: u64,
     udp_queue_drops: u64,
     tcp_capacity_drops: u64,
+    tcp_untracked_drops: u64,
     icmp_oversize_drops: u64,
     icmp_queue_drops: u64,
     peerapi_capacity_drops: u64,
@@ -264,7 +293,11 @@ pub(crate) fn provision(flash: esp_hal::peripherals::FLASH<'static>) -> Bootstra
     )
     .expect("TS_CONTROL_URL was validated before flashing");
     let mut rng = HwRng(esp_hal::rng::Rng::new());
-    let mut state_store = TwoSlot::new(crate::flash::FlashSlots::new(flash));
+    #[cfg_attr(not(tailfeather_emulab), allow(unused_mut))]
+    let mut slots = crate::flash::FlashSlots::new(flash);
+    #[cfg(tailfeather_emulab)]
+    slots.load_lab_auth_key();
+    let mut state_store = TwoSlot::new(slots);
     let loaded = state_store
         .load_with_metadata()
         .expect("persistent state slots are readable and not both corrupt");
@@ -272,35 +305,30 @@ pub(crate) fn provision(flash: esp_hal::peripherals::FLASH<'static>) -> Bootstra
     let replacement_generation = loaded
         .replacement_generation()
         .expect("persistent state generation is not exhausted");
-    let node = NODE.init_with(|| match loaded.into_state() {
-        Some(state) => match Node::restore_for_authority(&state, authority.digest()) {
-            Ok(node) => {
+    // Build the node once, in its static, then restore onto it. Restoring by
+    // value stacked a Node-sized temporary per constructor layer: this frame
+    // alone was ~101 KB, the deepest point of every boot.
+    let node = NODE.init_with(|| {
+        Node::factory_reset_for_authority(
+            Identity::generate(&mut rng),
+            replacement_generation,
+            authority.digest(),
+        )
+    });
+    match loaded.into_state() {
+        Some(state) => match node.restore_in_place(&state, authority.digest()) {
+            Ok(()) => {
                 if needs_repair && !node.requires_persistence() {
                     state_store
                         .save(&state)
                         .expect("repair the missing persistent state copy before networking");
                 }
                 info!("state=identity-restored");
-                node
             }
-            Err(_) => {
-                info!("state=identity-created reason=authority-changed");
-                Node::factory_reset_for_authority(
-                    Identity::generate(&mut rng),
-                    replacement_generation,
-                    authority.digest(),
-                )
-            }
+            Err(_) => info!("state=identity-created reason=authority-changed"),
         },
-        None => {
-            info!("state=identity-created reason=first-boot");
-            Node::factory_reset_for_authority(
-                Identity::generate(&mut rng),
-                replacement_generation,
-                authority.digest(),
-            )
-        }
-    });
+        None => info!("state=identity-created reason=first-boot"),
+    }
     if node.requires_persistence() {
         let state = match node.poll(0) {
             Ok(Some(NodeAction::PersistState(state))) => state,
@@ -375,7 +403,7 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
 
     let mut wg_socket = UdpSocket::new(
         stack,
-        WG_RX_META.init([PacketMetadata::EMPTY; WG_RX_PACKETS]),
+        WG_RX_META.init([PacketMetadata::EMPTY; WG_RX_SLOTS]),
         WG_RX_BUFFER.init([0; WG_RX_BUFFER_LEN]),
         WG_TX_META.init([PacketMetadata::EMPTY; WG_TX_PACKETS]),
         WG_TX_BUFFER.init([0; WG_TX_BUFFER_LEN]),
@@ -416,6 +444,9 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
         nat::SLOTS,
         nat::TCP_SLOTS,
         tailfeather_gateway::peerapi::PORT,
+    );
+    info!(
+        "forward-budget up_packets={FWD_UP_PACKETS} down_packets={FWD_DOWN_PACKETS} wg_rx={WG_RX_PACKETS} wg_rx_slots={WG_RX_SLOTS} server_window={SERVER_TCP_RECEIVE_WINDOW} client_window={CLIENT_TCP_RECEIVE_WINDOW}"
     );
 
     loop {
@@ -513,6 +544,8 @@ pub(crate) async fn tunnel(stack: Stack<'static>, bootstrap: Bootstrap, spawner:
             match ready {
                 Ready::Tunnel => {
                     if let Ok((len, from)) = wg_socket.recv_from(&mut scratch.datagram).await {
+                        #[cfg(tailfeather_emulab)]
+                        WG_RX_DATAGRAMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         handle_tunnel_datagram(
                             node,
                             &mut rng,
@@ -1577,7 +1610,21 @@ async fn forward_tcp_out(
     }
     let now_ms = embassy_time::Instant::now().as_millis();
     let Some(slot) = tcp_table.slot_for_packet(info, now_ms) else {
+        // Only a SYN may claim a slot. Anything else without a flow belongs
+        // to a connection that already ended (a retransmitted FIN or ACK
+        // after an RST, say) and is not a sign of a full table.
+        if !info.opens_connection() {
+            rate_limited(&mut diagnostics.tcp_untracked_drops, "tcp-untracked-drop");
+            return;
+        }
         rate_limited(&mut diagnostics.tcp_capacity_drops, "tcp-nat-capacity-drop");
+        if diagnostics.tcp_capacity_drops.is_power_of_two() {
+            let o = tcp_table.occupancy();
+            info!(
+                "metric=tcp-nat-occupancy open={} embryonic={} half_closed={} closed={}",
+                o.open, o.embryonic, o.half_closed, o.closed
+            );
+        }
         return;
     };
     let Some(external_port) = tcp_table.external_port_for_packet(slot, info, now_ms) else {

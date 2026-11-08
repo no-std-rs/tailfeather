@@ -181,6 +181,31 @@ http_archive(
     urls = ["https://pkgs.tailscale.com/stable/tailscale_1.94.2_amd64.tgz"],
 )
 
+# Espressif's ESP32 emulator (static-pie, so it also runs inside the Alpine lab
+# guest) and the ELF-to-flash-image converter the ESP exit-node lab uses.
+http_archive(
+    name = "esp_emu_0_50_0_linux_x86_64",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["esp-emu"])
+""",
+    sha256 = "3f388f44ae38e829c74d637a68f4d80a136c375ff4d7d168acf87c8d274f0075",
+    strip_prefix = "esp-emu-0.50.0-x86_64-unknown-linux-gnu",
+    urls = ["https://github.com/espressif/esp-emulator/releases/download/v0.50.0/esp-emu-0.50.0-x86_64-unknown-linux-gnu.tar.gz"],
+)
+
+http_archive(
+    name = "espflash_4_4_0_linux_x86_64",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["espflash"])
+""",
+    sha256 = "ac2031bd1f04c9107d9ba0e977535daa885a9f533f937dc369debd77f83665cd",
+    urls = ["https://github.com/esp-rs/espflash/releases/download/v4.4.0/espflash-x86_64-unknown-linux-gnu.zip"],
+)
+
 # The privileged guest installs these checksum-pinned APKs with --no-network.
 # They form its complete networking and TLS overlay; the action never consults
 # Alpine package indexes or upstream repositories.
@@ -211,6 +236,10 @@ http_file(name = "apk_ncurses_terminfo_base", downloaded_file_path = "ncurses-te
 http_file(name = "apk_openssl", downloaded_file_path = "openssl-3.3.7-r2.apk", sha256 = "a444f449e2993d6b37fd5c9d9928b4378bb33a2362c0d0084ac940f564aaeb97", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/openssl-3.3.7-r2.apk"])
 http_file(name = "apk_readline", downloaded_file_path = "readline-8.2.13-r0.apk", sha256 = "fa4ff2347886f5516d021b9064a00259b29fc6e2608eac5588a339de244acf12", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/readline-8.2.13-r0.apk"])
 http_file(name = "apk_socat", downloaded_file_path = "socat-1.8.1.3-r0.apk", sha256 = "01652284adced99e2f8fe74d24746c176ba50fce1a507a08f4fbe3c95c41c22e", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/socat-1.8.1.3-r0.apk"])
+
+# IPv6 router advertisements for the emulated ESP32's Wi-Fi segment.
+http_file(name = "apk_dnsmasq", downloaded_file_path = "dnsmasq-2.90-r3.apk", sha256 = "d7475ed16e3806ac6f2bc7304171160ceb5a90830ee0a111cda0190655a5bef4", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/dnsmasq-2.90-r3.apk"])
+http_file(name = "apk_dnsmasq_common", downloaded_file_path = "dnsmasq-common-2.90-r3.apk", sha256 = "c7ee0d2b51024a39a8df5fc88dcec7860accc1778f92f67e119d28303a9e2f21", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/dnsmasq-common-2.90-r3.apk"])
 
 # Stock OpenSSH for the offline NAT/DERP SSH acceptance lab.
 http_file(name = "apk_openssh_client_default", downloaded_file_path = "openssh-client-default-9.9_p2-r0.apk", sha256 = "1280bc7be47f88342880cda6270a4b736f9daab2eab9d2b0bce8826589b39e2d", urls = ["https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/openssh-client-default-9.9_p2-r0.apk"])

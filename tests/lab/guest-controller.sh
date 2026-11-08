@@ -225,6 +225,23 @@ JOBS="$JOBS $!"
         /opt/lab/reactor-node /opt/lab/headscale.yaml
 ) &
 JOBS="$JOBS $!"
+# The emulated-ESP exit-node stage runs only when named: the full lab does not
+# stage the firmware image or the emulator.
+case ",$STAGES," in
+    *,esp-exit,*)
+        # shellcheck disable=SC2086
+        stage esp-exit 900 bash /opt/lab/esp-exit.sh $NETWORK /opt/lab/esp-emu \
+            /opt/lab/esp-flash.bin /opt/lab/esp-firmware.elf /opt/lab/headscale.yaml &
+        JOBS="$JOBS $!"
+        ;;
+    *,esp-exit-tls,*)
+        # shellcheck disable=SC2086
+        stage esp-exit-tls 900 bash /opt/lab/esp-exit.sh $NETWORK /opt/lab/esp-emu \
+            /opt/lab/esp-flash.bin /opt/lab/esp-firmware.elf /opt/lab/headscale.yaml \
+            /opt/lab/esp-tls &
+        JOBS="$JOBS $!"
+        ;;
+esac
 # shellcheck disable=SC2086
 wait $JOBS
 
@@ -237,4 +254,9 @@ if grep -q ' FAIL' "$RESULTS"; then diagnostics_status=1; fi
 # The matrix report (its table, then the logs of any failing run) is the
 # evidence a reviewer wants whether it passed or not.
 if test -f "$STATE/nat-matrix.log"; then sed -n '/^== NAT matrix/,$p' "$STATE/nat-matrix.log" | head -n 600; fi
+for log in "$STATE"/esp-exit*.log; do
+    test -f "$log" || continue
+    echo "--- $(basename "$log" .log) ---"
+    tail -n 200 "$log"
+done
 diagnostics "$diagnostics_status"

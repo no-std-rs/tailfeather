@@ -101,6 +101,12 @@ pub const MAX_DERP_NODES: usize = crate::UNBOUNDED;
 /// DERP DNS names retained by the embedded map. This keeps the capacity that
 /// previous releases accepted, including custom relay hostnames.
 pub const MAX_DERP_HOSTNAME: usize = 64;
+/// Bytes kept of a region's display code (`RegionCode`). It is never used to
+/// select or dial a relay, only shown, and the parser keeps whatever prefix
+/// fits: Tailscale's codes are three letters, Headscale's embedded region is
+/// `headscale`. Every inline region pays for this, so it stays small enough
+/// to keep the device's staged netmap inside the 16 KiB RTC-fast bank.
+pub const MAX_DERP_REGION_CODE: usize = 8;
 
 /// The longest retained display name, in bytes: a DNS label's limit. Longer
 /// names are cut at a character boundary.

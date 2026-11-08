@@ -60,6 +60,94 @@ rust_binary(
     ],
 )
 
+# ESP exit-node lab images (//tests/lab:esp_exit, //tests/lab:esp_exit_tls).
+# Each is the lab image's build with one lab segment's fixed provisioning baked
+# in; the Headscale auth key is written per run into an unpartitioned flash
+# sector (`flash::LAB_AUTH_KEY_ADDRESS`), so the images stay cacheable.
+#
+#   emulab      plaintext control and DERP, the cheapest path to an exit node
+#   emulab_tls  the production build, control and DERP included: NTP time
+#               bootstrap, TLS 1.3 verified against a pinned test CA
+#               (tests/lab/esp-tls), Noise, HTTP/2; only the lab
+#               instrumentation of `--cfg tailfeather_emulab` is added
+#
+# Throughput and stack depth are what these labs measure, so they build exactly
+# like production under --config=optimized: no debug assertions, which would
+# compile checks into every generic dependency and inflate the very frames
+# being measured. The release guard in main.rs admits test-insecure-control in
+# an optimized build only with `--cfg tailfeather_emulab`, which only these
+# targets pass.
+EMULAB_COMMON_ENV = {
+    "CARGO_PKG_VERSION": "0.0.1",
+    "TS_AUTH_KEY": "tskey-auth-emulab-unprovisioned",
+    "TS_BUILD_TIME_FLOOR": "1767225600",
+    "TS_CONTROL_CA_DER": "/dev/null",
+    "TS_CONTROL_CA_DER_HEX": "",
+    "TS_HOSTNAME": "esp-exit-lab",
+    "WIFI_PASSWORD": "tailfeather-lab",
+    "WIFI_SSID": "tailfeather-lab",
+}
+
+# variant: (crate features, provisioning)
+EMULAB_VARIANTS = {
+    "emulab": {
+        "TS_CONTROL_URL": "http://10.77.0.1:8080",
+    },
+    "emulab_tls": {
+        "TS_CONTROL_CA_DER": "$(execpath //tests/lab:esp-tls/ca.der)",
+        "TS_CONTROL_URL": "https://control.lab:8443",
+    },
+}
+
+[rust_binary(
+    name = "esp_gateway_firmware_" + variant,
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//crates/tailfeather:tailfeather_firmware": "tailfeather",
+        "//crates/tailfeather-gateway:tailfeather_gateway_firmware": "tailfeather_gateway",
+        "//crates/wirefeather:wirefeather_firmware": "wirefeather",
+    },
+    compile_data = ["//tests/lab:esp-tls/ca.der"],
+    # The TLS image is the production build: no insecure-control feature,
+    # only the emulator lab instrumentation of `tailfeather_emulab`.
+    crate_features = ["test-insecure-control"] if variant == "emulab" else [],
+    crate_name = "esp_gateway_firmware_" + variant,
+    edition = "2024",
+    platform = "//platforms:esp32c6",
+    rustc_env = EMULAB_COMMON_ENV | env,
+    rustc_flags = [
+        "-Cforce-frame-pointers",
+        "-Cpanic=abort",
+        "-Clink-arg=-Tlinkall.x",
+        "--cfg=tailfeather_emulab",
+        "--check-cfg=cfg(tailfeather_emulab)",
+        "--check-cfg=cfg(emulab_plain)",
+        "--check-cfg=cfg(feature, values(\"test-insecure-control\"))",
+    ] + (["--cfg=emulab_plain"] if variant == "emulab" else []),
+    tags = ["manual"],
+    deps = third_party_deps() + [
+        "//crates/tailfeather:tailfeather_firmware",
+        "//crates/tailfeather-gateway:tailfeather_gateway_firmware",
+        "//crates/wirefeather:wirefeather_firmware",
+    ],
+) for variant, env in EMULAB_VARIANTS.items()]
+
+# Merged 4 MiB flash images of the lab firmware, ready for esp-emu.
+[genrule(
+    name = variant + "_flash",
+    srcs = [
+        ":esp_gateway_firmware_" + variant,
+        "partitions.csv",
+    ],
+    outs = [variant + "-flash.bin"],
+    cmd = "$(execpath @espflash_4_4_0_linux_x86_64//:espflash) save-image --chip esp32c6 --merge " +
+          "--flash-size 4mb --partition-table $(execpath partitions.csv) --partition-table-offset 0x8000 " +
+          "--target-app-partition factory --skip-update-check " +
+          "$(execpath :esp_gateway_firmware_" + variant + ") $@",
+    tags = ["manual"],
+    tools = ["@espflash_4_4_0_linux_x86_64//:espflash"],
+) for variant in EMULAB_VARIANTS]
+
 # Clippy actions do not inherit the Rustc action environment. This equivalent
 # analysis target supplies inert values without changing the device artifact,
 # whose values still come exclusively from the selected Bazel configuration.

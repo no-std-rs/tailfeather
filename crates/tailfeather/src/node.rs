@@ -633,6 +633,45 @@ impl<const PEERS: usize> Node<PEERS> {
         Ok(node)
     }
 
+    /// [`Self::restore_for_authority`] onto this node, in place.
+    ///
+    /// `Self` is large, and building it by value on a small device stacks a
+    /// temporary for every constructor layer. A caller that already owns a
+    /// node in static storage can create it once with
+    /// [`Self::factory_reset_for_authority`] and restore onto it here instead.
+    /// The node must be fresh: created that way and not yet polled. On error it
+    /// is left unchanged.
+    pub fn restore_in_place(
+        &mut self,
+        state: &PersistState,
+        authority_hash: [u8; 16],
+    ) -> Result<(), NodeError> {
+        if state.authority_hash != authority_hash && !state.legacy {
+            return Err(NodeError::Persistence);
+        }
+        if self.enrolled || !self.requires_persistence() || !self.netmap.peers.is_empty() {
+            return Err(NodeError::InvalidState);
+        }
+        let mut generation = state.generation.max(1);
+        let mut registration = RegistrationState::Disconnected;
+        let mut bound_authority = state.authority_hash;
+        if state.legacy {
+            generation = generation.checked_add(1).ok_or(NodeError::Persistence)?;
+            registration = RegistrationState::WaitingForPersistence;
+            bound_authority = authority_hash;
+        }
+        let identity = state.identity();
+        self.tunnel = Device::new(identity.node.to_bytes());
+        self.identity = identity;
+        self.generation = generation;
+        self.authority_hash = bound_authority;
+        self.trusted_time_floor = state.trusted_time_floor;
+        self.enrolled = state.enrolled;
+        self.rotation_old = state.rotation_old;
+        self.registration = registration;
+        Ok(())
+    }
+
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
@@ -2118,6 +2157,33 @@ mod tests {
         assert_eq!(migrated.generation(), 6);
         assert_eq!(migrated.authority_hash(), authority);
         assert_eq!(migrated.as_bytes()[4], PersistState::VERSION);
+    }
+
+    #[test]
+    fn restore_in_place_matches_restore_for_authority() {
+        on_node_test_stack(restore_in_place_roundtrip);
+    }
+
+    fn restore_in_place_roundtrip() {
+        let authority = [7; 16];
+        let identity = Identity::generate(&mut Counter(21));
+        let state = PersistState::encode(&identity, 5, 1234, true, authority, None);
+        let restored = Node::<1>::restore_for_authority(&state, authority).unwrap();
+        let mut in_place =
+            Node::<1>::factory_reset_for_authority(Identity::generate(&mut Counter(22)), 9, authority);
+        in_place.restore_in_place(&state, authority).unwrap();
+        assert_eq!(in_place.identity().node.public(), restored.identity().node.public());
+        assert_eq!(in_place.generation, restored.generation);
+        assert_eq!(in_place.trusted_time_floor(), restored.trusted_time_floor());
+        assert_eq!(in_place.authority_hash(), restored.authority_hash());
+        assert_eq!(in_place.registration_state(), restored.registration_state());
+        assert_eq!(in_place.is_enrolled(), restored.is_enrolled());
+
+        let mut other =
+            Node::<1>::factory_reset_for_authority(Identity::generate(&mut Counter(23)), 9, authority);
+        let before = other.identity().node.public();
+        assert!(other.restore_in_place(&state, [8; 16]).is_err());
+        assert_eq!(other.identity().node.public(), before, "a refused restore changes nothing");
     }
 
     #[test]
