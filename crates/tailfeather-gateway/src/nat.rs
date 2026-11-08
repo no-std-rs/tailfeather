@@ -740,14 +740,25 @@ impl TcpTable {
             return;
         }
 
+        // `own_next` is the highest sequence this direction has reached. A
+        // segment is accepted when it lies within the largest window that can
+        // be in flight -- the gateway strips window scaling on the wire, so no
+        // more than 65,535 bytes -- of that mark, and an accepted segment
+        // advances it. Requiring the exact next sequence instead lost track
+        // for good at the first segment dropped or reordered upstream (the
+        // following ones arrive "early"), so the flow's FIN was never
+        // recognized and a busy exit node filled its table with half-closed
+        // flows that sat out the full idle timeout.
         let next = packet.next_sequence();
         let sequence_valid = match *own_next {
             None if outbound || !packet.is_ack || peer_next == Some(packet.acknowledgement) => {
                 *own_next = Some(next);
                 true
             }
-            Some(expected) if packet.sequence == expected => {
-                *own_next = Some(next);
+            Some(high) if within_window(packet.sequence, high) => {
+                if sequence_before(high, next) {
+                    *own_next = Some(next);
+                }
                 true
             }
             _ => false,
@@ -836,6 +847,20 @@ impl TcpTable {
         }
         Some(flow)
     }
+}
+
+/// The largest unscaled TCP window: everything in flight for one direction of
+/// a translated flow lies within this distance of its highest sequence.
+const MAX_TRACKED_WINDOW: u32 = u16::MAX as u32;
+
+/// `left` precedes `right` in 32-bit sequence space.
+fn sequence_before(left: u32, right: u32) -> bool {
+    (left.wrapping_sub(right) as i32) < 0
+}
+
+/// `sequence` is within one maximal window either side of `high`.
+fn within_window(sequence: u32, high: u32) -> bool {
+    sequence.wrapping_sub(high).wrapping_add(MAX_TRACKED_WINDOW) <= 2 * MAX_TRACKED_WINDOW
 }
 
 /// Portable view of an unfragmented inner TCP segment.

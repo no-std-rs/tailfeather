@@ -455,6 +455,75 @@ mod tests {
         );
     }
 
+    /// An IPv4 TCP segment with a 20-byte header and `payload` zero bytes.
+    fn tcp_segment(
+        src: ([u8; 4], u16),
+        dst: ([u8; 4], u16),
+        flags: u8,
+        sequence: u32,
+        acknowledgement: u32,
+        payload: usize,
+        out: &mut [u8; 1500],
+    ) -> usize {
+        let len = 40 + payload;
+        out[..len].fill(0);
+        out[0] = 0x45;
+        out[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        out[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        out[8] = 64;
+        out[9] = 6;
+        out[12..16].copy_from_slice(&src.0);
+        out[16..20].copy_from_slice(&dst.0);
+        out[20..22].copy_from_slice(&src.1.to_be_bytes());
+        out[22..24].copy_from_slice(&dst.1.to_be_bytes());
+        out[24..28].copy_from_slice(&sequence.to_be_bytes());
+        out[28..32].copy_from_slice(&acknowledgement.to_be_bytes());
+        out[32] = 0x50;
+        out[33] = flags;
+        out[34..36].copy_from_slice(&4096u16.to_be_bytes());
+        let ip_sum = checksum(&out[..20]);
+        out[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+        write_tcp_checksum(&mut out[..len]);
+        len
+    }
+
+    #[test]
+    fn tcp_fin_is_recognized_after_upstream_loss_and_reordering() {
+        const SYN: u8 = 0x02;
+        const ACK: u8 = 0x10;
+        const FIN_ACK: u8 = 0x11;
+        let client = ([100, 64, 0, 2], 40_000);
+        let server = ([10, 79, 0, 2], 5003);
+        let uplink = ([192, 168, 4, 2], nat::TCP_EXT_PORT_BASE);
+        let mut table = nat::TcpTable::new();
+        let mut buffer = [0u8; 1500];
+        let mut outbound = |table: &mut nat::TcpTable, flags, seq, ack, payload| {
+            let len = tcp_segment(client, server, flags, seq, ack, payload, &mut buffer);
+            let info = nat::parse_tcp4(&buffer[..len]).unwrap();
+            let slot = table.slot_for_packet(&info, 0).unwrap();
+            table.observe_outbound(slot, &info, 0);
+            slot
+        };
+        let slot = outbound(&mut table, SYN, 1000, 0, 0);
+        let mut inbound_buffer = [0u8; 1500];
+        let mut inbound = |table: &mut nat::TcpTable, flags, seq, payload| {
+            let len = tcp_segment(server, uplink, flags, seq, 1001, payload, &mut inbound_buffer);
+            table.observe_inbound(slot, &nat::parse_tcp4(&inbound_buffer[..len]).unwrap(), 0);
+        };
+        inbound(&mut table, SYN | ACK, 5000, 0);
+        inbound(&mut table, ACK, 5001, 100);
+        // 5101..5201 is lost upstream; the segment after it arrives first.
+        inbound(&mut table, ACK, 5201, 100);
+        inbound(&mut table, ACK, 5101, 100);
+        // A FIN far outside any window is not the server's.
+        inbound(&mut table, FIN_ACK, 5301 + 200_000, 0);
+        assert_eq!(table.closure(slot), Some((false, false, None)));
+        inbound(&mut table, FIN_ACK, 5301, 0);
+        assert_eq!(table.closure(slot), Some((false, true, None)));
+        outbound(&mut table, FIN_ACK, 1001, 5302, 0);
+        assert_eq!(table.closure(slot), Some((true, true, Some(0))));
+    }
+
     #[test]
     fn tcp_rst_requires_sequence_validation_before_releasing_a_mapping() {
         let client = [100, 64, 0, 2];
