@@ -1,0 +1,108 @@
+name: ESP exit lab
+
+# The ESP32-C6 firmware in ESP-EMU as the Headscale exit node of a stock
+# Tailscale client (tests/lab/esp-exit.sh), in the same pinned smolVM as the
+# NAT matrix: plaintext control (//tests/lab:esp_exit) and the production
+# build's verified TLS control and DERP (//tests/lab:esp_exit_tls). Each run
+# checks the exit path, bulk and multi-stream TCP, browser-like page loads and
+# concurrent DNS through the ESP, and reports the firmware's stack high-water
+# mark that the resource contract's STACK_FLOOR is measured from.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: esp-exit-lab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.files.outputs.relevant }}
+    steps:
+      # Path filtering happens here rather than in `on:` so that a pull
+      # request touching nothing relevant skips the lab, which satisfies the
+      # required result check below, instead of never starting it.
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          relevant=true
+          if [ "$EVENT" = pull_request ]; then
+            count=$(gh api "repos/$REPO/pulls/$PR" --jq .changed_files)
+            # The files endpoint stops at 3000; past that, assume relevant.
+            if [ "$count" -lt 3000 ]; then
+              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
+              if ! grep -Eq '^(firmware/|crates/tailfeather/|crates/tailfeather-gateway/|crates/wirefeather/|bazel/|platforms/|scripts/BUILD\.bazel$|tests/lab/|MODULE\.bazel[^/]*$|Cargo\.[^/]*$|BUILD\.bazel$|\.bazel[^/]*$|\.github/workflows/esp-exit-lab\.yml$)' <<<"$files"; then
+                relevant=false
+              fi
+            fi
+          fi
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+
+  esp-exit:
+    name: ESP exit node
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: bazel-contrib/setup-bazel@8cb04a772ab4c1eb984e9c1b493a182e96c5e425 # 0.19.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+      - name: Enable KVM access on the disposable hosted VM
+        run: |
+          test -c /dev/kvm
+          test -c /dev/net/tun
+          sudo chmod a+rw /dev/kvm /dev/net/tun
+      # Optimized: the lab images are production builds and the stage
+      # measures their throughput and stack depth.
+      - name: Run the ESP exit lab
+        run: >-
+          bazel test --config=local --config=optimized
+          --strategy=TestRunner=local --test_output=all
+          //:esp_exit_lab
+      - name: Retain lab diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: esp-exit-lab-logs
+          path: |
+            bazel-testlogs/tests/lab/esp_exit/
+            bazel-testlogs/tests/lab/esp_exit_tls/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The check to require. Skipped jobs pass required checks, so a failed
+  # `changes` job must surface here rather than skip the lab.
+  result:
+    name: ESP exit lab
+    needs: [changes, esp-exit]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            case "$result" in success|skipped) ;; *) echo "an ESP exit lab job ended: $result"; exit 1;; esac
+          done
