@@ -112,6 +112,20 @@ small { color: var(--muted); font-weight: 400; }
 
 #drawer-toggle[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
 
+.icon-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--control);
+  min-height: var(--control);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--bg);
+  color: inherit;
+}
+.icon-link:hover, .icon-link:focus-visible { border-color: var(--accent); color: var(--accent); }
+.icon-link svg { width: 18px; height: 18px; fill: currentColor; }
+
 @media (max-width: 599px) {
   h1 span { display: none; }
 }
