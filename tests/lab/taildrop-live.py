@@ -16,20 +16,64 @@ netmap exactly as stock Tailscale does.
 Uses a separate userspace daemon with no host network changes and no access
 to the user's existing tailnet or credentials. Taildrop only works between
 untagged nodes of one user, so unlike the SSH lab both nodes enroll untagged.
+
+Chaos: with TF_LAB_CHAOS set to netem options or a profile name (`jitter`,
+`lossy`, `reorder`, `storm`, the same presets as the ESP exit stage), the test
+re-runs itself in a private user and network namespace and impairs its
+loopback, which every hop of the test crosses: control, DERP, WireGuard and
+the peer API streams. TF_LAB_CHAOS_SEED (default random, always printed)
+seeds netem, so the same loss, duplication and reordering replay.
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import random
 import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
+
+CHAOS_PROFILES = {
+    "jitter": "delay 15ms 15ms",
+    "lossy": "delay 10ms 5ms loss 2% duplicate 0.5%",
+    "reorder": "delay 25ms 20ms reorder 10% 50% duplicate 1%",
+    "storm": "delay 30ms 25ms loss 3% 25% duplicate 2% reorder 10% corrupt 0.1%",
+}
+CHAOS_RERUN = ""
+
+
+def enter_chaos_namespace():
+    """Re-execute in a private network namespace with an impaired loopback."""
+    global CHAOS_RERUN
+    profile = os.environ.get("TF_LAB_CHAOS")
+    if not profile:
+        return
+    seed = os.environ.get("TF_LAB_CHAOS_SEED") or str(random.randrange(1, 1 << 31))
+    CHAOS_RERUN = f"TF_LAB_CHAOS={profile!r} TF_LAB_CHAOS_SEED={seed}"
+    if os.environ.get("TF_LAB_CHAOS_INSIDE"):
+        return
+    options = CHAOS_PROFILES.get(profile, profile)
+    print(f"CHAOS {options} seed={seed} (reproduce with {CHAOS_RERUN})", flush=True)
+    # tailscaled pauses control while it sees no default route, so give the
+    # namespace a dummy uplink. Every hop of the test stays on loopback.
+    setup = ("ip link set lo up && ip link add uplink type dummy && "
+             "ip addr add 192.0.2.10/24 dev uplink && ip link set uplink up && "
+             "ip route add default via 192.0.2.1 dev uplink && "
+             f"tc qdisc add dev lo root netem limit 10000 {options} seed {seed}")
+    env = dict(os.environ, TF_LAB_CHAOS_INSIDE="1", TF_LAB_CHAOS_SEED=seed)
+    unshare = shutil.which("unshare")
+    if not unshare:
+        raise SystemExit("TF_LAB_CHAOS needs util-linux unshare")
+    os.execve(unshare, [unshare, "--user", "--map-root-user", "--net", "sh", "-c",
+                        f'{setup} && exec "$@"', "sh", sys.executable, *sys.argv], env)
+
 
 SEND_NAME = "from-tailfeather.bin"
 SEND_BYTES = 300_000
@@ -93,6 +137,7 @@ def pattern(length):
 
 
 def main():
+    enter_chaos_namespace()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--headscale", required=True)
     parser.add_argument("--node", default="crates/tailfeather-reactor/target/debug/examples/taildrop_node")
@@ -159,7 +204,8 @@ def main():
             return process
 
         def wait_for(predicate, process, description, seconds=45):
-            deadline = time.monotonic() + seconds
+            # Impaired links legitimately need longer; a hang still fails.
+            deadline = time.monotonic() + seconds * (4 if CHAOS_RERUN else 1)
             while time.monotonic() < deadline:
                 result = predicate()
                 if result:
@@ -228,7 +274,7 @@ def main():
             env = dict(os.environ, TF_TEST_AUTH_KEY=keys.pop(), TF_TEST_CA_DER=str(tls_dir / "ca.der"))
             node = spawn([
                 str(node_binary), f"https://127.0.0.1:{tls_port}", str(state / "node"),
-                f"--send-to={stock_ip}", "--timeout-seconds=150",
+                f"--send-to={stock_ip}", f"--timeout-seconds={600 if CHAOS_RERUN else 150}",
             ], "node", env=env)
             del env
             node_log = state / "node.log"
@@ -273,11 +319,22 @@ def main():
 
             # Tailfeather -> stock, found through the netmap and resumed.
             sent = wait_for(lambda: node_line("SENT "), node, "Tailfeather upload", seconds=60)
-            for prefix in ("TARGET ", "RESUMED "):
-                print(node_line(prefix), flush=True)
+            progress = [line for line in node_log.read_text().splitlines()
+                        if line.startswith(("TARGET ", "RESUMED ", "RETRY "))]
+            print("\n".join(progress), flush=True)
             print(sent, flush=True)
             assert node_line("TARGET ") == f"TARGET {stock_api}", node_line("TARGET ")
-            assert node_line("RESUMED ") == f"RESUMED offset={BREAK_AT}", node_line("RESUMED ")
+            # On a clean link the receiver keeps exactly the bytes sent before
+            # the break; under chaos some may still have been in flight. Either
+            # way the probe must find a stored prefix, and the content check
+            # below proves the resumed file is exact.
+            offsets = [int(line.split("=")[1]) for line in progress if line.startswith("RESUMED ")]
+            assert offsets and all(0 <= offset <= BREAK_AT for offset in offsets), progress
+            if not CHAOS_RERUN:
+                assert offsets == [BREAK_AT], progress
+            # Under chaos the receiver may end the broken transfer with an
+            # error first, and then discards its partial file as stock
+            # Tailscale does: a later probe then rightly finds nothing.
             assert sent == f"SENT ok bytes={SEND_BYTES}", sent
             inbox = state / "inbox"
             inbox.mkdir()
@@ -291,6 +348,8 @@ def main():
             print("PASS: stock tailscale and Tailfeather exchanged Taildrop files in both directions, "
                   "with netmap authorization and discovery and a resumed upload")
         except Exception:
+            if CHAOS_RERUN:
+                print(f"--- reproduce with: {CHAOS_RERUN} ---", flush=True)
             for log in logs:
                 print(f"--- {log.name} ---", flush=True)
                 print(log.read_text(errors="replace")[-16000:], flush=True)

@@ -14,7 +14,9 @@
 //! [`SEND_BYTES`] bytes of [`pattern`] data as `from-tailfeather.bin`, the way
 //! an interrupted transfer would: the first upload breaks off after
 //! [`BREAK_AT`] bytes, a resume probe asks the receiver what it kept, and the
-//! rest follows. It prints `TARGET <peer-api>`, `RESUMED offset=<n>`, then
+//! rest follows. A receiver still finishing the broken attempt answers `409`;
+//! the node then backs off and probes again. It prints `TARGET <peer-api>`,
+//! `RESUMED offset=<n>` per attempt (`RETRY ...` between them), then
 //! `SENT ok bytes=<n>` or `SENT err=<error>`.
 use std::{
     io::Write as _,
@@ -168,22 +170,40 @@ async fn upload(runtime: &Node<'_>, tcp: &Stack<'_>, peer: Ipv4Addr) -> Result<(
         offset: 0,
         break_at: None,
     };
-    let stream = connect(runtime, tcp, target, &mut local_port).await?;
-    let offset =
-        taildrop::resume_offset_async(&mut &stream, target, SEND_NAME, &mut source, &mut buffer)
-            .await
-            .map_err(|error| format!("resume probe: {error}"))?;
-    let _ = stream.shutdown();
-    drop(stream);
-    say(format_args!("RESUMED offset={offset}"));
-
-    let stream = connect(runtime, tcp, target, &mut local_port).await?;
-    let resumed = Upload { offset, ..upload };
-    let result = taildrop::send_async(&mut &stream, &resumed, &mut source, &mut buffer)
+    // Until the receiver has seen the broken connection end, stock Tailscale
+    // reports that transfer as still in progress (`409`). Its stored prefix
+    // can still grow meanwhile, so each retry probes afresh.
+    for attempt in 1..=20 {
+        let stream = connect(runtime, tcp, target, &mut local_port).await?;
+        let offset = taildrop::resume_offset_async(
+            &mut &stream,
+            target,
+            SEND_NAME,
+            &mut source,
+            &mut buffer,
+        )
         .await
-        .map_err(|error| error.to_string());
-    let _ = stream.shutdown();
-    result
+        .map_err(|error| format!("resume probe: {error}"))?;
+        let _ = stream.shutdown();
+        drop(stream);
+        say(format_args!("RESUMED offset={offset}"));
+
+        let stream = connect(runtime, tcp, target, &mut local_port).await?;
+        let resumed = Upload { offset, ..upload };
+        let result = taildrop::send_async(&mut &stream, &resumed, &mut source, &mut buffer).await;
+        let _ = stream.shutdown();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(taildrop::SendError::Rejected(409)) => {
+                say(format_args!(
+                    "RETRY attempt={attempt}: the broken transfer is still in progress"
+                ));
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("the receiver kept the broken transfer in progress".into())
 }
 
 async fn serve(

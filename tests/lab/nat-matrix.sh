@@ -497,8 +497,8 @@ if test "$PEER" = stock; then
     stock_up b "$(mint tag:server)"
     if case "$EVENT" in bulk*) true ;; *) false ;; esac; then
         # A userspace tailscaled delivers inbound tailnet TCP to loopback.
-        start b sink socat TCP-LISTEN:5001,bind=127.0.0.1,reuseaddr,fork SYSTEM:'cat >/dev/null; echo done'
-        start b source socat TCP-LISTEN:5002,bind=127.0.0.1,reuseaddr,fork SYSTEM:"head -c $BULK_BYTES /dev/zero"
+        start b sink socat -t 60 TCP-LISTEN:5001,bind=127.0.0.1,reuseaddr,fork SYSTEM:'cat >/dev/null; echo done'
+        start b source socat -t 60 TCP-LISTEN:5002,bind=127.0.0.1,reuseaddr,fork SYSTEM:"head -c $BULK_BYTES /dev/zero"
     fi
     ADDRESS=$(ns b "$TAILSCALE" "--socket=$WORK/b.sock" ip -4)
 else

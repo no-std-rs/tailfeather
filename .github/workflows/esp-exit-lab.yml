@@ -88,6 +88,7 @@ jobs:
           name: esp-exit-lab-logs
           path: |
             bazel-testlogs/tests/lab/esp_exit/
+            bazel-testlogs/tests/lab/esp_exit_chaos/
             bazel-testlogs/tests/lab/esp_exit_tls/
           if-no-files-found: ignore
           retention-days: 7

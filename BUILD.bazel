@@ -111,6 +111,7 @@ test_suite(
         "//third_party/zssh:unit_test",
         "//tests/lab:ssh_live",
         "//tests/lab:taildrop_live",
+        "//tests/lab:taildrop_live_chaos",
     ],
 )
 
@@ -244,6 +245,7 @@ test_suite(
     name = "esp_exit_lab",
     tests = [
         "//tests/lab:esp_exit",
+        "//tests/lab:esp_exit_chaos",
         "//tests/lab:esp_exit_tls",
     ],
 )

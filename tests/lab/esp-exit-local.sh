@@ -11,6 +11,10 @@
 #   TF_ESP_EXIT_NO_BUILD=1 tests/lab/esp-exit-local.sh   # rerun the last build
 #   TF_ESP_EXIT_BAZEL_FLAGS="--action_env=TS_FWD_UP_PACKETS=4" tests/lab/esp-exit-local.sh
 #   TF_ESP_EXIT_TLS=1 tests/lab/esp-exit-local.sh   # the production TLS control path
+#   TF_ESP_EXIT_CHAOS=storm tests/lab/esp-exit-local.sh   # seeded impairment (jitter,
+#                                   # lossy, reorder, storm, or raw netem options)
+#   TF_ESP_EXIT_CHAOS=storm TF_ESP_EXIT_CHAOS_SEED=404 tests/lab/esp-exit-local.sh
+#                                   # replay a failure: the stage prints its seed
 #
 # Needs on the host: unprivileged user namespaces with a subordinate ID range
 # (/etc/subuid, for dnsmasq to drop privileges), /dev/net/tun, iproute2,
