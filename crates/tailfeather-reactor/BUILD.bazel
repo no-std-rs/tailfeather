@@ -22,7 +22,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
     crate_name = "tailfeather_reactor",
-    crate_features = ["alloc", "std", "embassy", "tls", "accelerated-crypto"],
+    crate_features = ["alloc", "ipv6", "std", "embassy", "tls", "accelerated-crypto"],
     edition = "2024",
     rustc_env = {"CARGO_PKG_VERSION": "0.0.1"},
     deps = all_crate_deps(normal = True),
@@ -32,7 +32,7 @@ rust_test(
     name = "unit_test",
     aliases = aliases(),
     crate = ":tailfeather_reactor",
-    crate_features = ["alloc", "std", "embassy", "tls", "accelerated-crypto"],
+    crate_features = ["alloc", "ipv6", "std", "embassy", "tls", "accelerated-crypto"],
     deps = all_crate_deps(normal_dev = True, cargo_only = True),
 )
 
@@ -41,7 +41,7 @@ rust_test(
     srcs = ["tests/tcp_parity.rs"],
     aliases = aliases(),
     crate_name = "tcp_parity_test",
-    crate_features = ["std", "embassy"],
+    crate_features = ["ipv6", "std", "embassy"],
     edition = "2024",
     deps = [":tailfeather_reactor"] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
 )
@@ -77,7 +77,7 @@ rust_binary(
     srcs = ["benches/throughput.rs", "benches/throughput/mesh.rs"],
     aliases = aliases(),
     crate_name = "throughput",
-    crate_features = ["std", "embassy"],
+    crate_features = ["ipv6", "std", "embassy"],
     crate_root = "benches/throughput.rs",
     edition = "2024",
     deps = [":tailfeather_reactor"] + all_crate_deps(normal = True, normal_dev = True),

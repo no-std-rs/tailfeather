@@ -9,6 +9,11 @@ Proves both directions against the unmodified client:
   uploads to it, breaking the first attempt off half way; a resume probe
   recovers the stored prefix, the rest follows, and `tailscale file get`
   hands back the exact bytes.
+* Both again over IPv6: the Tailfeather node advertises `peerapi6`, accepts
+  an upload that `tailscale nc` carries to its IPv6 address, and uploads to
+  the stock node's IPv6 peer API.
+* Each Tailfeather upload finishes within a bound (generous under chaos), so
+  slow loss recovery fails the test instead of only slowing it down.
 
 The Tailfeather node authorizes senders, and picks its target, from the
 netmap exactly as stock Tailscale does.
@@ -29,6 +34,7 @@ import json
 import os
 from pathlib import Path
 import random
+import select
 import shutil
 import socket
 import ssl
@@ -78,6 +84,13 @@ def enter_chaos_namespace():
 SEND_NAME = "from-tailfeather.bin"
 SEND_BYTES = 300_000
 BREAK_AT = 150_000
+SEND6_NAME = "from-tailfeather-v6.bin"
+SEND6_BYTES = 100_000
+NC_NAME = "over ipv6.bin"
+NC_BYTES = 50_000
+# Seconds from the broken first attempt to the finished resumed upload. Clean
+# runs take well under a second, the storm profile about one to five.
+UPLOAD_BOUND = 30
 
 
 def port(kind=socket.SOCK_STREAM):
@@ -282,8 +295,10 @@ def main():
             def node_line(prefix):
                 return next((line for line in node_log.read_text().splitlines() if line.startswith(prefix)), None)
 
-            address = wait_for(lambda: node_line("READY "), node, "Tailfeather registration and netmap").split()[1]
-            print(f"READY {address}", flush=True)
+            _, address, address6 = wait_for(lambda: node_line("READY "), node,
+                                            "Tailfeather registration and netmap").split()
+            print(f"READY {address} {address6}", flush=True)
+            assert address6 != "none", "control assigned no IPv6 address"
 
             # Stock -> Tailfeather. The CLI only offers peers that advertise a
             # peer API, are online and belong to the same user.
@@ -317,6 +332,46 @@ def main():
             expected = f"RECEIVED name={name} bytes={len(payload)} fnv={fnv1a(payload):016x} "
             assert received.startswith(expected), f"{received!r} != {expected!r}..."
 
+            # The peer API is advertised for both families.
+            urls = peer_status().get("PeerAPIURL") or []
+            assert f"http://[{address6}]:5254" in urls, urls
+
+            # Stock -> Tailfeather over IPv6. The CLI always picks the IPv4
+            # peer API, so carry a raw upload to the IPv6 one with
+            # `tailscale nc`, which dials through the daemon's tailnet stack.
+            stock_ip6 = next(ip for ip in status()["Self"]["TailscaleIPs"] if ":" in ip)
+            body = os.urandom(NC_BYTES)
+            request = (f"PUT /v0/put/{urllib.parse.quote(NC_NAME)} HTTP/1.1\r\n"
+                       f"Host: [{address6}]:5254\r\nContent-Length: {len(body)}\r\n"
+                       "Connection: close\r\n\r\n").encode() + body
+            before = node_log.read_text().count("RECEIVED ")
+            # `tailscale nc` ends the whole connection at end of input, so keep
+            # its input open until the response head has arrived.
+            nc = subprocess.Popen(client + ["nc", address6, "5254"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=client_env)
+            try:
+                nc.stdin.write(request)
+                nc.stdin.flush()
+                reply = b""
+                deadline = time.monotonic() + 60 * (4 if CHAOS_RERUN else 1)
+                while b"\r\n\r\n" not in reply and time.monotonic() < deadline:
+                    if select.select([nc.stdout], [], [], 0.5)[0]:
+                        chunk = os.read(nc.stdout.fileno(), 4096)
+                        if not chunk:
+                            break
+                        reply += chunk
+            finally:
+                nc.kill()
+                stderr = nc.communicate()[1]
+            reply = reply.decode(errors="replace")
+            assert reply.startswith("HTTP/1.1 200"), f"`tailscale nc` upload: {reply!r} {stderr!r}"
+            received6 = wait_for(lambda: node_log.read_text().count("RECEIVED ") > before and
+                                 [line for line in node_log.read_text().splitlines()
+                                  if line.startswith("RECEIVED ")][-1], node, "Tailfeather receipt over IPv6")
+            print(received6, flush=True)
+            expected = f"RECEIVED name={NC_NAME} bytes={len(body)} fnv={fnv1a(body):016x} from={stock_ip6}"
+            assert received6 == expected, f"{received6!r} != {expected!r}"
+
             # Tailfeather -> stock, found through the netmap and resumed.
             sent = wait_for(lambda: node_line("SENT "), node, "Tailfeather upload", seconds=60)
             progress = [line for line in node_log.read_text().splitlines()
@@ -336,17 +391,36 @@ def main():
             # error first, and then discards its partial file as stock
             # Tailscale does: a later probe then rightly finds nothing.
             assert sent == f"SENT ok bytes={SEND_BYTES}", sent
+            # How long loss recovery took, from the node's timestamped log.
+            stamps = {}
+            for line in node_log.read_text().splitlines():
+                if line.startswith("[") and "] " in line:
+                    stamp, event = line[1:].split("] ", 1)
+                    stamps.setdefault(event.split()[0], float(stamp))
+            took = stamps["SENT"] - stamps["BROKEN"]
+            print(f"TIMING broken-to-sent={took:.2f}s", flush=True)
+            assert took < UPLOAD_BOUND, f"the resumed upload took {took:.1f}s (bound {UPLOAD_BOUND}s)"
+
+            # Tailfeather -> stock's IPv6 peer API.
+            sent6 = wait_for(lambda: node_line("SENT6 "), node, "Tailfeather upload over IPv6", seconds=60)
+            print(node_line("TARGET6 "), flush=True)
+            print(sent6, flush=True)
+            stock_api6 = next(urllib.parse.urlsplit(url).netloc for url in status()["Self"]["PeerAPIURL"]
+                              if urllib.parse.urlsplit(url).hostname == stock_ip6)
+            assert node_line("TARGET6 ") == f"TARGET6 {stock_api6}", (node_line("TARGET6 "), stock_api6)
+            assert sent6 == f"SENT6 ok bytes={SEND6_BYTES}", sent6
             inbox = state / "inbox"
             inbox.mkdir()
 
             def fetched():
                 subprocess.run(client + ["file", "get", str(inbox)], env=client_env, capture_output=True, timeout=15)
-                return (inbox / SEND_NAME).exists()
-            wait_for(fetched, daemon, "`tailscale file get` of the Tailfeather upload")
-            data = (inbox / SEND_NAME).read_bytes()
-            assert data == pattern(SEND_BYTES), f"stored {len(data)} bytes, fnv={fnv1a(data):016x}"
-            print("PASS: stock tailscale and Tailfeather exchanged Taildrop files in both directions, "
-                  "with netmap authorization and discovery and a resumed upload")
+                return (inbox / SEND_NAME).exists() and (inbox / SEND6_NAME).exists()
+            wait_for(fetched, daemon, "`tailscale file get` of the Tailfeather uploads")
+            for name, size in [(SEND_NAME, SEND_BYTES), (SEND6_NAME, SEND6_BYTES)]:
+                data = (inbox / name).read_bytes()
+                assert data == pattern(size), f"{name}: stored {len(data)} bytes, fnv={fnv1a(data):016x}"
+            print("PASS: stock tailscale and Tailfeather exchanged Taildrop files in both directions "
+                  "over IPv4 and IPv6, with netmap authorization and discovery and a resumed upload")
         except Exception:
             if CHAOS_RERUN:
                 print(f"--- reproduce with: {CHAOS_RERUN} ---", flush=True)
@@ -364,6 +438,11 @@ def main():
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+            # Keep the logs, timestamped node log included, as test outputs.
+            outputs = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+            if outputs:
+                for log in logs:
+                    shutil.copyfile(log, Path(outputs) / log.name)
 
 
 if __name__ == "__main__":

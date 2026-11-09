@@ -5,7 +5,9 @@
 
 #[cfg(feature = "alloc")]
 use alloc::vec;
-use core::net::{Ipv4Addr, SocketAddrV4};
+#[cfg(feature = "ipv6")]
+use core::net::Ipv6Addr;
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use heapless::{Deque, Vec};
 use smoltcp::iface::SocketStorage;
 
@@ -31,6 +33,28 @@ pub struct TcpListener<const N: usize = 16> {
 /// Any address works: with `Medium::Ip` smoltcp only needs *a* route for
 /// destinations outside its own /32.
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 100);
+/// The same for IPv6: Tailscale's service address, never actually reached.
+#[cfg(feature = "ipv6")]
+const GATEWAY6: Ipv6Addr = Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0x53);
+
+/// An address smoltcp can use; IPv6 only with the `ipv6` feature.
+fn stack_address(address: IpAddr) -> Option<IpAddress> {
+    match address {
+        IpAddr::V4(address) => Some(IpAddress::Ipv4(address)),
+        #[cfg(feature = "ipv6")]
+        IpAddr::V6(address) => Some(IpAddress::Ipv6(address)),
+        #[cfg(not(feature = "ipv6"))]
+        IpAddr::V6(_) => None,
+    }
+}
+
+fn core_address(address: IpAddress) -> IpAddr {
+    match address {
+        IpAddress::Ipv4(address) => IpAddr::V4(address),
+        #[cfg(feature = "ipv6")]
+        IpAddress::Ipv6(address) => IpAddr::V6(address),
+    }
+}
 
 pub trait PacketQueue<const Q: usize>: Default + IntoIterator<Item = Packet> {
     fn len(&self) -> usize;
@@ -162,18 +186,46 @@ struct TcpFrame {
     ack: Option<i32>,
     reset: bool,
 }
-fn tcp_frame(bytes: &[u8]) -> Option<TcpFrame> {
-    let ip = Ipv4Packet::new_checked(bytes).ok()?;
-    if ip.next_header() != IpProtocol::Tcp
-        || ip.more_frags()
-        || ip.frag_offset() != 0
-        || !ip.verify_checksum()
-    {
-        return None;
+/// The addresses and TCP segment of an unfragmented IPv4 or (with the
+/// `ipv6` feature) extension-free IPv6 TCP packet.
+fn tcp_segment(bytes: &[u8]) -> Option<(IpAddress, IpAddress, &[u8])> {
+    match bytes.first()? >> 4 {
+        4 => {
+            let ip = Ipv4Packet::new_checked(bytes).ok()?;
+            if ip.next_header() != IpProtocol::Tcp
+                || ip.more_frags()
+                || ip.frag_offset() != 0
+                || !ip.verify_checksum()
+            {
+                return None;
+            }
+            let payload = bytes.get(usize::from(ip.header_len())..usize::from(ip.total_len()))?;
+            Some((
+                IpAddress::Ipv4(ip.src_addr()),
+                IpAddress::Ipv4(ip.dst_addr()),
+                payload,
+            ))
+        }
+        #[cfg(feature = "ipv6")]
+        6 => {
+            let ip = smoltcp::wire::Ipv6Packet::new_checked(bytes).ok()?;
+            if ip.next_header() != IpProtocol::Tcp {
+                return None;
+            }
+            let payload = bytes.get(40..40 + usize::from(ip.payload_len()))?;
+            Some((
+                IpAddress::Ipv6(ip.src_addr()),
+                IpAddress::Ipv6(ip.dst_addr()),
+                payload,
+            ))
+        }
+        _ => None,
     }
-    let source = IpAddress::Ipv4(ip.src_addr());
-    let destination = IpAddress::Ipv4(ip.dst_addr());
-    let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+}
+
+fn tcp_frame(bytes: &[u8]) -> Option<TcpFrame> {
+    let (source, destination, segment) = tcp_segment(bytes)?;
+    let tcp = TcpPacket::new_checked(segment).ok()?;
     if !tcp.verify_checksum(&source, &destination) {
         return None;
     }
@@ -205,7 +257,11 @@ fn fin_hint(packet: &[u8]) -> bool {
     let Some(first) = packet.first() else {
         return false;
     };
-    let offset = usize::from(first & 0x0f) * 4;
+    let offset = if first >> 4 == 6 {
+        40
+    } else {
+        usize::from(first & 0x0f) * 4
+    };
     packet.get(offset + 13).is_some_and(|flags| flags & 1 != 0)
 }
 
@@ -223,6 +279,10 @@ pub struct NetStack<
     live: Vec<(SocketHandle, u64), N>,
     generation: u64,
     address: Option<Ipv4Addr>,
+    #[cfg(feature = "ipv6")]
+    address6: Option<Ipv6Addr>,
+    /// Where the next automatically chosen source port search starts.
+    next_port: u16,
     pub close_failed: bool,
     fins: Vec<Fin, N>,
     received_fins: Vec<(SocketHandle, i32, bool), N>,
@@ -320,6 +380,9 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
             live: Vec::new(),
             generation: 0,
             address: None,
+            #[cfg(feature = "ipv6")]
+            address6: None,
+            next_port: 49152,
             close_failed: false,
             fins: Vec::new(),
             received_fins: Vec::new(),
@@ -393,11 +456,13 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
         }
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = seed;
+        // A fresh starting point per interface, so a restarted node does not
+        // retrace its previous run's ports either.
+        self.next_port = 49152 + (seed % 16384) as u16;
         let mut iface = Interface::new(config, &mut self.device, instant(now_ms));
-        iface.update_ip_addrs(|addresses| {
-            let _ = addresses.push(IpCidr::new(IpAddress::Ipv4(address), 32));
-        });
         let _ = iface.routes_mut().add_default_ipv4_route(GATEWAY);
+        #[cfg(feature = "ipv6")]
+        let _ = iface.routes_mut().add_default_ipv6_route(GATEWAY6);
         for (_, socket) in self.sockets.iter_mut() {
             let socket = tcp::Socket::downcast_mut(socket).expect("TCP-only stack");
             // Passive listeners are wildcard-bound and remain valid on the
@@ -413,6 +478,63 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
         self.received_fins.clear();
         self.iface = Some(iface);
         self.address = Some(address);
+        self.update_addresses();
+    }
+
+    /// This node's tailnet IPv6 address, when it has one.
+    #[cfg(feature = "ipv6")]
+    pub fn ipv6_address(&self) -> Option<Ipv6Addr> {
+        self.address6
+    }
+
+    /// Adopt, change or drop this node's tailnet IPv6 address. Connections
+    /// bound to a previous IPv6 address end; IPv4 ones and listeners stay.
+    /// It takes effect once the node also has an IPv4 address.
+    #[cfg(feature = "ipv6")]
+    pub fn set_ipv6_address(&mut self, address: Option<Ipv6Addr>) {
+        if self.address6 == address {
+            return;
+        }
+        if let Some(old) = self.address6 {
+            let old = Some(IpAddress::Ipv6(old));
+            for (handle, socket) in self.sockets.iter_mut() {
+                let socket = tcp::Socket::downcast_mut(socket).expect("TCP-only stack");
+                if socket.state() != tcp::State::Listen
+                    && socket.local_endpoint().map(|endpoint| endpoint.addr) == old
+                {
+                    let listen = (socket.state() == tcp::State::SynReceived)
+                        .then(|| socket.listen_endpoint());
+                    socket.abort();
+                    if let Some(endpoint) = listen {
+                        let _ = socket.listen(endpoint);
+                    }
+                    self.fins.retain(|fin| fin.socket != handle);
+                    self.received_fins.retain(|(key, _, _)| *key != handle);
+                }
+            }
+        }
+        self.address6 = address;
+        self.update_addresses();
+    }
+
+    /// Give the interface exactly this node's current addresses.
+    fn update_addresses(&mut self) {
+        let Some(iface) = self.iface.as_mut() else {
+            return;
+        };
+        let address = self.address;
+        #[cfg(feature = "ipv6")]
+        let address6 = self.address6;
+        iface.update_ip_addrs(|addresses| {
+            addresses.clear();
+            if let Some(address) = address {
+                let _ = addresses.push(IpCidr::new(IpAddress::Ipv4(address), 32));
+            }
+            #[cfg(feature = "ipv6")]
+            if let Some(address) = address6 {
+                let _ = addresses.push(IpCidr::new(IpAddress::Ipv6(address), 128));
+            }
+        });
     }
 
     /// Remove the local address, sockets and packets after revocation or shutdown.
@@ -424,6 +546,10 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
         self.device.tx.clear();
         self.iface = None;
         self.address = None;
+        #[cfg(feature = "ipv6")]
+        {
+            self.address6 = None;
+        }
     }
 
     /// Queue a decrypted packet for smoltcp.
@@ -538,16 +664,27 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
     }
 
     /// Open a TCP connection. It completes asynchronously as packets flow.
+    ///
+    /// `local_port` in the ephemeral range (49152-65535) is the first source
+    /// port tried. Any other value, such as 0, lets the stack pick: it rotates
+    /// through the range like Linux instead of reusing the lowest free port.
+    /// Reusing a just-closed connection's four-tuple would meet the peer's
+    /// TIME_WAIT for it, which ignores the new SYN for up to a minute.
     pub fn connect(
         &mut self,
-        remote: Ipv4Addr,
+        remote: impl Into<IpAddr>,
         port: u16,
         local_port: u16,
     ) -> Result<TcpHandle, &'static str> {
+        let remote = stack_address(remote.into()).ok_or("IPv6 needs the `ipv6` feature")?;
         if self.live.len() >= N {
             return Err("TCP session capacity reached");
         }
-        let first = local_port.max(49152);
+        let first = if local_port >= 49152 {
+            local_port
+        } else {
+            self.next_port
+        };
         let local_port = (0..=N as u32)
             .map(|offset| 49152 + ((u32::from(first) - 49152 + offset) % 16384) as u16)
             .find(|candidate| {
@@ -563,16 +700,29 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
         if self.iface.is_none() {
             return Err("this node has no tailnet address yet");
         }
+        // Always send from this node's own address of the remote's family;
+        // left unbound, smoltcp would fall back to a loopback source.
+        let source = match remote {
+            IpAddress::Ipv4(_) => self.address.map(IpAddress::Ipv4),
+            #[cfg(feature = "ipv6")]
+            IpAddress::Ipv6(_) => self.address6.map(IpAddress::Ipv6),
+        }
+        .ok_or("this node has no tailnet address of that family")?;
         let mut socket = self.socket()?;
         let iface = self.iface.as_mut().unwrap();
         socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(25)));
         if socket
-            .connect(iface.context(), (IpAddress::Ipv4(remote), port), local_port)
+            .connect(iface.context(), (remote, port), (source, local_port))
             .is_err()
         {
             self.recycle(socket);
             return Err("invalid TCP connection endpoint");
         }
+        self.next_port = if local_port == u16::MAX {
+            49152
+        } else {
+            local_port + 1
+        };
         Ok(self.insert(socket))
     }
 
@@ -606,16 +756,12 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
             socket.state() == tcp::State::Listen
         })
     }
-    pub fn remote_addresses(&self) -> Vec<Ipv4Addr, N> {
+    pub fn remote_addresses(&self) -> Vec<IpAddr, N> {
         self.sockets
             .iter()
             .filter_map(|(_, socket)| {
                 let socket = tcp::Socket::downcast(socket).expect("TCP-only stack");
-                #[allow(unreachable_patterns)]
-                match socket.remote_endpoint()?.addr {
-                    IpAddress::Ipv4(address) => Some(address),
-                    _ => None,
-                }
+                Some(core_address(socket.remote_endpoint()?.addr))
             })
             .collect()
     }
@@ -756,7 +902,7 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
 
     /// The current peer endpoint, retaining it across a write-side half-close.
     /// Removed, reset and address-revoked sockets cannot expose a stale peer.
-    pub fn remote_endpoint(&self, handle: TcpHandle) -> Option<SocketAddrV4> {
+    pub fn remote_endpoint(&self, handle: TcpHandle) -> Option<SocketAddr> {
         if !self.valid(handle) {
             return None;
         }
@@ -765,11 +911,7 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> NetStack<'a, N, Q, B
             return None;
         }
         let endpoint = socket.remote_endpoint()?;
-        match endpoint.addr {
-            IpAddress::Ipv4(address) => Some(SocketAddrV4::new(address, endpoint.port)),
-            #[allow(unreachable_patterns)]
-            _ => None,
-        }
+        Some(SocketAddr::new(core_address(endpoint.addr), endpoint.port))
     }
 
     fn valid(&self, handle: TcpHandle) -> bool {
@@ -804,6 +946,122 @@ fn instant(now_ms: u64) -> Instant {
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
+
+    fn exchange(local: &mut OwnedStack, remote: &mut OwnedStack, times: core::ops::Range<u64>) {
+        for now in times {
+            for bytes in local.poll(now) {
+                remote.deliver(&bytes);
+            }
+            for bytes in remote.poll(now) {
+                local.deliver(&bytes);
+            }
+        }
+    }
+
+    #[cfg(feature = "ipv6")]
+    #[test]
+    fn one_listener_serves_both_families_and_an_ipv6_change_ends_only_ipv6() {
+        let local6: Ipv6Addr = "fd7a:115c:a1e0::1".parse().unwrap();
+        let remote6: Ipv6Addr = "fd7a:115c:a1e0::2".parse().unwrap();
+        let mut local = OwnedStack::new(1);
+        let mut remote = OwnedStack::new(2);
+        // The IPv6 address may arrive before the IPv4 one creates the interface.
+        local.set_ipv6_address(Some(local6));
+        local.set_address("100.64.0.1".parse().unwrap(), 0, 1);
+        remote.set_address("100.64.0.2".parse().unwrap(), 0, 2);
+        remote.set_ipv6_address(Some(remote6));
+        assert_eq!(remote.ipv6_address(), Some(remote6));
+        let mut listener = remote.listen_backlog(2222).unwrap();
+
+        let over6 = local.connect(remote6, 2222, 49152).unwrap();
+        let over4 = local
+            .connect("100.64.0.2".parse::<Ipv4Addr>().unwrap(), 2222, 49153)
+            .unwrap();
+        exchange(&mut local, &mut remote, 0..10);
+        assert_eq!(
+            local.remote_endpoint(over6),
+            Some(SocketAddr::new(remote6.into(), 2222))
+        );
+        let mut peers = std::vec::Vec::new();
+        while let Some(accepted) = remote.accept_one(&mut listener) {
+            peers.push(remote.remote_endpoint(accepted).unwrap());
+        }
+        peers.sort();
+        assert_eq!(
+            peers,
+            [
+                "100.64.0.1:49153".parse().unwrap(),
+                SocketAddr::new(local6.into(), 49152),
+            ]
+        );
+        let mut remotes = local.remote_addresses();
+        remotes.sort();
+        assert_eq!(remotes, [IpAddr::from([100, 64, 0, 2]), remote6.into()]);
+
+        // Data and a closing FIN round-trip over IPv6, so FIN bookkeeping
+        // reads IPv6 headers too.
+        local.tcp(over6).unwrap().send_slice(b"over ipv6").unwrap();
+        local.tcp(over6).unwrap().close();
+        exchange(&mut local, &mut remote, 10..100);
+        assert_eq!(local.close_outcome(over6), Some(true));
+
+        // A new IPv6 address ends what was bound to the old one only.
+        let fresh = local.connect(remote6, 2222, 49160).unwrap();
+        exchange(&mut local, &mut remote, 100..110);
+        assert_eq!(local.tcp(fresh).unwrap().state(), tcp::State::Established);
+        local.set_ipv6_address(Some("fd7a:115c:a1e0::9".parse().unwrap()));
+        assert_eq!(local.tcp(fresh).unwrap().state(), tcp::State::Closed);
+        assert_eq!(local.tcp(over4).unwrap().state(), tcp::State::Established);
+        // Without an IPv6 address there is no source to connect from.
+        local.set_ipv6_address(None);
+        assert!(local.connect(remote6, 2222, 49170).is_err());
+    }
+
+    #[test]
+    fn automatic_source_ports_rotate_instead_of_reusing_a_closed_tuple() {
+        let mut net = OwnedStack::new(1);
+        net.set_address("100.64.0.1".parse().unwrap(), 0, 7);
+        let remote: Ipv4Addr = "100.64.0.2".parse().unwrap();
+        let mut seen = std::vec::Vec::new();
+        for _ in 0..4 {
+            let handle = net.connect(remote, 2222, 0).unwrap();
+            let port = net.tcp(handle).unwrap().local_endpoint().unwrap().port;
+            // Closed at once, as a short request is: its port is free again,
+            // but the peer may still hold the tuple in TIME_WAIT.
+            net.remove(handle);
+            seen.push(port);
+        }
+        assert!(seen.iter().all(|port| *port >= 49152), "{seen:?}");
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "a freed port came straight back: {seen:?}"
+        );
+        // The cursor wraps within the ephemeral range.
+        net.next_port = u16::MAX;
+        let last = net.connect(remote, 2222, 0).unwrap();
+        assert_eq!(
+            net.tcp(last).unwrap().local_endpoint().unwrap().port,
+            u16::MAX
+        );
+        let wrapped = net.connect(remote, 2222, 0).unwrap();
+        assert_eq!(
+            net.tcp(wrapped).unwrap().local_endpoint().unwrap().port,
+            49152
+        );
+    }
+
+    #[cfg(not(feature = "ipv6"))]
+    #[test]
+    fn ipv6_connections_need_the_feature() {
+        let mut local = OwnedStack::new(1);
+        local.set_address("100.64.0.1".parse().unwrap(), 0, 1);
+        let remote: core::net::Ipv6Addr = "fd7a:115c:a1e0::2".parse().unwrap();
+        assert!(local.connect(remote, 2222, 49152).is_err());
+    }
     #[test]
     fn remote_endpoints_survive_half_close_but_not_reset_revocation_or_handle_reuse() {
         for reset in [true, false] {
@@ -814,7 +1072,11 @@ mod tests {
             let accepted = remote.listen(2222).unwrap();
             assert_eq!(remote.remote_endpoint(accepted), None);
             let client = local
-                .connect("100.64.0.2".parse().unwrap(), 2222, 49152)
+                .connect(
+                    "100.64.0.2".parse::<core::net::Ipv4Addr>().unwrap(),
+                    2222,
+                    49152,
+                )
                 .unwrap();
             for now in 0..10 {
                 for bytes in local.poll(now) {
@@ -842,7 +1104,11 @@ mod tests {
             local.remove(client);
             local.set_address("100.64.0.1".parse().unwrap(), 10, 3);
             let replacement = local
-                .connect("100.64.0.3".parse().unwrap(), 2223, 49152)
+                .connect(
+                    "100.64.0.3".parse::<core::net::Ipv4Addr>().unwrap(),
+                    2223,
+                    49152,
+                )
                 .unwrap();
             assert_eq!(
                 local.remote_endpoint(client),
@@ -865,7 +1131,11 @@ mod tests {
             remote.set_address("100.64.0.2".parse().unwrap(), 0, 2);
             let accepted = remote.listen(2222).unwrap();
             let client = local
-                .connect("100.64.0.2".parse().unwrap(), 2222, 49152)
+                .connect(
+                    "100.64.0.2".parse::<core::net::Ipv4Addr>().unwrap(),
+                    2222,
+                    49152,
+                )
                 .unwrap();
             for now in 0..10 {
                 for bytes in local.poll(now) {
@@ -902,7 +1172,7 @@ mod tests {
     fn wrapping_source_port_selection_preserves_active_four_tuples() {
         let mut net = OwnedStack::new(1);
         net.set_address("100.64.0.1".parse().unwrap(), 0, 1);
-        let remote = "100.64.0.2".parse().unwrap();
+        let remote: Ipv4Addr = "100.64.0.2".parse().unwrap();
         let first = net.connect(remote, 2222, 49152).unwrap();
         let last = net.connect(remote, 2222, 65535).unwrap();
         let wrapped = net.connect(remote, 2222, 49152).unwrap();
@@ -922,7 +1192,11 @@ mod tests {
         net.set_address("100.64.0.1".parse().unwrap(), 0, 1);
         let listener = net.listen(2222).unwrap();
         let outgoing = net
-            .connect("100.64.0.2".parse().unwrap(), 2222, 49152)
+            .connect(
+                "100.64.0.2".parse::<core::net::Ipv4Addr>().unwrap(),
+                2222,
+                49152,
+            )
             .unwrap();
         net.set_address("100.64.0.3".parse().unwrap(), 1, 1);
         assert_eq!(net.tcp(listener).unwrap().state(), tcp::State::Listen);
@@ -945,7 +1219,11 @@ mod backlog_tests {
             let connections = (0..backlog as u16)
                 .map(|n| {
                     client
-                        .connect("100.64.0.1".parse().unwrap(), 2222, 49152 + n)
+                        .connect(
+                            "100.64.0.1".parse::<core::net::Ipv4Addr>().unwrap(),
+                            2222,
+                            49152 + n,
+                        )
                         .unwrap()
                 })
                 .collect::<alloc::vec::Vec<_>>();
@@ -1014,7 +1292,11 @@ mod fixed_storage_tests {
         remote.set_address("100.64.0.2".parse().unwrap(), 0, 2);
         let accepted = remote.listen(2222).unwrap();
         let client = local
-            .connect("100.64.0.2".parse().unwrap(), 2222, 49152)
+            .connect(
+                "100.64.0.2".parse::<core::net::Ipv4Addr>().unwrap(),
+                2222,
+                49152,
+            )
             .unwrap();
         for now in 0..10 {
             for bytes in local.poll(now) {

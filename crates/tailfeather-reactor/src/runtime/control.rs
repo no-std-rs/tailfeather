@@ -98,6 +98,7 @@ fn hostinfo<'a>(config: &Config<'a>, preferred_derp: u16, report_no_derp: bool) 
         preferred_derp,
         report_no_derp,
         peer_api_port: config.peer_api_port,
+        peer_api6_port: config.peer_api_port.filter(|_| config.peer_api_ipv6),
         ..Default::default()
     }
 }

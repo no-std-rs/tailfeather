@@ -103,7 +103,20 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> Tcp<'a, N, Q, B> {
         self.changed.signal(());
     }
 
-    pub fn remote_addresses(&self) -> heapless::Vec<core::net::Ipv4Addr, N> {
+    /// Adopt, change or drop this node's tailnet IPv6 address.
+    #[cfg(feature = "ipv6")]
+    pub fn set_ipv6_address(&self, address: Option<core::net::Ipv6Addr>) {
+        self.stack.borrow_mut().set_ipv6_address(address);
+        self.changed.signal(());
+    }
+
+    /// Print every connection's state and queues to stderr.
+    #[cfg(feature = "std")]
+    pub fn trace(&self) {
+        self.stack.borrow().trace();
+    }
+
+    pub fn remote_addresses(&self) -> heapless::Vec<core::net::IpAddr, N> {
         self.stack.borrow().remote_addresses()
     }
 
@@ -226,7 +239,7 @@ impl<'a, const N: usize, const Q: usize, B: PacketQueue<Q>> Tcp<'a, N, Q, B> {
     pub async fn connect<C: Clock>(
         &self,
         reactor: &Reactor<C>,
-        address: core::net::Ipv4Addr,
+        address: impl Into<core::net::IpAddr>,
         port: u16,
         local_port: u16,
     ) -> Result<Stream<'_, 'a, N, Q, B>, Error> {
@@ -363,7 +376,7 @@ pub struct Stream<'r, 'a, const N: usize, const Q: usize, B: PacketQueue<Q>> {
 impl<const N: usize, const Q: usize, B: PacketQueue<Q>> Stream<'_, '_, N, Q, B> {
     /// The peer's inner TCP endpoint. A write-side half-close
     /// retains it; a reset, removed socket or revoked local address returns None.
-    pub fn remote_endpoint(&self) -> Option<core::net::SocketAddrV4> {
+    pub fn remote_endpoint(&self) -> Option<core::net::SocketAddr> {
         self.tcp.stack.borrow().remote_endpoint(self.handle)
     }
 

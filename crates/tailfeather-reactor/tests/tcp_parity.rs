@@ -50,7 +50,12 @@ async fn exchange<'a, C: Clock, B: PacketQueue<8>>(
         let mut listener = remote.listen(2222).unwrap();
         let client = async {
             let stream = local
-                .connect(&clock, "100.64.0.2".parse().unwrap(), 2222, 49152)
+                .connect(
+                    &clock,
+                    "100.64.0.2".parse::<core::net::Ipv4Addr>().unwrap(),
+                    2222,
+                    49152,
+                )
                 .await
                 .unwrap();
             assert_eq!(

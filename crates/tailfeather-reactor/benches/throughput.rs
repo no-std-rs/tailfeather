@@ -66,7 +66,12 @@ async fn transfer<'a, C: Clock, B: PacketQueue<64>>(
 ) -> f64 {
     let mut listener = remote.listen(2222).unwrap();
     let (source, sink) = tokio::join!(
-        local.connect(clock, "100.64.0.2".parse().unwrap(), 2222, 49152),
+        local.connect(
+            clock,
+            "100.64.0.2".parse::<std::net::Ipv4Addr>().unwrap(),
+            2222,
+            49152
+        ),
         listener.accept()
     );
     let mut source = source.unwrap();

@@ -546,6 +546,7 @@ impl State {
             preferred_derp,
             report_no_derp: false,
             peer_api_port: None,
+            peer_api6_port: None,
             peer_api_dns_proxy: false,
             ssh_host_keys: &[],
         }

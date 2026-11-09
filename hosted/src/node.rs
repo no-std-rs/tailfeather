@@ -875,7 +875,7 @@ async fn packets(
                 .remote_addresses()
                 .into_iter()
                 .filter_map(|address| {
-                    crate::logic::route_ipv4(node.borrow().netmap().peers.iter(), address)
+                    crate::logic::route_ip(node.borrow().netmap().peers.iter(), address)
                 })
                 .collect();
             punches.retain(|(peer, _, _)| active.contains(peer));

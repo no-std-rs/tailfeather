@@ -13,7 +13,7 @@ use crate::{
 };
 use core::{
     cell::{Cell, RefCell},
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4},
 };
 use embassy_sync::{
     blocking_mutex::raw::NoopRawMutex, channel::Channel, signal::Signal, watch::Watch,
@@ -62,14 +62,26 @@ where
     }
 }
 
-/// Local delivery of authenticated inner IPv4 packets. Implement this for a
+/// Local delivery of authenticated inner packets. Implement this for a
 /// kernel TUN interface, or use [`Tcp`] for the shared userspace TCP stack.
 /// The driver must be cancellation-safe and must not bypass [`PacketIo`]'s
 /// authenticated ingress. Address removal also invalidates local connections.
+///
+/// Devices are IPv4 unless they opt in to IPv6: one that does is told the
+/// node's IPv6 address and receives authenticated inner IPv6 packets too.
 #[allow(async_fn_in_trait)]
 pub trait Device {
     fn set_address(&self, address: Option<Ipv4Addr>, now_ms: u64, seed: u64) -> Result<(), Error>;
-    fn visit_remote_addresses(&self, _visit: impl FnMut(Ipv4Addr)) {}
+    /// Whether this device takes IPv6 packets.
+    fn accepts_ipv6(&self) -> bool {
+        false
+    }
+    /// The node's IPv6 address changed. Only called when [`Device::accepts_ipv6`],
+    /// and only while the node also has an IPv4 address.
+    fn set_ipv6_address(&self, _address: Option<Ipv6Addr>) -> Result<(), Error> {
+        Ok(())
+    }
+    fn visit_remote_addresses(&self, _visit: impl FnMut(IpAddr)) {}
     async fn run<C: Clock, I: PacketIo<Error = Error>>(
         &self,
         reactor: &Reactor<C>,
@@ -86,7 +98,16 @@ impl<const N: usize, const Q: usize, B: PacketQueue<Q>> Device for Tcp<'_, N, Q,
         }
         Ok(())
     }
-    fn visit_remote_addresses(&self, visit: impl FnMut(Ipv4Addr)) {
+    #[cfg(feature = "ipv6")]
+    fn accepts_ipv6(&self) -> bool {
+        true
+    }
+    #[cfg(feature = "ipv6")]
+    fn set_ipv6_address(&self, address: Option<Ipv6Addr>) -> Result<(), Error> {
+        Tcp::set_ipv6_address(self, address);
+        Ok(())
+    }
+    fn visit_remote_addresses(&self, visit: impl FnMut(IpAddr)) {
         self.remote_addresses().into_iter().for_each(visit);
     }
     async fn run<C: Clock, I: PacketIo<Error = Error>>(
@@ -170,6 +191,11 @@ pub struct Config<'a> {
     /// port through its TCP stack and serves it, for example with
     /// `tailfeather-gateway`'s `taildrop` feature.
     pub peer_api_port: Option<u16>,
+    /// Advertise the same port as the IPv6 peer API (`peerapi6`) too. Set it
+    /// only when the TCP stack takes IPv6 (the `ipv6` feature, or a
+    /// [`Device`] that accepts it), since peers may then dial the node's
+    /// IPv6 address.
+    pub peer_api_ipv6: bool,
 }
 
 /// Caller-owned transport and TLS buffers for one control or DERP connection.
@@ -397,6 +423,19 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
             .collect()
     }
 
+    /// This node's tailnet IPv6 address, once control has assigned one.
+    pub fn ipv6_address(&self) -> Option<Ipv6Addr> {
+        self.node
+            .borrow()
+            .netmap()
+            .addresses
+            .iter()
+            .find_map(|cidr| match cidr.address {
+                IpAddr::V6(address) => Some(address),
+                IpAddr::V4(_) => None,
+            })
+    }
+
     pub async fn ready(&self) -> Result<Ipv4Addr, Error> {
         let mut receiver = self.status.receiver().ok_or("status waiter capacity")?;
         loop {
@@ -414,7 +453,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
     pub async fn connect<'r, 's, const N: usize, const Q: usize, B: PacketQueue<Q>>(
         &self,
         tcp: &'r Tcp<'s, N, Q, B>,
-        address: Ipv4Addr,
+        address: impl Into<IpAddr>,
         port: u16,
         local_port: u16,
     ) -> Result<crate::tcp_async::Stream<'r, 's, N, Q, B>, Error> {
@@ -587,6 +626,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
         let mut seed = [0; 8];
         self.network.rng().fill_bytes(&mut seed);
         let mut address = None;
+        let mut address6 = None;
         let mut next_maintenance = 0;
         let mut budget = 0;
         loop {
@@ -601,6 +641,14 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                     u64::from_le_bytes(seed),
                 )?;
                 address = current_address;
+                address6 = None;
+            }
+            if device.accepts_ipv6() && address.is_some() {
+                let current = self.ipv6_address();
+                if current != address6 {
+                    device.set_ipv6_address(current)?;
+                    address6 = current;
+                }
             }
             for _ in 0..A {
                 let Some(action) = self.pop() else {
@@ -640,8 +688,25 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                             self.delivered.send(packet).await;
                         }
                     }
-                    // This adapter exposes an IPv4 local device only.
-                    NodeAction::DeliveredIpv6 { .. } => {}
+                    NodeAction::DeliveredIpv6 { peer, packet } => {
+                        let allowed = device.accepts_ipv6() && {
+                            let node = self.node.borrow();
+                            let bytes = packet.as_slice();
+                            (crate::routing::tcp_continuation(bytes)
+                                || node.netmap().packet_filter.allows_ipv6(bytes))
+                                && address6.is_some_and(|own| {
+                                    crate::routing::inbound_allowed_ipv6(
+                                        bytes,
+                                        &peer,
+                                        node.netmap().peers.iter(),
+                                        own,
+                                    )
+                                })
+                        };
+                        if allowed && let Ok(packet) = Packet::from_slice(packet.as_slice()) {
+                            self.delivered.send(packet).await;
+                        }
+                    }
                     NodeAction::Derp(command) => {
                         if let Some(command) = derp::dispatch(self, command) {
                             let _ = self.actions.borrow_mut().push(NodeAction::Derp(command));
@@ -671,7 +736,7 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
                     }
                     let mut active: Vec<tailfeather::keys::NodePublic, PEERS> = Vec::new();
                     device.visit_remote_addresses(|address| {
-                        if let Some(peer) = crate::routing::route_ipv4(
+                        if let Some(peer) = crate::routing::route_ip(
                             self.node.borrow().netmap().peers.iter(),
                             address,
                         ) && !active.contains(&peer)
@@ -816,17 +881,24 @@ impl<P: Network, S: State, const PEERS: usize, const A: usize> PacketIo
     }
     async fn send(&self, packet: &[u8]) -> Result<(), Error> {
         self.wait_for_space().await;
-        let peer = crate::routing::ipv4_addresses(packet).and_then(|(_, destination)| {
-            crate::routing::route_ipv4(self.node.borrow().netmap().peers.iter(), destination)
+        let destination = crate::routing::ipv4_addresses(packet)
+            .map(|(_, destination)| IpAddr::V4(destination))
+            .or_else(|| {
+                crate::routing::ipv6_addresses(packet).map(|(_, destination)| destination.into())
+            });
+        let peer = destination.and_then(|destination| {
+            crate::routing::route_ip(self.node.borrow().netmap().peers.iter(), destination)
         });
         if let Some(peer) = peer {
-            let action = self
-                .node
-                .borrow_mut()
-                .encapsulate_ipv4(&peer, packet, self.network.now_millis())
-                .ok()
-                .flatten();
-            self.enqueue(action);
+            let now = self.network.now_millis();
+            let mut node = self.node.borrow_mut();
+            let action = if destination.is_some_and(|destination| destination.is_ipv6()) {
+                node.encapsulate_ipv6(&peer, packet, now)
+            } else {
+                node.encapsulate_ipv4(&peer, packet, now)
+            };
+            drop(node);
+            self.enqueue(action.ok().flatten());
         }
         Ok(())
     }
@@ -955,6 +1027,7 @@ mod tests {
             ephemeral: true,
             os: "fixture",
             peer_api_port: None,
+            peer_api_ipv6: false,
         }
     }
 
@@ -963,8 +1036,8 @@ mod tests {
         fn set_address(&self, _: Option<Ipv4Addr>, _: u64, _: u64) -> Result<(), Error> {
             Ok(())
         }
-        fn visit_remote_addresses(&self, mut visit: impl FnMut(Ipv4Addr)) {
-            self.0.iter().copied().for_each(&mut visit);
+        fn visit_remote_addresses(&self, mut visit: impl FnMut(IpAddr)) {
+            self.0.iter().copied().map(IpAddr::V4).for_each(&mut visit);
         }
         async fn run<C: Clock, I: PacketIo<Error = Error>>(
             &self,
@@ -1407,6 +1480,112 @@ mod tests {
             [0, 1, 2],
             "relay backpressure must preserve the original packet order"
         );
+    }
+
+    /// Takes IPv6 and records the addresses it is given.
+    struct DualStackDevice(RefCell<std::vec::Vec<Option<Ipv6Addr>>>);
+    impl Device for DualStackDevice {
+        fn set_address(&self, _: Option<Ipv4Addr>, _: u64, _: u64) -> Result<(), Error> {
+            Ok(())
+        }
+        fn accepts_ipv6(&self) -> bool {
+            true
+        }
+        fn set_ipv6_address(&self, address: Option<Ipv6Addr>) -> Result<(), Error> {
+            self.0.borrow_mut().push(address);
+            Ok(())
+        }
+        async fn run<C: Clock, I: PacketIo<Error = Error>>(
+            &self,
+            _: &Reactor<C>,
+            _: &I,
+        ) -> Result<(), Error> {
+            core::future::pending().await
+        }
+    }
+
+    #[test]
+    fn ipv6_delivery_is_authenticated_and_only_for_devices_that_take_it() {
+        use core::future::Future;
+        use tailfeather::{
+            keys::NodePrivate,
+            netmap::{Cidr, Cidr4, Netmap, Peer},
+            node::SecretBuffer,
+        };
+        let own: Ipv6Addr = "fd7a:115c:a1e0::1".parse().unwrap();
+        let theirs: Ipv6Addr = "fd7a:115c:a1e0::2".parse().unwrap();
+        let network = Offline(Cell::new(0), RefCell::new(std::vec::Vec::new()));
+        let state = MemoryState::default();
+        let mut node = restore::<_, _, 1>(&config(), &network, &state).unwrap();
+        let generation = match node.poll(0).unwrap().unwrap() {
+            NodeAction::PersistState(state) => state.generation(),
+            _ => unreachable!(),
+        };
+        node.persistence_result(generation, true).unwrap();
+        let peer = NodePrivate::from_bytes([7; 32]).public();
+        let mut map = Netmap::<1>::new();
+        for address in ["100.64.0.1/32", "fd7a:115c:a1e0::1/128"] {
+            map.addresses.push(Cidr::parse(address).unwrap()).unwrap();
+        }
+        let mut entry = Peer::new(1, peer);
+        let peer_address = Cidr4::from_cidr(Cidr::parse("100.64.0.2/32").unwrap()).unwrap();
+        entry.addresses.push(peer_address).unwrap();
+        entry.allowed_ips.push(peer_address).unwrap();
+        entry.ipv6_address = Some(theirs);
+        map.peers.upsert(entry).unwrap();
+        node.handle_control_event(ControlEvent::MapFinished {
+            lease: &mut map,
+            result: Ok(()),
+        })
+        .unwrap();
+        let runtime = Runtime::<_, _, 1, 32>::new(config(), &mut node, &network, &state).unwrap();
+        assert_eq!(runtime.ipv6_address(), Some(own));
+
+        // A TCP continuation (ACK) of an existing connection; the stack
+        // validates its state, as for IPv4.
+        let packet = |source: Ipv6Addr, destination: Ipv6Addr| {
+            let mut inner = [0u8; 60];
+            inner[0] = 0x60;
+            inner[4..6].copy_from_slice(&20u16.to_be_bytes());
+            inner[6] = 6;
+            inner[8..24].copy_from_slice(&source.octets());
+            inner[24..40].copy_from_slice(&destination.octets());
+            inner[52] = 0x50;
+            inner[53] = 0x10;
+            inner
+        };
+        let genuine = packet(theirs, own);
+        let deliver = |inner: &[u8]| {
+            runtime.enqueue(Some(NodeAction::DeliveredIpv6 {
+                peer,
+                packet: SecretBuffer::try_from_slice(inner).unwrap(),
+            }));
+        };
+        let reactor = Reactor::with_clock(&network);
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+
+        // An IPv4-only device never sees IPv6.
+        deliver(&genuine);
+        let device = ActiveDevice(std::vec![]);
+        let mut packets = std::boxed::Box::pin(runtime.packets(&device, &reactor));
+        assert!(packets.as_mut().poll(&mut cx).is_pending());
+        assert!(runtime.delivered.try_receive().is_err());
+        drop(packets);
+
+        // A dual-stack one learns the address and gets only genuine packets:
+        // not a spoofed source, nor one meant for another node.
+        deliver(&packet("fd7a:115c:a1e0::3".parse().unwrap(), own));
+        deliver(&packet(theirs, "fd7a:115c:a1e0::4".parse().unwrap()));
+        deliver(&genuine);
+        let device = DualStackDevice(RefCell::new(std::vec::Vec::new()));
+        let mut packets = std::boxed::Box::pin(runtime.packets(&device, &reactor));
+        assert!(packets.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(&*device.0.borrow(), &[Some(own)]);
+        assert_eq!(
+            runtime.delivered.try_receive().unwrap().as_slice(),
+            &genuine
+        );
+        assert!(runtime.delivered.try_receive().is_err());
     }
 
     #[test]
