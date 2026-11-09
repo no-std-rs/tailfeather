@@ -42,9 +42,11 @@ impl core::error::Error for MemoryError {}
 ///
 /// An aborted upload is kept as its sender's partial file, so the sender can
 /// resume it; finished and partial files share the budget. The budget charges
-/// what is allocated, not just what arrived: a reservation for an announced
-/// size counts until the bytes come, and an aborted upload gives back what it
-/// reserved for bytes that never arrived. Allocation is fallible: a full heap
+/// what is allocated, not just what arrived: each file's record, name and
+/// buffer capacity, so a reservation for an announced size counts until the
+/// bytes come, and an aborted upload gives back what it reserved for bytes
+/// that never arrived. Beyond the budget the sink holds only its own struct
+/// and one spare record slot in each of its two file tables. Allocation is fallible: a full heap
 /// fails the transfer (the sender sees `500`) instead of aborting the process.
 #[derive(Debug)]
 pub struct MemorySink {
@@ -108,12 +110,13 @@ impl MemorySink {
         if self.files.iter().any(|kept| kept.name == file.name) {
             return Err(Refusal::Exists);
         }
+        // Convert before taking the partial out, so a refusal cannot lose it.
+        let kept = usize::try_from(file.offset).map_err(|_| MemoryError::BadOffset)?;
         let resumed = self
             .partial(file.from, file.name)
             .map(|index| self.partials.swap_remove(index));
         let mut current = match resumed {
             Some(mut partial) => {
-                let kept = usize::try_from(file.offset).map_err(|_| MemoryError::BadOffset)?;
                 if kept > partial.data.len() {
                     // Keep the partial for a correct retry.
                     self.partials.push(partial);
@@ -151,11 +154,13 @@ impl MemorySink {
             self.partials.push(current);
             return Err(MemoryError::OverBudget.into());
         }
+        // Exact, so the record tables hold at most one spare slot each (for
+        // this file to land in) beyond what the budget charges.
         let reserved = current
             .data
             .try_reserve_exact(declared)
-            .and_then(|()| self.files.try_reserve(1))
-            .and_then(|()| self.partials.try_reserve(1));
+            .and_then(|()| self.files.try_reserve_exact(1))
+            .and_then(|()| self.partials.try_reserve_exact(1));
         if reserved.is_err() {
             return Err(MemoryError::OutOfMemory.into());
         }
