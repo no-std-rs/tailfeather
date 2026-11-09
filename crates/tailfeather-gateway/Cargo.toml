@@ -14,12 +14,10 @@ categories = ["network-programming", "no-std", "embedded"]
 
 [features]
 default = []
-# Stream-based peer API endpoints over caller-supplied byte streams: sans-I/O
-# HTTP/1.1 framing with blocking (embedded-io) and async (embedded-io-async)
-# drivers. The packet-level DNS peer API above is always present.
-peerapi-http = ["dep:embedded-io", "dep:embedded-io-async"]
-# Taildrop file receive and send on top of `peerapi-http`.
-taildrop = ["peerapi-http"]
+# Taildrop file receive and send over caller-supplied byte streams, with
+# blocking (embedded-io) and async (embedded-io-async) drivers. The sans-I/O
+# HTTP framing they share, and the packet-level DNS peer API, are always built.
+taildrop = ["dep:embedded-io", "dep:embedded-io-async"]
 # Heap-backed conveniences (an in-memory Taildrop sink). Allocation is
 # fallible; the default build stays allocation-free.
 alloc = []

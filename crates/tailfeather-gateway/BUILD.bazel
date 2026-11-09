@@ -43,13 +43,13 @@ rust_test(
     deps = all_crate_deps(normal_dev = True),
 )
 
-# The opt-in stream peer API: HTTP framing, Taildrop receive/send with both
-# drivers, the alloc sink, and the multi-threaded Tokio round trip.
+# The opt-in Taildrop stream peer API: receive/send with both drivers, the
+# alloc sink, and the multi-threaded Tokio round trip.
 rust_test(
     name = "peerapi_http_test",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
-    crate_features = ["peerapi-http", "taildrop", "alloc"],
+    crate_features = ["taildrop", "alloc"],
     crate_name = "tailfeather_gateway",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -70,12 +70,12 @@ rust_doc(
     rustdoc_flags = ["-Dwarnings"],
 )
 
-# Documents the feature-gated stream peer API with warnings denied.
+# Documents the feature-gated Taildrop API with warnings denied.
 rust_library(
     name = "tailfeather_gateway_peerapi_http",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
-    crate_features = ["peerapi-http", "taildrop", "alloc"],
+    crate_features = ["taildrop", "alloc"],
     crate_name = "tailfeather_gateway",
     edition = "2024",
     deps = all_crate_deps(normal = True) + [

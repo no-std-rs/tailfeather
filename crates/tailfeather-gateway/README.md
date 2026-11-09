@@ -32,9 +32,9 @@ follow [RFC 8200](https://www.rfc-editor.org/rfc/rfc8200) and
 
 ## Stream peer API (opt-in)
 
-The `peerapi-http` feature adds sans-I/O HTTP/1.1 framing for peer API
-endpoints served over caller-supplied byte streams, and `taildrop` builds
-Taildrop receive (`PUT /v0/put/<name>`) and send on it. Each comes with a
+The peer API's sans-I/O HTTP/1.1 framing (`peerapi::http`) is always built;
+the DNS proxy parses with it. The `taildrop` feature adds Taildrop receive
+(`PUT /v0/put/<name>`, with resume) and send over caller-supplied streams. Each comes with a
 blocking driver over `embedded-io` and an async one over `embedded-io-async`,
 with no executor or allocator; Tokio and `futures` streams plug in through
 `embedded-io-adapters`. Authorization is the caller's decision, and received

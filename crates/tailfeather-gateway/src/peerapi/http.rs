@@ -5,9 +5,9 @@
 //! TLS layer. This module owns no stream and performs no allocation. It
 //! locates and parses message heads in caller-supplied buffers, decodes
 //! `Content-Length` and `chunked` bodies incrementally, and formats the small
-//! heads the endpoints send. The blocking and async drivers in
-//! [`super::taildrop`] are thin loops over these pieces, so both share one
-//! protocol implementation.
+//! heads the endpoints send. The exit-node DNS proxy parses its requests
+//! with it, and the `taildrop` feature's blocking and async drivers are thin
+//! loops over these pieces, so every endpoint shares one implementation.
 //!
 //! The parser is deliberately strict, because a lenient one is how request
 //! smuggling starts: lines end in CRLF, obsolete line folding is rejected, a
@@ -57,6 +57,7 @@ pub struct Request<'a> {
     pub framing: Framing,
     /// The client sent `Expect: 100-continue` and waits before the body.
     pub expect_continue: bool,
+    headers: &'a str,
 }
 
 impl<'a> Request<'a> {
@@ -65,6 +66,22 @@ impl<'a> Request<'a> {
         self.target
             .split_once('?')
             .map_or(self.target, |(path, _)| path)
+    }
+
+    /// The target's query string, without the `?`.
+    pub fn query(&self) -> &'a str {
+        self.target.split_once('?').map_or("", |(_, query)| query)
+    }
+
+    /// The first value of the named header, trimmed of optional whitespace.
+    /// Names compare case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&'a str> {
+        self.headers.split("\r\n").find_map(|line| {
+            let (field, value) = line.split_once(':')?;
+            field
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim_matches([' ', '\t']))
+        })
     }
 }
 
@@ -146,6 +163,7 @@ pub fn parse_request(head: &[u8]) -> Result<Request<'_>, Error> {
         target,
         framing: fields.framing.unwrap_or(Framing::None),
         expect_continue: fields.expect_continue,
+        headers,
     })
 }
 
@@ -533,6 +551,9 @@ mod tests {
         assert_eq!(request.path(), "/v0/put/a%20b.txt");
         assert_eq!(request.framing, Framing::Length(12));
         assert!(!request.expect_continue);
+        assert_eq!(request.header("user-agent"), Some("Go-http-client/1.1"));
+        assert_eq!(request.header("X-Missing"), None);
+        assert_eq!(request.query(), "");
     }
 
     #[test]
