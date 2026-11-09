@@ -59,6 +59,19 @@ rust_binary(
     deps = [":tailfeather_reactor"] + all_crate_deps(normal = True),
 )
 
+# Taildrop peer for //tests/lab:taildrop_live, serving and sending with
+# tailfeather-gateway's async Taildrop drivers over the runtime's TCP stack.
+rust_binary(
+    name = "taildrop_node",
+    testonly = True,
+    srcs = ["examples/taildrop_node.rs"],
+    aliases = aliases(),
+    crate_name = "taildrop_node",
+    crate_root = "examples/taildrop_node.rs",
+    edition = "2024",
+    deps = [":tailfeather_reactor"] + all_crate_deps(normal = True, normal_dev = True),
+)
+
 rust_binary(
     name = "throughput",
     srcs = ["benches/throughput.rs", "benches/throughput/mesh.rs"],

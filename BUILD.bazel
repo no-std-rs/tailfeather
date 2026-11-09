@@ -13,7 +13,9 @@ FIRST_PARTY_RUST_TARGETS = [
     "//crates/tailfeather-reactor:tailfeather_reactor",
     "//crates/tailfeather-reactor:tailfeather_reactor_portable",
     "//crates/tailfeather-reactor:throughput",
+    "//crates/tailfeather-reactor:taildrop_node",
     "//crates/tailfeather-gateway:tailfeather_gateway",
+    "//crates/tailfeather-gateway:tailfeather_gateway_peerapi_http",
     "//crates/tailfeather-ssh:tailfeather_ssh",
     "//crates/tailfeather-ssh:footprint",
     "//crates/tailfeather-ssh:live_server",
@@ -66,6 +68,7 @@ filegroup(
     srcs = [
         "//crates/tailfeather:docs",
         "//crates/tailfeather-gateway:docs",
+        "//crates/tailfeather-gateway:peerapi_http_docs",
         "//crates/tailfeather-ssh:docs",
         "//crates/tailfeather-testkit:docs",
         "//crates/ts-conformance:docs",
@@ -85,6 +88,7 @@ test_suite(
         "//crates/tailfeather:doc_test",
         "//crates/tailfeather-gateway:unit_test",
         "//crates/tailfeather-gateway:doc_test",
+        "//crates/tailfeather-gateway:peerapi_http_test",
         "//crates/tailfeather-ssh:unit_test",
         "//crates/tailfeather-ssh:unit_test_byte_input",
         "//crates/tailfeather-ssh:openssh_test",
@@ -105,6 +109,7 @@ test_suite(
         "//crates/wirefeather:doc_test",
         "//third_party/zssh:unit_test",
         "//tests/lab:ssh_live",
+        "//tests/lab:taildrop_live",
     ],
 )
 

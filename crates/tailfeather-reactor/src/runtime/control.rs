@@ -97,6 +97,7 @@ fn hostinfo<'a>(config: &Config<'a>, preferred_derp: u16, report_no_derp: bool) 
         version: concat!("tailfeather-reactor-", env!("CARGO_PKG_VERSION")),
         preferred_derp,
         report_no_derp,
+        peer_api_port: config.peer_api_port,
         ..Default::default()
     }
 }

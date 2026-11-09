@@ -154,6 +154,7 @@ fn config() -> Config<'static> {
         relay_only: false,
         ephemeral: true,
         os: "fixture",
+        peer_api_port: None,
     }
 }
 fn map(own: &str, other: &Node<2>, address: &str, endpoint: SocketAddrV4) -> Netmap<2> {

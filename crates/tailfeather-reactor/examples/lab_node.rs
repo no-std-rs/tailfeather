@@ -107,6 +107,7 @@ fn node(control_url: &str, state: PathBuf, timeout: Duration) {
         relay_only: false,
         ephemeral: true,
         os: std::env::consts::OS,
+        peer_api_port: None,
     };
     let mut node = Box::new(runtime::restore::<_, _, 4>(&config, &network, &state).unwrap());
     let runtime = Box::new(Node::new(config, &mut node, &network, &state).unwrap());

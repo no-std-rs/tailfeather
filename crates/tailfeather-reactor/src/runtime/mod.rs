@@ -165,6 +165,11 @@ pub struct Config<'a> {
     pub relay_only: bool,
     pub ephemeral: bool,
     pub os: &'a str,
+    /// Advertise a peer API (`peerapi4`) on this tailnet TCP port, for
+    /// Taildrop. The runtime only advertises it; the caller listens on the
+    /// port through its TCP stack and serves it, for example with
+    /// `tailfeather-gateway`'s `taildrop` feature.
+    pub peer_api_port: Option<u16>,
 }
 
 /// Caller-owned transport and TLS buffers for one control or DERP connection.
@@ -942,6 +947,7 @@ mod tests {
             relay_only: true,
             ephemeral: true,
             os: "fixture",
+            peer_api_port: None,
         }
     }
 

@@ -8,6 +8,11 @@
 
 use crate::nat::{self, TcpInfo};
 
+#[cfg(feature = "peerapi-http")]
+pub mod http;
+#[cfg(feature = "taildrop")]
+pub mod taildrop;
+
 pub const PORT: u16 = 5254;
 pub const CONNECTIONS: usize = 4;
 pub const CONNECTION_STORAGE: usize = 1280;

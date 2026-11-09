@@ -49,9 +49,13 @@ pub struct Hostinfo<'a> {
     pub preferred_derp: u16,
     /// Explicitly report zero to clear a previously advertised relay.
     pub report_no_derp: bool,
-    /// TCP port of the IPv4 peer API. When present, the node also advertises
-    /// the exit-node DNS proxy capability whose sentinel port is always one.
+    /// TCP port of the IPv4 peer API (`peerapi4`), for Taildrop and other
+    /// peer-to-peer HTTP endpoints.
     pub peer_api_port: Option<u16>,
+    /// With a peer API port, also advertise the exit-node DNS proxy
+    /// (`peerapi-dns-proxy`, whose sentinel port is always one). Only nodes
+    /// that answer DoH on their peer API may set this.
+    pub peer_api_dns_proxy: bool,
     /// Public OpenSSH host-key lines. Empty unless this node serves Tailscale SSH.
     pub ssh_host_keys: &'a [&'a str],
 }
@@ -76,6 +80,7 @@ impl Default for Hostinfo<'_> {
             preferred_derp: 0,
             report_no_derp: false,
             peer_api_port: None,
+            peer_api_dns_proxy: false,
             ssh_host_keys: &[],
         }
     }
@@ -122,11 +127,14 @@ impl Hostinfo<'_> {
                 .begin_object()
                 .field_str("Proto", "peerapi4")
                 .field_u64("Port", u64::from(port))
-                .end_object()
-                .begin_object()
-                .field_str("Proto", "peerapi-dns-proxy")
-                .field_u64("Port", 1)
                 .end_object();
+            if self.peer_api_dns_proxy {
+                writer
+                    .begin_object()
+                    .field_str("Proto", "peerapi-dns-proxy")
+                    .field_u64("Port", 1)
+                    .end_object();
+            }
         }
         writer.end_array();
         writer.end_object();
@@ -213,6 +221,7 @@ mod tests {
         let mut buffer = [0u8; 384];
         let hostinfo = Hostinfo {
             peer_api_port: Some(5254),
+            peer_api_dns_proxy: true,
             ..Default::default()
         };
         let text = rendered(&mut buffer, &hostinfo);
@@ -221,6 +230,16 @@ mod tests {
                 r#""Services":[{"Proto":"peerapi4","Port":5254},{"Proto":"peerapi-dns-proxy","Port":1}]"#
             ),
             "{text}"
+        );
+
+        let hostinfo = Hostinfo {
+            peer_api_port: Some(5254),
+            ..Default::default()
+        };
+        let text = rendered(&mut buffer, &hostinfo);
+        assert!(
+            text.contains(r#""Services":[{"Proto":"peerapi4","Port":5254}]"#),
+            "a Taildrop-only peer API must not claim the DNS proxy: {text}"
         );
     }
 }

@@ -12,5 +12,25 @@ readme = "README.md"
 keywords = ["tailscale", "nat", "no-std", "embedded"]
 categories = ["network-programming", "no-std", "embedded"]
 
+[features]
+default = []
+# Stream-based peer API endpoints over caller-supplied byte streams: sans-I/O
+# HTTP/1.1 framing with blocking (embedded-io) and async (embedded-io-async)
+# drivers. The packet-level DNS peer API above is always present.
+peerapi-http = ["dep:embedded-io", "dep:embedded-io-async"]
+# Taildrop file receive and send on top of `peerapi-http`.
+taildrop = ["peerapi-http"]
+# Heap-backed conveniences (an in-memory Taildrop sink). Allocation is
+# fallible; the default build stays allocation-free.
+alloc = []
+
 [dependencies]
+embedded-io = { version = "0.7", default-features = false, optional = true }
+embedded-io-async = { version = "0.7", default-features = false, optional = true }
 wirefeather = { path = "../wirefeather", version = "0.0.1" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
+
+[package.metadata.docs.rs]
+all-features = true
