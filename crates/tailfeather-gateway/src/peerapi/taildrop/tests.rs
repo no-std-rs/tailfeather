@@ -1317,3 +1317,45 @@ fn moving_records_between_tables_stays_within_the_budget() {
     assert_eq!((sink.files().len(), sink.partials().len()), (1000, 0));
     assert!(sink.allocated() <= 1000 * (record + 6) + 2 * record);
 }
+
+#[cfg(feature = "alloc")]
+#[test]
+fn refused_resumes_leave_the_sink_untouched() {
+    // Codex's case: a tight budget, a one-byte name and a one-byte partial.
+    // A resume past its end (BadOffset), or one too large (OverBudget), must
+    // neither grow a table nor change the partial.
+    let record = core::mem::size_of::<ReceivedFile>();
+    let mut sink = MemorySink::new(2 * record + 4);
+    let file = |offset, size| Incoming {
+        from: PEER.addr,
+        name: "a",
+        offset,
+        size: Some(size),
+    };
+    FileSink::begin(&mut sink, &file(0, 1)).unwrap();
+    FileSink::write(&mut sink, b"x").unwrap();
+    FileSink::abort(&mut sink);
+    let before = sink.allocated();
+    assert!(before <= 2 * record + 4);
+
+    assert_eq!(
+        FileSink::begin(&mut sink, &file(2, 1)),
+        Err(Refusal::Failed(MemoryError::BadOffset))
+    );
+    assert_eq!(sink.allocated(), before);
+    assert_eq!(sink.partials()[0].data, b"x");
+
+    assert_eq!(
+        FileSink::begin(&mut sink, &file(1, 1_000)),
+        Err(Refusal::Failed(MemoryError::OverBudget))
+    );
+    assert_eq!(sink.allocated(), before);
+    assert_eq!(sink.partials()[0].data, b"x");
+
+    // A resume that fits still works, and lands within the budget.
+    FileSink::begin(&mut sink, &file(1, 1)).unwrap();
+    FileSink::write(&mut sink, b"y").unwrap();
+    FileSink::finish(&mut sink).unwrap();
+    assert_eq!(sink.files()[0].data, b"xy");
+    assert!(sink.allocated() <= 2 * record + 4);
+}

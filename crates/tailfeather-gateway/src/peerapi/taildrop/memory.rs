@@ -115,78 +115,76 @@ impl MemorySink {
         if self.files.iter().any(|kept| kept.name == file.name) {
             return Err(Refusal::Exists);
         }
-        // Convert before taking the partial out, so a refusal cannot lose it.
         let kept = usize::try_from(file.offset).map_err(|_| MemoryError::BadOffset)?;
-        let resumed = self.partial(file.from, file.name).map(|index| {
-            let partial = self.partials.swap_remove(index);
-            // The emptied slot would otherwise stay allocated, and charged.
-            release_spare_slots(&mut self.partials);
-            partial
-        });
-        let mut current = match resumed {
-            Some(mut partial) => {
-                if kept > partial.data.len() {
-                    // Keep the partial for a correct retry.
-                    self.partials.push(partial);
+        let declared = match file.size {
+            Some(size) => usize::try_from(size).map_err(|_| MemoryError::OverBudget)?,
+            None => 0,
+        };
+        // Every refusal is decided before anything moves, so a refused
+        // resume leaves its partial, and every table, exactly as they were.
+        let index = self.partial(file.from, file.name);
+        let full = |table: &Vec<ReceivedFile>| table.len() == table.capacity();
+        let files_slot = if full(&self.files) { RECORD } else { 0 };
+        let needed = match index {
+            Some(index) => {
+                let partial = &self.partials[index].data;
+                if kept > partial.len() {
                     return Err(MemoryError::BadOffset.into());
                 }
+                // The partial is already charged where it is, and its slot
+                // becomes the spare an abort lands in. Reserving `declared`
+                // from length `kept` adds only what exceeds its capacity.
+                kept.checked_add(declared)
+                    .map(|end| end.saturating_sub(partial.capacity()))
+            }
+            None if kept != 0 => return Err(MemoryError::BadOffset.into()),
+            // A new file brings a record, a name, its reservation and a
+            // spare slot to abort into.
+            None => declared
+                .checked_add(file.name.len())
+                .and_then(|total| total.checked_add(if full(&self.partials) { RECORD } else { 0 })),
+        };
+        let fits = needed
+            .and_then(|needed| needed.checked_add(files_slot))
+            .is_some_and(|total| total <= self.remaining());
+        if !fits {
+            return Err(MemoryError::OverBudget.into());
+        }
+
+        // Reserve, exactly: the tables grow by the slots just charged.
+        self.files
+            .try_reserve_exact(1)
+            .map_err(|_| MemoryError::OutOfMemory)?;
+        let current = match index {
+            Some(index) => {
+                // The freed slot stays as the abort spare, so putting the
+                // partial back below cannot reallocate.
+                let mut partial = self.partials.swap_remove(index);
                 partial.data.truncate(kept);
+                if partial.data.try_reserve_exact(declared).is_err() {
+                    self.partials.push(partial);
+                    return Err(MemoryError::OutOfMemory.into());
+                }
                 partial
             }
-            None if file.offset != 0 => return Err(MemoryError::BadOffset.into()),
             None => {
                 let mut name = String::new();
+                let mut data = Vec::new();
                 name.try_reserve_exact(file.name.len())
+                    .and_then(|()| data.try_reserve_exact(declared))
+                    .and_then(|()| self.partials.try_reserve_exact(1))
                     .map_err(|_| MemoryError::OutOfMemory)?;
                 name.push_str(file.name);
                 ReceivedFile {
                     from: file.from,
                     name,
-                    data: Vec::new(),
+                    data,
                 }
             }
         };
-        let declared = match file.size {
-            Some(size) => usize::try_from(size).map_err(|_| MemoryError::OverBudget)?,
-            None => 0,
-        };
-        // The record itself must fit as well as what it announces: an empty
-        // upload still keeps a record and a name. What it announces costs
-        // only the growth beyond the buffer it already holds: a resumed
-        // partial keeps its capacity after `truncate`, and reserving
-        // `declared` from length `kept` needs exactly `kept + declared`.
-        let growth = current
-            .data
-            .len()
-            .checked_add(declared)
-            .map(|needed| needed.saturating_sub(current.data.capacity()));
-        // Landing this file needs a free slot in each table (it may finish or
-        // be aborted); a full table grows by exactly one record.
-        let slots = [&self.files, &self.partials]
-            .iter()
-            .filter(|table| table.len() == table.capacity())
-            .count()
-            * RECORD;
-        let fits = growth
-            .and_then(|growth| heap(&current).checked_add(growth))
-            .and_then(|total| total.checked_add(slots))
-            .is_some_and(|total| total <= self.remaining());
-        if !fits {
-            if current.data.is_empty() {
-                return Err(MemoryError::OverBudget.into());
-            }
-            self.partials.push(current);
-            return Err(MemoryError::OverBudget.into());
-        }
-        // Exact: the tables grow by the slot just charged, no more.
-        let reserved = current
-            .data
-            .try_reserve_exact(declared)
-            .and_then(|()| self.files.try_reserve_exact(1))
-            .and_then(|()| self.partials.try_reserve_exact(1));
-        if reserved.is_err() {
-            return Err(MemoryError::OutOfMemory.into());
-        }
+        // Give back emptied partial slots now that nothing can be refused,
+        // keeping the one an abort of this file lands in.
+        shrink_table(&mut self.partials, 1);
         self.current = Some(current);
         Ok(())
     }
@@ -266,19 +264,20 @@ fn heap(file: &ReceivedFile) -> usize {
     file.name.capacity() + file.data.capacity()
 }
 
-/// Shrink a record table to its length. Fallible: when the smaller table
-/// cannot be allocated, the larger one is kept (and stays charged).
-fn release_spare_slots(table: &mut Vec<ReceivedFile>) {
-    if table.capacity() == table.len() {
+/// Shrink a record table to its length plus `spare` slots. Fallible: when
+/// the smaller table cannot be allocated, the larger one is kept (and stays
+/// charged).
+fn shrink_table(table: &mut Vec<ReceivedFile>, spare: usize) {
+    let target = table.len().saturating_add(spare);
+    if table.capacity() <= target {
         return;
     }
     let mut exact = Vec::new();
-    if exact.try_reserve_exact(table.len()).is_ok() {
+    if exact.try_reserve_exact(target).is_ok() {
         exact.append(table);
         *table = exact;
     }
 }
-
 /// Give back capacity beyond `data`'s length. Fallible: when the smaller
 /// buffer cannot be allocated, the larger one is kept (and stays charged).
 fn release_spare(data: &mut Vec<u8>) {
