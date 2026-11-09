@@ -647,7 +647,8 @@ fn memory_sink_keeps_finished_files_within_budget() {
     let upload = |name: &str| {
         std::format!("PUT /v0/put/{name} HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc").into_bytes()
     };
-    let mut sink = MemorySink::new(5);
+    // The budget charges names too: each file here costs 5 + 3 bytes.
+    let mut sink = MemorySink::new(13);
     let first = upload("a.txt");
     let segments: &[&[u8]] = &[&first];
     let mut io = Script::new(segments);
@@ -663,7 +664,7 @@ fn memory_sink_keeps_finished_files_within_budget() {
     assert_eq!(error, ServeError::Exists);
     assert_eq!(status_of(&io.written), 409);
 
-    // Only two bytes of budget remain.
+    // Only five bytes of budget remain.
     let second = upload("b.txt");
     let segments: &[&[u8]] = &[&second];
     let mut io = Script::new(segments);
@@ -1107,4 +1108,76 @@ fn a_final_response_behind_100_continue_is_read_not_awaited() {
     let error = send(&mut io, &upload, &mut body, &mut [0; MIN_CLIENT_BUFFER]).unwrap_err();
     assert_eq!(error, SendError::Rejected(403));
     assert!(!io.written.ends_with(b"hello"));
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn interrupted_uploads_keep_only_what_arrived() {
+    // An authorized sender announcing near-budget files, sending a byte and
+    // hanging up must not make the sink hold the reservations.
+    const BUDGET: usize = 1 << 20;
+    let mut sink = MemorySink::new(BUDGET);
+    for index in 0..10 {
+        let head = std::format!(
+            "PUT /v0/put/file{index} HTTP/1.1\r\nContent-Length: {}\r\n\r\nx",
+            BUDGET - 4096
+        );
+        let segments: &[&[u8]] = &[head.as_bytes()];
+        let mut io = Script::new(segments);
+        let error =
+            serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap_err();
+        assert_eq!(error, ServeError::Http(http::Error::UnexpectedEof));
+    }
+    assert_eq!(sink.partials().len(), 10);
+    let held: usize = sink
+        .partials()
+        .iter()
+        .map(|file| file.data.capacity())
+        .sum();
+    assert_eq!(
+        held, 10,
+        "partials hold {held} bytes of buffer for 10 bytes of data"
+    );
+
+    // The budget charges reservations: one in-flight announcement of the
+    // whole budget leaves no room for a second.
+    let mut big = MemorySink::new(BUDGET);
+    let begin = |sink: &mut MemorySink, name: &str| {
+        FileSink::begin(
+            sink,
+            &Incoming {
+                from: PEER.addr,
+                name,
+                offset: 0,
+                size: Some((BUDGET - 4096) as u64),
+            },
+        )
+    };
+    begin(&mut big, "first").unwrap();
+    FileSink::write(&mut big, b"y").unwrap();
+    FileSink::finish(&mut big).unwrap();
+    assert_eq!(begin(&mut big, "second"), Ok(()));
+    FileSink::abort(&mut big);
+    assert_eq!(begin(&mut big, "third"), Ok(()));
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn chunked_uploads_stay_within_the_budget() {
+    let mut sink = MemorySink::new(100);
+    let head: &[u8] = b"PUT /v0/put/a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let body: &[u8] = b"20\r\n0123456789abcdef0123456789abcdef\r\n20\r\n0123456789abcdef0123456789abcdef\r\n0\r\n\r\n";
+    let segments: &[&[u8]] = &[head, body];
+    let mut io = Script::new(segments);
+    serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap();
+    let file = &sink.files()[0];
+    assert_eq!(file.data.len(), 64);
+    assert!(file.data.capacity() + file.name.capacity() <= 100);
+
+    // A second 64-byte file does not fit what is left of the 100 bytes.
+    let renamed: &[u8] = b"PUT /v0/put/b HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let segments: &[&[u8]] = &[renamed, body];
+    let mut io = Script::new(segments);
+    let error = serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap_err();
+    assert_eq!(error, ServeError::Sink(MemoryError::OverBudget));
 }

@@ -41,9 +41,11 @@ impl core::error::Error for MemoryError {}
 /// Keeps received files in memory, within a total byte budget.
 ///
 /// An aborted upload is kept as its sender's partial file, so the sender can
-/// resume it; finished and partial files share the budget. Allocation is
-/// fallible: a full heap fails the transfer (the sender sees `500`) instead
-/// of aborting the process.
+/// resume it; finished and partial files share the budget. The budget charges
+/// what is allocated, not just what arrived: a reservation for an announced
+/// size counts until the bytes come, and an aborted upload gives back what it
+/// reserved for bytes that never arrived. Allocation is fallible: a full heap
+/// fails the transfer (the sender sees `500`) instead of aborting the process.
 #[derive(Debug)]
 pub struct MemorySink {
     budget: usize,
@@ -79,13 +81,19 @@ impl MemorySink {
         core::mem::take(&mut self.files)
     }
 
+    /// Bytes allocated for retained files: buffer and name capacity, so a
+    /// reservation counts as much as the data it is reserved for.
     fn used(&self) -> usize {
         self.files
             .iter()
             .chain(&self.partials)
             .chain(&self.current)
-            .map(|file| file.data.len())
+            .map(|file| file.data.capacity() + file.name.capacity())
             .sum()
+    }
+
+    fn remaining(&self) -> usize {
+        self.budget.saturating_sub(self.used())
     }
 
     fn partial(&self, from: IpAddr, name: &str) -> Option<usize> {
@@ -130,7 +138,8 @@ impl MemorySink {
             Some(size) => usize::try_from(size).map_err(|_| MemoryError::OverBudget)?,
             None => 0,
         };
-        if declared > self.budget.saturating_sub(self.used() + current.data.len()) {
+        let held = current.data.capacity() + current.name.capacity();
+        if declared > self.remaining().saturating_sub(held) {
             if current.data.is_empty() {
                 return Err(MemoryError::OverBudget.into());
             }
@@ -150,28 +159,39 @@ impl MemorySink {
     }
 
     fn write_file(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
-        if bytes.len() > self.budget.saturating_sub(self.used()) {
+        let remaining = self.remaining();
+        let file = self.current.as_mut().ok_or(MemoryError::NoFile)?;
+        // Only growth beyond what `begin` reserved is newly charged. Grow
+        // geometrically for chunked uploads, but never past the budget.
+        let needed = (file.data.len() + bytes.len()).saturating_sub(file.data.capacity());
+        if needed > remaining {
             return Err(MemoryError::OverBudget);
         }
-        let file = self.current.as_mut().ok_or(MemoryError::NoFile)?;
-        file.data
-            .try_reserve(bytes.len())
-            .map_err(|_| MemoryError::OutOfMemory)?;
+        if needed > 0 {
+            let grow = needed.max(file.data.len()).min(remaining);
+            file.data
+                .try_reserve_exact(grow)
+                .map_err(|_| MemoryError::OutOfMemory)?;
+        }
         file.data.extend_from_slice(bytes);
         Ok(())
     }
 
     fn finish_file(&mut self) -> Result<(), MemoryError> {
-        let file = self.current.take().ok_or(MemoryError::NoFile)?;
+        let mut file = self.current.take().ok_or(MemoryError::NoFile)?;
+        release_spare(&mut file.data);
         // Capacity was reserved in `begin`.
         self.files.push(file);
         Ok(())
     }
 
     fn abort_file(&mut self) {
-        if let Some(file) = self.current.take()
+        if let Some(mut file) = self.current.take()
             && !file.data.is_empty()
         {
+            // Keep what arrived, not the reservation for what did not: an
+            // interrupted upload costs its bytes.
+            release_spare(&mut file.data);
             // Capacity was reserved in `begin`.
             self.partials.push(file);
         }
@@ -192,6 +212,19 @@ impl MemorySink {
         for file in self.partials.iter().filter(|file| file.from == from) {
             each(&file.name);
         }
+    }
+}
+
+/// Give back capacity beyond `data`'s length. Fallible: when the smaller
+/// buffer cannot be allocated, the larger one is kept (and stays charged).
+fn release_spare(data: &mut Vec<u8>) {
+    if data.capacity() == data.len() {
+        return;
+    }
+    let mut exact = Vec::new();
+    if exact.try_reserve_exact(data.len()).is_ok() {
+        exact.extend_from_slice(data);
+        *data = exact;
     }
 }
 
