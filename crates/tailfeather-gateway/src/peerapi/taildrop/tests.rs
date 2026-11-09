@@ -1242,3 +1242,32 @@ fn empty_files_still_count_against_the_budget() {
     }
     assert_eq!(accepted, 3);
 }
+
+#[cfg(feature = "alloc")]
+#[test]
+fn resuming_inside_a_partial_charges_only_new_growth() {
+    // Codex's case: room for a record, a one-byte name and 100 data bytes; a
+    // 70-byte partial; a resume at 64 with the remaining 36. The finished
+    // file fits exactly, so the resume must be accepted.
+    let record = core::mem::size_of::<ReceivedFile>();
+    let mut sink = MemorySink::new(record + 1 + 100);
+    let data = content(100);
+    let head = b"PUT /v0/put/a HTTP/1.1\r\nContent-Length: 100\r\n\r\n";
+    let segments: &[&[u8]] = &[head, &data[..70]];
+    let mut io = Script::new(segments);
+    serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap_err();
+    assert_eq!(sink.partials()[0].data.len(), 70);
+
+    let resume = b"PUT /v0/put/a HTTP/1.1\r\nRange: bytes=64-\r\nContent-Length: 36\r\n\r\n";
+    let segments: &[&[u8]] = &[resume, &data[64..]];
+    let mut io = Script::new(segments);
+    let served = serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap();
+    assert_eq!(
+        served,
+        Served::Received {
+            bytes: 36,
+            offset: 64
+        }
+    );
+    assert_eq!(sink.files()[0].data, data);
+}

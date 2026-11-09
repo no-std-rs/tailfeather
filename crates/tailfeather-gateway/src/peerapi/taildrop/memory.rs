@@ -143,9 +143,17 @@ impl MemorySink {
             None => 0,
         };
         // The record itself must fit as well as what it announces: an empty
-        // upload still keeps a record and a name.
-        let fits = cost(&current)
+        // upload still keeps a record and a name. What it announces costs
+        // only the growth beyond the buffer it already holds: a resumed
+        // partial keeps its capacity after `truncate`, and reserving
+        // `declared` from length `kept` needs exactly `kept + declared`.
+        let growth = current
+            .data
+            .len()
             .checked_add(declared)
+            .map(|needed| needed.saturating_sub(current.data.capacity()));
+        let fits = growth
+            .and_then(|growth| cost(&current).checked_add(growth))
             .is_some_and(|total| total <= self.remaining());
         if !fits {
             if current.data.is_empty() {
