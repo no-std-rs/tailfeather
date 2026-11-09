@@ -12,6 +12,7 @@ import pty
 from pathlib import Path
 import shutil
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -81,7 +82,18 @@ def main():
         state = Path(directory)
         (state / "logs").mkdir()
         (state / "config").mkdir()
-        client_env = dict(os.environ, XDG_CONFIG_HOME=str(state / "config"))
+        # `tailscale ssh` runs the first `ssh` on PATH. Wrap it so OpenSSH
+        # reads no host configuration (`-F none`): the test then depends only
+        # on the options tailscale passes, not on /etc/ssh, whose drop-ins a
+        # sandbox may present with ownership OpenSSH refuses.
+        real_ssh = shutil.which("ssh")
+        assert real_ssh, "OpenSSH client not found on PATH"
+        (state / "bin").mkdir()
+        wrapper = state / "bin" / "ssh"
+        wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(real_ssh)} -F none "$@"\n')
+        wrapper.chmod(0o700)
+        client_env = dict(os.environ, XDG_CONFIG_HOME=str(state / "config"),
+                          PATH=f"{state / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
         if os.environ.get("TF_TEST_SSH_DEBUG"):
             client_env["TS_DEBUG_SSH_EXEC"] = "1"
         headscale = state / "headscale"
