@@ -45,8 +45,9 @@ impl core::error::Error for MemoryError {}
 /// what is allocated, not just what arrived: each file's record, name and
 /// buffer capacity, so a reservation for an announced size counts until the
 /// bytes come, and an aborted upload gives back what it reserved for bytes
-/// that never arrived. Beyond the budget the sink holds only its own struct
-/// and one spare record slot in each of its two file tables. Allocation is fallible: a full heap
+/// that never arrived. The record tables count by capacity, spare slots
+/// included, so [`MemorySink::allocated`] never exceeds the budget; only the
+/// sink's own struct lies outside it. Allocation is fallible: a full heap
 /// fails the transfer (the sender sees `500`) instead of aborting the process.
 #[derive(Debug)]
 pub struct MemorySink {
@@ -83,16 +84,20 @@ impl MemorySink {
         core::mem::take(&mut self.files)
     }
 
-    /// Bytes allocated for retained files: each record, its name and its
-    /// buffer capacity, so a reservation counts as much as the data it is
-    /// reserved for and no file, however empty, is free.
+    /// Heap bytes the sink holds and charges against its budget: both record
+    /// tables at their capacity, and every file's name and buffer.
+    pub fn allocated(&self) -> usize {
+        self.used()
+    }
+
     fn used(&self) -> usize {
+        let tables = (self.files.capacity() + self.partials.capacity()).saturating_mul(RECORD);
         self.files
             .iter()
             .chain(&self.partials)
             .chain(&self.current)
-            .map(cost)
-            .sum()
+            .map(heap)
+            .fold(tables, usize::saturating_add)
     }
 
     fn remaining(&self) -> usize {
@@ -112,9 +117,12 @@ impl MemorySink {
         }
         // Convert before taking the partial out, so a refusal cannot lose it.
         let kept = usize::try_from(file.offset).map_err(|_| MemoryError::BadOffset)?;
-        let resumed = self
-            .partial(file.from, file.name)
-            .map(|index| self.partials.swap_remove(index));
+        let resumed = self.partial(file.from, file.name).map(|index| {
+            let partial = self.partials.swap_remove(index);
+            // The emptied slot would otherwise stay allocated, and charged.
+            release_spare_slots(&mut self.partials);
+            partial
+        });
         let mut current = match resumed {
             Some(mut partial) => {
                 if kept > partial.data.len() {
@@ -152,8 +160,16 @@ impl MemorySink {
             .len()
             .checked_add(declared)
             .map(|needed| needed.saturating_sub(current.data.capacity()));
+        // Landing this file needs a free slot in each table (it may finish or
+        // be aborted); a full table grows by exactly one record.
+        let slots = [&self.files, &self.partials]
+            .iter()
+            .filter(|table| table.len() == table.capacity())
+            .count()
+            * RECORD;
         let fits = growth
-            .and_then(|growth| cost(&current).checked_add(growth))
+            .and_then(|growth| heap(&current).checked_add(growth))
+            .and_then(|total| total.checked_add(slots))
             .is_some_and(|total| total <= self.remaining());
         if !fits {
             if current.data.is_empty() {
@@ -162,8 +178,7 @@ impl MemorySink {
             self.partials.push(current);
             return Err(MemoryError::OverBudget.into());
         }
-        // Exact, so the record tables hold at most one spare slot each (for
-        // this file to land in) beyond what the budget charges.
+        // Exact: the tables grow by the slot just charged, no more.
         let reserved = current
             .data
             .try_reserve_exact(declared)
@@ -243,9 +258,25 @@ impl MemorySink {
     }
 }
 
-/// What one retained file costs the budget: its record, name and buffer.
-fn cost(file: &ReceivedFile) -> usize {
-    core::mem::size_of::<ReceivedFile>() + file.name.capacity() + file.data.capacity()
+/// One record slot in a file table.
+const RECORD: usize = core::mem::size_of::<ReceivedFile>();
+
+/// The heap a file holds beyond its record: its name and buffer.
+fn heap(file: &ReceivedFile) -> usize {
+    file.name.capacity() + file.data.capacity()
+}
+
+/// Shrink a record table to its length. Fallible: when the smaller table
+/// cannot be allocated, the larger one is kept (and stays charged).
+fn release_spare_slots(table: &mut Vec<ReceivedFile>) {
+    if table.capacity() == table.len() {
+        return;
+    }
+    let mut exact = Vec::new();
+    if exact.try_reserve_exact(table.len()).is_ok() {
+        exact.append(table);
+        *table = exact;
+    }
 }
 
 /// Give back capacity beyond `data`'s length. Fallible: when the smaller

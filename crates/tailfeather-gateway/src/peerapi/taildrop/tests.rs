@@ -1166,8 +1166,10 @@ fn interrupted_uploads_keep_only_what_arrived() {
 #[cfg(feature = "alloc")]
 #[test]
 fn chunked_uploads_stay_within_the_budget() {
+    // A file in flight holds a slot in each record table (it may finish or
+    // be aborted), so two records of overhead.
     let record = core::mem::size_of::<ReceivedFile>();
-    let mut sink = MemorySink::new(record + 100);
+    let mut sink = MemorySink::new(2 * record + 100);
     let head: &[u8] = b"PUT /v0/put/a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
     let body: &[u8] = b"20\r\n0123456789abcdef0123456789abcdef\r\n20\r\n0123456789abcdef0123456789abcdef\r\n0\r\n\r\n";
     let segments: &[&[u8]] = &[head, body];
@@ -1191,7 +1193,7 @@ fn growth_reserves_before_writing_and_respects_the_budget() {
     // Codex's case: a 12-byte budget beyond the record, a one-byte name, and
     // chunked writes of 5, 1 and 5 bytes. Every byte fits, but never more.
     let record = core::mem::size_of::<ReceivedFile>();
-    let mut sink = MemorySink::new(record + 12);
+    let mut sink = MemorySink::new(2 * record + 12);
     let incoming = Incoming {
         from: PEER.addr,
         name: "a",
@@ -1209,7 +1211,8 @@ fn growth_reserves_before_writing_and_respects_the_budget() {
     FileSink::finish(&mut sink).unwrap();
     let file = &sink.files()[0];
     assert_eq!(file.data, b"123456789ab");
-    assert!(record + file.name.capacity() + file.data.capacity() <= record + 12);
+    assert!(file.name.capacity() + file.data.capacity() <= 12);
+    assert!(sink.allocated() <= 2 * record + 12);
 }
 
 #[cfg(feature = "alloc")]
@@ -1229,9 +1232,10 @@ fn empty_files_still_count_against_the_budget() {
         Err(Refusal::Failed(MemoryError::OverBudget))
     );
 
-    // A budget for three records takes three empty files and refuses more.
+    // Three finished empty files hold three records and names, plus the
+    // spare partial slot the first one reserved; the fourth does not fit.
     let record = core::mem::size_of::<ReceivedFile>();
-    let mut small = MemorySink::new(3 * (record + 2));
+    let mut small = MemorySink::new(3 * (record + 2) + record);
     let mut accepted = 0;
     for index in 0..100 {
         let name = std::format!("{index:02}");
@@ -1250,7 +1254,7 @@ fn resuming_inside_a_partial_charges_only_new_growth() {
     // 70-byte partial; a resume at 64 with the remaining 36. The finished
     // file fits exactly, so the resume must be accepted.
     let record = core::mem::size_of::<ReceivedFile>();
-    let mut sink = MemorySink::new(record + 1 + 100);
+    let mut sink = MemorySink::new(2 * record + 1 + 100);
     let data = content(100);
     let head = b"PUT /v0/put/a HTTP/1.1\r\nContent-Length: 100\r\n\r\n";
     let segments: &[&[u8]] = &[head, &data[..70]];
@@ -1270,4 +1274,46 @@ fn resuming_inside_a_partial_charges_only_new_growth() {
         }
     );
     assert_eq!(sink.files()[0].data, data);
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn moving_records_between_tables_stays_within_the_budget() {
+    // Codex's case: a thousand one-byte partials, each then completed at
+    // offset 1. Emptied partial slots must be given back, not retained.
+    let record = core::mem::size_of::<ReceivedFile>();
+    let budget = 1000 * (record + 6) + 4 * record;
+    let mut sink = MemorySink::new(budget);
+    let names: std::vec::Vec<std::string::String> =
+        (0..1000).map(|index| std::format!("f{index:04}")).collect();
+    for name in &names {
+        let file = Incoming {
+            from: PEER.addr,
+            name,
+            offset: 0,
+            size: Some(1),
+        };
+        FileSink::begin(&mut sink, &file).unwrap();
+        FileSink::write(&mut sink, b"x").unwrap();
+        FileSink::abort(&mut sink);
+        assert!(sink.allocated() <= budget);
+    }
+    assert_eq!(sink.partials().len(), 1000);
+    for name in &names {
+        let file = Incoming {
+            from: PEER.addr,
+            name,
+            offset: 1,
+            size: Some(0),
+        };
+        FileSink::begin(&mut sink, &file).unwrap();
+        FileSink::finish(&mut sink).unwrap();
+        assert!(
+            sink.allocated() <= budget,
+            "{} > {budget}",
+            sink.allocated()
+        );
+    }
+    assert_eq!((sink.files().len(), sink.partials().len()), (1000, 0));
+    assert!(sink.allocated() <= 1000 * (record + 6) + 2 * record);
 }
