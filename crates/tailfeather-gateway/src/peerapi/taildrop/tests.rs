@@ -647,8 +647,10 @@ fn memory_sink_keeps_finished_files_within_budget() {
     let upload = |name: &str| {
         std::format!("PUT /v0/put/{name} HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc").into_bytes()
     };
-    // The budget charges names too: each file here costs 5 + 3 bytes.
-    let mut sink = MemorySink::new(13);
+    // The budget charges records and names too: each file here costs its
+    // record plus 5 + 3 bytes, so one fits and a second does not.
+    let record = core::mem::size_of::<ReceivedFile>();
+    let mut sink = MemorySink::new(2 * record + 13);
     let first = upload("a.txt");
     let segments: &[&[u8]] = &[&first];
     let mut io = Script::new(segments);
@@ -664,7 +666,7 @@ fn memory_sink_keeps_finished_files_within_budget() {
     assert_eq!(error, ServeError::Exists);
     assert_eq!(status_of(&io.written), 409);
 
-    // Only five bytes of budget remain.
+    // Only a record and five bytes of budget remain.
     let second = upload("b.txt");
     let segments: &[&[u8]] = &[&second];
     let mut io = Script::new(segments);
@@ -1141,7 +1143,7 @@ fn interrupted_uploads_keep_only_what_arrived() {
 
     // The budget charges reservations: one in-flight announcement of the
     // whole budget leaves no room for a second.
-    let mut big = MemorySink::new(BUDGET);
+    let mut big = MemorySink::new(BUDGET + 4 * core::mem::size_of::<ReceivedFile>());
     let begin = |sink: &mut MemorySink, name: &str| {
         FileSink::begin(
             sink,
@@ -1164,7 +1166,8 @@ fn interrupted_uploads_keep_only_what_arrived() {
 #[cfg(feature = "alloc")]
 #[test]
 fn chunked_uploads_stay_within_the_budget() {
-    let mut sink = MemorySink::new(100);
+    let record = core::mem::size_of::<ReceivedFile>();
+    let mut sink = MemorySink::new(record + 100);
     let head: &[u8] = b"PUT /v0/put/a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
     let body: &[u8] = b"20\r\n0123456789abcdef0123456789abcdef\r\n20\r\n0123456789abcdef0123456789abcdef\r\n0\r\n\r\n";
     let segments: &[&[u8]] = &[head, body];
@@ -1180,4 +1183,62 @@ fn chunked_uploads_stay_within_the_budget() {
     let mut io = Script::new(segments);
     let error = serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap_err();
     assert_eq!(error, ServeError::Sink(MemoryError::OverBudget));
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn growth_reserves_before_writing_and_respects_the_budget() {
+    // Codex's case: a 12-byte budget beyond the record, a one-byte name, and
+    // chunked writes of 5, 1 and 5 bytes. Every byte fits, but never more.
+    let record = core::mem::size_of::<ReceivedFile>();
+    let mut sink = MemorySink::new(record + 12);
+    let incoming = Incoming {
+        from: PEER.addr,
+        name: "a",
+        offset: 0,
+        size: None,
+    };
+    FileSink::begin(&mut sink, &incoming).unwrap();
+    for chunk in [&b"12345"[..], b"6", b"789ab"] {
+        FileSink::write(&mut sink, chunk).unwrap();
+    }
+    assert_eq!(
+        FileSink::write(&mut sink, b"c"),
+        Err(MemoryError::OverBudget)
+    );
+    FileSink::finish(&mut sink).unwrap();
+    let file = &sink.files()[0];
+    assert_eq!(file.data, b"123456789ab");
+    assert!(record + file.name.capacity() + file.data.capacity() <= record + 12);
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn empty_files_still_count_against_the_budget() {
+    fn empty(name: &str) -> Incoming<'_> {
+        Incoming {
+            from: PEER.addr,
+            name,
+            offset: 0,
+            size: Some(0),
+        }
+    }
+    let mut zero = MemorySink::new(0);
+    assert_eq!(
+        FileSink::begin(&mut zero, &empty("x")),
+        Err(Refusal::Failed(MemoryError::OverBudget))
+    );
+
+    // A budget for three records takes three empty files and refuses more.
+    let record = core::mem::size_of::<ReceivedFile>();
+    let mut small = MemorySink::new(3 * (record + 2));
+    let mut accepted = 0;
+    for index in 0..100 {
+        let name = std::format!("{index:02}");
+        if FileSink::begin(&mut small, &empty(&name)).is_ok() {
+            FileSink::finish(&mut small).unwrap();
+            accepted += 1;
+        }
+    }
+    assert_eq!(accepted, 3);
 }

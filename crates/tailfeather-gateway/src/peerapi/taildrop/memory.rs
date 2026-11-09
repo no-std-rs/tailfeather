@@ -81,14 +81,15 @@ impl MemorySink {
         core::mem::take(&mut self.files)
     }
 
-    /// Bytes allocated for retained files: buffer and name capacity, so a
-    /// reservation counts as much as the data it is reserved for.
+    /// Bytes allocated for retained files: each record, its name and its
+    /// buffer capacity, so a reservation counts as much as the data it is
+    /// reserved for and no file, however empty, is free.
     fn used(&self) -> usize {
         self.files
             .iter()
             .chain(&self.partials)
             .chain(&self.current)
-            .map(|file| file.data.capacity() + file.name.capacity())
+            .map(cost)
             .sum()
     }
 
@@ -138,8 +139,12 @@ impl MemorySink {
             Some(size) => usize::try_from(size).map_err(|_| MemoryError::OverBudget)?,
             None => 0,
         };
-        let held = current.data.capacity() + current.name.capacity();
-        if declared > self.remaining().saturating_sub(held) {
+        // The record itself must fit as well as what it announces: an empty
+        // upload still keeps a record and a name.
+        let fits = cost(&current)
+            .checked_add(declared)
+            .is_some_and(|total| total <= self.remaining());
+        if !fits {
             if current.data.is_empty() {
                 return Err(MemoryError::OverBudget.into());
             }
@@ -162,17 +167,27 @@ impl MemorySink {
         let remaining = self.remaining();
         let file = self.current.as_mut().ok_or(MemoryError::NoFile)?;
         // Only growth beyond what `begin` reserved is newly charged. Grow
-        // geometrically for chunked uploads, but never past the budget.
-        let needed = (file.data.len() + bytes.len()).saturating_sub(file.data.capacity());
-        if needed > remaining {
-            return Err(MemoryError::OverBudget);
-        }
-        if needed > 0 {
-            let grow = needed.max(file.data.len()).min(remaining);
+        // geometrically for chunked uploads, but never past the budget, and
+        // always reserve first: `extend_from_slice` must never allocate, or
+        // it could exceed the budget and abort on a full heap.
+        let required = file
+            .data
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(MemoryError::OverBudget)?;
+        let capacity = file.data.capacity();
+        if required > capacity {
+            let ceiling = capacity.saturating_add(remaining);
+            if required > ceiling {
+                return Err(MemoryError::OverBudget);
+            }
+            let target = capacity.saturating_mul(2).max(required).min(ceiling);
+            // `try_reserve_exact` counts from the length, not the capacity.
             file.data
-                .try_reserve_exact(grow)
+                .try_reserve_exact(target - file.data.len())
                 .map_err(|_| MemoryError::OutOfMemory)?;
         }
+        debug_assert!(file.data.capacity() >= required);
         file.data.extend_from_slice(bytes);
         Ok(())
     }
@@ -213,6 +228,11 @@ impl MemorySink {
             each(&file.name);
         }
     }
+}
+
+/// What one retained file costs the budget: its record, name and buffer.
+fn cost(file: &ReceivedFile) -> usize {
+    core::mem::size_of::<ReceivedFile>() + file.name.capacity() + file.data.capacity()
 }
 
 /// Give back capacity beyond `data`'s length. Fallible: when the smaller
