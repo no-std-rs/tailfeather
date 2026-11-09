@@ -37,6 +37,17 @@ pub const MAX_FILTER_DESTINATIONS: usize = 512;
 pub const MAX_FILTER_DESTINATIONS: usize = crate::UNBOUNDED;
 pub const MAX_FILTER_PROTOCOLS: usize = 8;
 pub const MAX_FILTER_SET_NAME: usize = 32;
+/// Capability grants retained across all filter sets. Only grants of a
+/// capability this crate acts on ([`PeerCapability`]) take a slot.
+#[cfg(all(feature = "peer-api", not(feature = "alloc")))]
+pub const MAX_CAP_RULES: usize = 8;
+#[cfg(all(feature = "peer-api", feature = "alloc"))]
+pub const MAX_CAP_RULES: usize = crate::UNBOUNDED;
+/// Destination prefixes of one capability grant.
+#[cfg(all(feature = "peer-api", not(feature = "alloc")))]
+pub const MAX_CAP_DESTINATIONS: usize = 4;
+#[cfg(all(feature = "peer-api", feature = "alloc"))]
+pub const MAX_CAP_DESTINATIONS: usize = crate::UNBOUNDED;
 /// Unstored filter sets tracked by name for truncation reporting.
 #[cfg(not(feature = "alloc"))]
 const MAX_UNSTORED_SETS: usize = 2;
@@ -225,6 +236,55 @@ impl Default for FilterRule {
     }
 }
 
+/// Peer capabilities granted through packet-filter `CapGrant`s that this
+/// crate acts on, as a bit set.
+#[cfg(feature = "peer-api")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PeerCapability(u8);
+
+#[cfg(feature = "peer-api")]
+impl PeerCapability {
+    pub const NONE: Self = Self(0);
+    /// `https://tailscale.com/cap/file-send`: the source may send this node
+    /// files with Taildrop although it belongs to another user or is tagged.
+    pub const FILE_SEND: Self = Self(1);
+    /// `https://tailscale.com/cap/file-sharing-target`: this node may send
+    /// files to the source although it belongs to another user.
+    pub const FILE_SHARING_TARGET: Self = Self(2);
+
+    /// The capability a grant names, or [`Self::NONE`] for one not acted on.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "https://tailscale.com/cap/file-send" => Self::FILE_SEND,
+            "https://tailscale.com/cap/file-sharing-target" => Self::FILE_SHARING_TARGET,
+            _ => Self::NONE,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// One `CapGrant` of a filter rule: `caps` for traffic from the rule's
+/// sources toward `destinations`.
+#[cfg(feature = "peer-api")]
+#[derive(Debug, Clone)]
+struct CapRule {
+    set: SetId,
+    sources: BoundedVec<Network, MAX_FILTER_SOURCES>,
+    destinations: BoundedVec<Network, MAX_CAP_DESTINATIONS>,
+    caps: PeerCapability,
+}
+
 #[derive(Debug, Clone)]
 struct FilterSet {
     name: String<MAX_FILTER_SET_NAME>,
@@ -258,6 +318,9 @@ pub struct PacketPolicy {
     /// Interned IPv6 ranges, referenced by index from stored rules. Kept
     /// dense: collecting unreferenced ranges compacts it and renumbers.
     v6_networks: BoundedVec<V6Range, MAX_V6_NETWORKS>,
+    /// Capability grants, replaced and deleted with their set like rules.
+    #[cfg(feature = "peer-api")]
+    cap_rules: BoundedVec<CapRule, MAX_CAP_RULES>,
 }
 
 impl PacketPolicy {
@@ -269,6 +332,8 @@ impl PacketPolicy {
             truncated: false,
             valid: false,
             v6_networks: BoundedVec::new(),
+            #[cfg(feature = "peer-api")]
+            cap_rules: BoundedVec::new(),
         }
     }
 
@@ -338,6 +403,11 @@ impl PacketPolicy {
         };
         self.sets = sets;
         self.v6_networks = v6_networks;
+        #[cfg(feature = "peer-api")]
+        match source.cap_rules.try_clone() {
+            Some(cap_rules) => self.cap_rules = cap_rules,
+            None => self.truncated = true,
+        }
         let _ = self.rules.try_reserve_total(source.rules.len());
         for rule in source.rules.iter() {
             let Some(rule) = rule.try_clone() else {
@@ -413,6 +483,8 @@ impl PacketPolicy {
             let id = self.sets.remove(index).id;
             let rules = self.rules.len();
             self.rules.retain(|rule| rule.set != id);
+            #[cfg(feature = "peer-api")]
+            self.cap_rules.retain(|rule| rule.set != id);
             // Only removed rules can leave ranges unreferenced; replacing a
             // new set (the common case while a map loads) collects nothing.
             if self.rules.len() != rules {
@@ -427,6 +499,8 @@ impl PacketPolicy {
         self.sets.clear();
         self.rules.clear();
         self.v6_networks.clear();
+        #[cfg(feature = "peer-api")]
+        self.cap_rules.clear();
         self.valid = true;
         self.unstored.clear();
         self.truncated = false;
@@ -478,6 +552,61 @@ impl PacketPolicy {
             self.collect_networks();
         }
         result
+    }
+
+    /// Store one capability grant of `set`'s current rule. Grants of no
+    /// capability this crate acts on are not stored. A full table drops the
+    /// grant (the caller marks the set truncated): it can only deny.
+    #[cfg(feature = "peer-api")]
+    pub(crate) fn push_cap_rule(
+        &mut self,
+        set: &str,
+        sources: impl Iterator<Item = Network>,
+        destinations: impl Iterator<Item = Network>,
+        caps: PeerCapability,
+    ) -> Result<(), Error> {
+        if caps.is_empty() {
+            return Ok(());
+        }
+        let set = self
+            .sets
+            .iter()
+            .rev()
+            .find(|entry| entry.name.as_str() == set)
+            .map(|entry| entry.id)
+            .ok_or(Error::Malformed)?;
+        let full = Error::Full(CapacityError::PacketPolicy);
+        let mut rule = CapRule {
+            set,
+            sources: BoundedVec::new(),
+            destinations: BoundedVec::new(),
+            caps,
+        };
+        for source in sources {
+            rule.sources.push(source).map_err(|_| full)?;
+        }
+        for destination in destinations {
+            rule.destinations.push(destination).map_err(|_| full)?;
+        }
+        if rule.sources.is_empty() || rule.destinations.is_empty() {
+            return Ok(());
+        }
+        self.cap_rules.push(rule).map_err(|_| full)
+    }
+
+    /// Whether the filter grants `source` the capability `cap` toward
+    /// `destination` (this node), as Tailscale's `PeerHasCap` decides.
+    #[cfg(feature = "peer-api")]
+    pub fn has_peer_cap(&self, source: IpAddr, destination: IpAddr, cap: PeerCapability) -> bool {
+        self.valid
+            && self.cap_rules.iter().any(|rule| {
+                rule.caps.contains(cap)
+                    && rule.sources.iter().any(|network| network.contains(source))
+                    && rule
+                        .destinations
+                        .iter()
+                        .any(|network| network.contains(destination))
+            })
     }
 
     fn store_network(&mut self, network: Network) -> Result<StoredNetwork, Error> {

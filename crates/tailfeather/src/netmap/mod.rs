@@ -39,6 +39,8 @@ pub mod dns;
 pub mod frame;
 pub mod parser;
 pub mod peer;
+#[cfg(feature = "peer-api")]
+pub mod peer_api;
 pub mod policy;
 pub mod scanner;
 #[cfg(feature = "ssh-policy")]
@@ -48,7 +50,11 @@ pub use derp::{DerpMap, DerpNode, DerpRegion};
 pub use dns::DnsConfig;
 pub use frame::FrameReader;
 pub use parser::{Netmap, Parser};
+#[cfg(feature = "peer-api")]
+pub use peer::PeerServices;
 pub use peer::{Cidr, Cidr4, Peer, PeerTable};
+#[cfg(feature = "peer-api")]
+pub use peer_api::SelfServices;
 pub use policy::{Destination, FilterRule, Network, PacketPolicy};
 pub use scanner::{Scanner, Token};
 

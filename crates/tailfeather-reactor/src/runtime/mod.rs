@@ -379,6 +379,13 @@ impl<'a, P: Network, S: State, const PEERS: usize, const A: usize> Runtime<'a, P
         self.status.receiver().ok_or("status waiter capacity")
     }
 
+    /// Read the last completely applied netmap, for decisions such as peer
+    /// API authorization. The borrow lasts only for `read`, which must not
+    /// re-enter the runtime.
+    pub fn with_netmap<R>(&self, read: impl FnOnce(&tailfeather::netmap::Netmap<PEERS>) -> R) -> R {
+        read(self.node.borrow().netmap())
+    }
+
     /// Current peer IPv4 addresses from the last completely applied netmap.
     pub fn peer_addresses(&self) -> Vec<Ipv4Addr, PEERS> {
         self.node

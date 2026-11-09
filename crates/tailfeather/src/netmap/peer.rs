@@ -86,6 +86,28 @@ pub struct Peer {
     /// map named neither. Display only; never used to route or authorize.
     #[cfg(feature = "peer-names")]
     pub name: heapless::String<{ crate::netmap::MAX_PEER_NAME }>,
+    /// Who owns the node, and what it advertises to peers; read by peer API
+    /// endpoints to authorize and to find this peer's own peer API.
+    #[cfg(feature = "peer-api")]
+    pub services: PeerServices,
+}
+
+/// A node's ownership and peer API facts from its control record.
+#[cfg(feature = "peer-api")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerServices {
+    /// The owning user's id; tagged nodes carry the server's tagged-devices
+    /// user instead of a person.
+    pub user_id: u64,
+    /// The node has ACL tags, and so belongs to no person.
+    pub tagged: bool,
+    /// `UnsignedPeerAPIOnly`: a node outside tailnet lock that may reach
+    /// only peer API endpoints; it can never send files.
+    pub unsigned_peer_api_only: bool,
+    /// Ports of its advertised peer API (Hostinfo `peerapi4`/`peerapi6`),
+    /// zero when not advertised.
+    pub peer_api4: u16,
+    pub peer_api6: u16,
 }
 
 impl Peer {
@@ -103,6 +125,45 @@ impl Peer {
             endpoints: heapless::Vec::new(),
             #[cfg(feature = "peer-names")]
             name: heapless::String::new(),
+            #[cfg(feature = "peer-api")]
+            services: PeerServices {
+                user_id: 0,
+                tagged: false,
+                unsigned_peer_api_only: false,
+                peer_api4: 0,
+                peer_api6: 0,
+            },
+        }
+    }
+
+    /// The peer's IPv4 peer API, when it advertises one.
+    #[cfg(feature = "peer-api")]
+    pub fn peer_api4(&self) -> Option<core::net::SocketAddrV4> {
+        let port = self.services.peer_api4;
+        (port != 0)
+            .then(|| self.tailscale_ipv4())
+            .flatten()
+            .map(|address| core::net::SocketAddrV4::new(address, port))
+    }
+
+    /// The peer's IPv6 peer API, when it advertises one.
+    #[cfg(feature = "peer-api")]
+    pub fn peer_api6(&self) -> Option<core::net::SocketAddrV6> {
+        let port = self.services.peer_api6;
+        (port != 0)
+            .then_some(self.ipv6_address)
+            .flatten()
+            .map(|address| core::net::SocketAddrV6::new(address, port, 0, 0))
+    }
+
+    /// Whether `address` is one of this peer's own tailnet addresses.
+    pub fn has_address(&self, address: core::net::IpAddr) -> bool {
+        match address {
+            core::net::IpAddr::V4(address) => self
+                .addresses
+                .iter()
+                .any(|cidr| cidr.prefix == 32 && cidr.address == address),
+            core::net::IpAddr::V6(address) => self.ipv6_address == Some(address),
         }
     }
 

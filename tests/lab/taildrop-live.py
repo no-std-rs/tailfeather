@@ -5,8 +5,13 @@ Proves both directions against the unmodified client:
 
 * `tailscale file cp` lists the Tailfeather node as a target and uploads to
   its peer API, which stores the exact bytes under the exact name.
-* The Tailfeather node uploads to the stock node's peer API, and
-  `tailscale file get` hands back the exact bytes.
+* The Tailfeather node finds the stock node's peer API in its netmap and
+  uploads to it, breaking the first attempt off half way; a resume probe
+  recovers the stored prefix, the rest follows, and `tailscale file get`
+  hands back the exact bytes.
+
+The Tailfeather node authorizes senders, and picks its target, from the
+netmap exactly as stock Tailscale does.
 
 Uses a separate userspace daemon with no host network changes and no access
 to the user's existing tailnet or credentials. Taildrop only works between
@@ -28,6 +33,7 @@ import urllib.request
 
 SEND_NAME = "from-tailfeather.bin"
 SEND_BYTES = 300_000
+BREAK_AT = 150_000
 
 
 def port(kind=socket.SOCK_STREAM):
@@ -215,13 +221,14 @@ def main():
                 return None
 
             stock_api = wait_for(stock_peer_api, daemon, "stock peer API listener")
+            stock_ip = stock_api.rsplit(":", 1)[0]
             version = subprocess.check_output(client + ["version"], env=client_env, timeout=5).decode().splitlines()[0]
             print(f"TAILSCALE {version} peerapi={stock_api}", flush=True)
 
             env = dict(os.environ, TF_TEST_AUTH_KEY=keys.pop(), TF_TEST_CA_DER=str(tls_dir / "ca.der"))
             node = spawn([
                 str(node_binary), f"https://127.0.0.1:{tls_port}", str(state / "node"),
-                f"--send={stock_api}", "--timeout-seconds=150",
+                f"--send-to={stock_ip}", "--timeout-seconds=150",
             ], "node", env=env)
             del env
             node_log = state / "node.log"
@@ -264,9 +271,13 @@ def main():
             expected = f"RECEIVED name={name} bytes={len(payload)} fnv={fnv1a(payload):016x} "
             assert received.startswith(expected), f"{received!r} != {expected!r}..."
 
-            # Tailfeather -> stock.
+            # Tailfeather -> stock, found through the netmap and resumed.
             sent = wait_for(lambda: node_line("SENT "), node, "Tailfeather upload", seconds=60)
+            for prefix in ("TARGET ", "RESUMED "):
+                print(node_line(prefix), flush=True)
             print(sent, flush=True)
+            assert node_line("TARGET ") == f"TARGET {stock_api}", node_line("TARGET ")
+            assert node_line("RESUMED ") == f"RESUMED offset={BREAK_AT}", node_line("RESUMED ")
             assert sent == f"SENT ok bytes={SEND_BYTES}", sent
             inbox = state / "inbox"
             inbox.mkdir()
@@ -277,7 +288,8 @@ def main():
             wait_for(fetched, daemon, "`tailscale file get` of the Tailfeather upload")
             data = (inbox / SEND_NAME).read_bytes()
             assert data == pattern(SEND_BYTES), f"stored {len(data)} bytes, fnv={fnv1a(data):016x}"
-            print("PASS: stock tailscale and Tailfeather exchanged Taildrop files in both directions")
+            print("PASS: stock tailscale and Tailfeather exchanged Taildrop files in both directions, "
+                  "with netmap authorization and discovery and a resumed upload")
         except Exception:
             for log in logs:
                 print(f"--- {log.name} ---", flush=True)

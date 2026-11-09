@@ -26,8 +26,12 @@ use crate::keys::{DiscoPublic, NodePublic};
 
 use crate::netmap::derp::{DEFAULT_DERP_PORT, DEFAULT_STUN_PORT, DerpMap, DerpNode, DerpRegion};
 use crate::netmap::dns::DnsConfig;
+#[cfg(feature = "peer-api")]
+use crate::netmap::peer::PeerServices;
 use crate::netmap::peer::{Cidr, Cidr4, Peer, PeerTable};
 use crate::netmap::policy::{Destination, FilterRule, Network};
+#[cfg(feature = "peer-api")]
+use crate::netmap::policy::{MAX_CAP_DESTINATIONS, PeerCapability};
 use crate::netmap::scanner::{Scanner, Token};
 use crate::netmap::{CapacityError, Error, MAX_PEERS, MalformedField};
 
@@ -50,9 +54,24 @@ enum Context {
     PeerAllowedIps,
     PeerPrimaryRoutes,
     PeerEndpoints,
-    /// A peer's `Hostinfo`, read only for its `Hostname`.
-    #[cfg(feature = "peer-names")]
+    /// A peer's `Hostinfo`, read for its `Hostname` and `Services`.
+    #[cfg(any(feature = "peer-names", feature = "peer-api"))]
     PeerHostinfo,
+    /// A peer's `Tags`, and its `Hostinfo.Services` entries.
+    #[cfg(feature = "peer-api")]
+    PeerTags,
+    #[cfg(feature = "peer-api")]
+    PeerServices,
+    #[cfg(feature = "peer-api")]
+    PeerServiceObject,
+    /// The self node's `Tags`, `Capabilities` and `CapMap` (whose member
+    /// names are the capabilities).
+    #[cfg(feature = "peer-api")]
+    SelfTags,
+    #[cfg(feature = "peer-api")]
+    SelfCapabilities,
+    #[cfg(feature = "peer-api")]
+    SelfCapMap,
     /// The self node's address arrays.
     SelfAddresses,
     SelfPrimaryRoutes,
@@ -84,6 +103,16 @@ enum Context {
     FilterDestinationObject,
     FilterPortsObject,
     FilterProtocols,
+    /// A rule's `CapGrant`: capabilities rather than network access. Always
+    /// recognized, so a grant-only rule is accepted instead of malformed.
+    FilterCapGrants,
+    FilterCapGrantObject,
+    #[cfg(feature = "peer-api")]
+    FilterCapDestinations,
+    #[cfg(feature = "peer-api")]
+    FilterCapMap,
+    #[cfg(feature = "peer-api")]
+    FilterCapList,
     /// Anything this parser does not read. Nested containers inherit it, so a
     /// whole subtree costs one push and one pop.
     Ignored,
@@ -125,6 +154,9 @@ pub struct Netmap<const PEERS: usize = MAX_PEERS> {
     /// This node's display name: the first label of its MagicDNS name.
     #[cfg(feature = "peer-names")]
     pub name: heapless::String<{ crate::netmap::MAX_PEER_NAME }>,
+    /// This node's owner, tags and the capabilities peer API endpoints use.
+    #[cfg(feature = "peer-api")]
+    pub services: crate::netmap::peer_api::SelfServices,
 }
 
 impl<const PEERS: usize> Netmap<PEERS> {
@@ -145,6 +177,8 @@ impl<const PEERS: usize> Netmap<PEERS> {
             responses: 0,
             #[cfg(feature = "peer-names")]
             name: heapless::String::new(),
+            #[cfg(feature = "peer-api")]
+            services: crate::netmap::peer_api::SelfServices::new(),
         }
     }
 
@@ -178,6 +212,10 @@ impl<const PEERS: usize> Netmap<PEERS> {
         #[cfg(feature = "peer-names")]
         {
             self.name = source.name.clone();
+        }
+        #[cfg(feature = "peer-api")]
+        {
+            self.services = source.services;
         }
     }
 
@@ -245,6 +283,14 @@ struct Pending {
     name: heapless::String<{ crate::netmap::MAX_PEER_NAME }>,
     #[cfg(feature = "peer-names")]
     hostname: heapless::String<{ crate::netmap::MAX_PEER_NAME }>,
+    #[cfg(feature = "peer-api")]
+    services: PeerServices,
+    /// The `Hostinfo.Services` entry being read: 4 or 6 for `peerapi4`/
+    /// `peerapi6`, zero for any other protocol.
+    #[cfg(feature = "peer-api")]
+    service_proto: u8,
+    #[cfg(feature = "peer-api")]
+    service_port: u16,
 }
 
 impl Pending {
@@ -273,6 +319,18 @@ impl Pending {
             name: heapless::String::new(),
             #[cfg(feature = "peer-names")]
             hostname: heapless::String::new(),
+            #[cfg(feature = "peer-api")]
+            services: PeerServices {
+                user_id: 0,
+                tagged: false,
+                unsigned_peer_api_only: false,
+                peer_api4: 0,
+                peer_api6: 0,
+            },
+            #[cfg(feature = "peer-api")]
+            service_proto: 0,
+            #[cfg(feature = "peer-api")]
+            service_port: 0,
         }
     }
 
@@ -309,7 +367,25 @@ struct PendingFilter {
     destination_network: Option<Network>,
     first_port: Option<u16>,
     last_port: Option<u16>,
+    /// The rule carried a `CapGrant`, so it may lack `DstPorts`.
+    cap_grant: bool,
+    #[cfg(feature = "peer-api")]
+    grants: heapless::Vec<PendingCapGrant, MAX_PENDING_CAP_GRANTS>,
+    #[cfg(feature = "peer-api")]
+    grant: PendingCapGrant,
 }
+
+/// One `CapGrant` entry of the rule being read.
+#[cfg(feature = "peer-api")]
+#[derive(Clone, Default)]
+struct PendingCapGrant {
+    destinations: crate::BoundedVec<Network, MAX_CAP_DESTINATIONS>,
+    caps: PeerCapability,
+}
+
+/// `CapGrant` entries one rule may carry.
+#[cfg(feature = "peer-api")]
+const MAX_PENDING_CAP_GRANTS: usize = 4;
 
 impl PendingFilter {
     const fn new() -> Self {
@@ -321,12 +397,23 @@ impl PendingFilter {
             destination_network: None,
             first_port: None,
             last_port: None,
+            cap_grant: false,
+            #[cfg(feature = "peer-api")]
+            grants: heapless::Vec::new(),
+            #[cfg(feature = "peer-api")]
+            grant: PendingCapGrant {
+                destinations: crate::BoundedVec::new(),
+                caps: PeerCapability::NONE,
+            },
         }
     }
 
     fn reset_rule(&mut self) {
         self.rule = FilterRule::new();
         self.rule_overflow = false;
+        self.cap_grant = false;
+        #[cfg(feature = "peer-api")]
+        self.grants.clear();
     }
 
     fn reset_destination(&mut self) {
@@ -451,6 +538,12 @@ impl State {
                 // either as approved self routes, and default-route readiness
                 // below still requires both exact /0 entries.
                 "AllowedIPs" | "PrimaryRoutes" => Context::SelfPrimaryRoutes,
+                #[cfg(feature = "peer-api")]
+                "Tags" => Context::SelfTags,
+                #[cfg(feature = "peer-api")]
+                "Capabilities" => Context::SelfCapabilities,
+                #[cfg(feature = "peer-api")]
+                "CapMap" => Context::SelfCapMap,
                 _ => Context::Ignored,
             },
             Context::PeerArray | Context::PeerChangedArray => Context::PeerObject,
@@ -459,10 +552,16 @@ impl State {
                 "AllowedIPs" => Context::PeerAllowedIps,
                 "PrimaryRoutes" => Context::PeerPrimaryRoutes,
                 "Endpoints" => Context::PeerEndpoints,
-                #[cfg(feature = "peer-names")]
+                #[cfg(any(feature = "peer-names", feature = "peer-api"))]
                 "Hostinfo" => Context::PeerHostinfo,
+                #[cfg(feature = "peer-api")]
+                "Tags" => Context::PeerTags,
                 _ => Context::Ignored,
             },
+            #[cfg(feature = "peer-api")]
+            Context::PeerHostinfo if key == "Services" => Context::PeerServices,
+            #[cfg(feature = "peer-api")]
+            Context::PeerServices => Context::PeerServiceObject,
             Context::PatchArray => Context::PatchObject,
             Context::PatchObject => match key {
                 "Endpoints" => Context::PatchEndpoints,
@@ -493,6 +592,16 @@ impl State {
                 "SrcIPs" => Context::FilterSources,
                 "DstPorts" => Context::FilterDestinations,
                 "IPProto" => Context::FilterProtocols,
+                "CapGrant" => Context::FilterCapGrants,
+                _ => Context::Ignored,
+            },
+            Context::FilterCapGrants => Context::FilterCapGrantObject,
+            #[cfg(feature = "peer-api")]
+            Context::FilterCapGrantObject => match key {
+                "Dsts" => Context::FilterCapDestinations,
+                "CapMap" => Context::FilterCapMap,
+                // The legacy form: capability names without values.
+                "Caps" => Context::FilterCapList,
                 _ => Context::Ignored,
             },
             Context::FilterDestinations => Context::FilterDestinationObject,
@@ -503,14 +612,33 @@ impl State {
     }
 
     fn on_start<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
+        // A capability map's member names are the capabilities; its values
+        // (arrays of parameters) are not read.
+        #[cfg(feature = "peer-api")]
+        self.note_cap_member(netmap);
         let context = self.child_context();
         match context {
             Context::Root => {
                 self.self_routes_seen = false;
                 self.self_home_derp_set = false;
             }
-            Context::SelfNode => self.self_numeric_derp = false,
+            Context::SelfNode => {
+                self.self_numeric_derp = false;
+                // A self record is whole: what it omits no longer applies.
+                #[cfg(feature = "peer-api")]
+                {
+                    netmap.services = crate::netmap::peer_api::SelfServices::new();
+                }
+            }
             Context::PeerObject | Context::PatchObject => self.pending.reset(),
+            #[cfg(feature = "peer-api")]
+            Context::PeerServiceObject => {
+                self.pending.service_proto = 0;
+                self.pending.service_port = 0;
+            }
+            Context::FilterCapGrants => self.filter.cap_grant = true,
+            #[cfg(feature = "peer-api")]
+            Context::FilterCapGrantObject => self.filter.grant = PendingCapGrant::default(),
             Context::PeerArray => {
                 netmap.peers.clear();
                 netmap.peers_truncated = false;
@@ -698,32 +826,81 @@ impl State {
                     self.filter.rule_overflow = true;
                 }
             }
-            Context::FilterRuleObject => {
-                if self.filter.skip_set || self.filter.rule_overflow {
-                    netmap
-                        .packet_filter
-                        .mark_truncated(self.filter.set.as_str());
-                } else if !self.filter.rule.is_well_formed() {
-                    self.fail(Error::MalformedField(MalformedField::PacketRule));
-                } else {
-                    match netmap.packet_filter.push_rule(
-                        self.filter.set.as_str(),
-                        core::mem::take(&mut self.filter.rule),
-                    ) {
-                        Ok(()) => {}
-                        Err(Error::Full(_)) => {
-                            netmap
-                                .packet_filter
-                                .mark_truncated(self.filter.set.as_str());
-                        }
-                        Err(error) => self.fail(error),
-                    }
+            #[cfg(feature = "peer-api")]
+            Context::PeerServiceObject => match self.pending.service_proto {
+                4 => self.pending.services.peer_api4 = self.pending.service_port,
+                6 => self.pending.services.peer_api6 = self.pending.service_port,
+                _ => {}
+            },
+            #[cfg(feature = "peer-api")]
+            Context::FilterCapGrantObject => {
+                let grant = core::mem::take(&mut self.filter.grant);
+                if !grant.caps.is_empty() && self.filter.grants.push(grant).is_err() {
+                    self.filter.rule_overflow = true;
                 }
             }
+            Context::FilterRuleObject => self.commit_rule(netmap),
             Context::Root => netmap.responses += 1,
             _ => {}
         }
         self.key.clear();
+    }
+
+    fn commit_rule<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
+        let set = self.filter.set.clone();
+        if self.filter.skip_set || self.filter.rule_overflow {
+            netmap.packet_filter.mark_truncated(set.as_str());
+            return;
+        }
+        // Capability grants (`CapGrant`) grant no network access, and such a
+        // rule carries no `DstPorts`. It is not malformed; only its grants of
+        // capabilities this crate acts on are kept.
+        #[cfg(feature = "peer-api")]
+        for grant in core::mem::take(&mut self.filter.grants) {
+            match netmap.packet_filter.push_cap_rule(
+                set.as_str(),
+                self.filter.rule.sources.iter().copied(),
+                grant.destinations.iter().copied(),
+                grant.caps,
+            ) {
+                Ok(()) => {}
+                Err(Error::Full(_)) => netmap.packet_filter.mark_truncated(set.as_str()),
+                Err(error) => self.fail(error),
+            }
+        }
+        if self.filter.cap_grant && self.filter.rule.destinations.is_empty() {
+            return;
+        }
+        if !self.filter.rule.is_well_formed() {
+            self.fail(Error::MalformedField(MalformedField::PacketRule));
+            return;
+        }
+        match netmap
+            .packet_filter
+            .push_rule(set.as_str(), core::mem::take(&mut self.filter.rule))
+        {
+            Ok(()) => {}
+            Err(Error::Full(_)) => netmap.packet_filter.mark_truncated(set.as_str()),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    /// Record a capability named by a member of a capability map.
+    #[cfg(feature = "peer-api")]
+    fn note_cap_member<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
+        if self.key_oversized {
+            return;
+        }
+        match self.context() {
+            Context::SelfCapMap if self.key == crate::netmap::peer_api::CAP_FILE_SHARING => {
+                netmap.services.file_sharing = true;
+            }
+            Context::FilterCapMap => {
+                let cap = PeerCapability::from_name(self.key.as_str());
+                self.filter.grant.caps = self.filter.grant.caps.union(cap);
+            }
+            _ => {}
+        }
     }
 
     fn commit_peer<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
@@ -792,6 +969,10 @@ impl State {
             } else {
                 self.pending.name.clone()
             };
+        }
+        #[cfg(feature = "peer-api")]
+        {
+            peer.services = self.pending.services;
         }
         if let Err(error) = netmap.peers.upsert(peer.clone()) {
             if error == Error::Full(CapacityError::Peers) {
@@ -1084,6 +1265,38 @@ impl State {
             Context::PeerHostinfo if key == "Hostname" => {
                 self.pending.hostname = display_name(value);
             }
+            #[cfg(feature = "peer-api")]
+            Context::PeerTags => self.pending.services.tagged = true,
+            #[cfg(feature = "peer-api")]
+            Context::PeerServiceObject if key == "Proto" => {
+                self.pending.service_proto = match value {
+                    "peerapi4" => 4,
+                    "peerapi6" => 6,
+                    _ => 0,
+                };
+            }
+            #[cfg(feature = "peer-api")]
+            Context::SelfTags => netmap.services.tagged = true,
+            #[cfg(feature = "peer-api")]
+            Context::SelfCapabilities if value == crate::netmap::peer_api::CAP_FILE_SHARING => {
+                netmap.services.file_sharing = true;
+            }
+            #[cfg(feature = "peer-api")]
+            Context::FilterCapDestinations => match Network::parse(value) {
+                Ok(network) => {
+                    if self.filter.grant.destinations.push(network).is_err() {
+                        self.filter.rule_overflow = true;
+                    }
+                }
+                // An unreadable grant destination drops the rule: grants
+                // only allow, so dropping one only denies.
+                Err(_) => self.filter.rule_overflow = true,
+            },
+            #[cfg(feature = "peer-api")]
+            Context::FilterCapList => {
+                let cap = PeerCapability::from_name(value);
+                self.filter.grant.caps = self.filter.grant.caps.union(cap);
+            }
             // Retain the exact IPv6 host assignment separately from compact
             // IPv4 route lists, so exit forwarding can bind it to the node key.
             Context::PeerAddresses => match Cidr::parse(value) {
@@ -1227,6 +1440,18 @@ impl State {
                     Err(_) => self.fail(Error::MalformedField(MalformedField::HomeDerp)),
                 }
             }
+            #[cfg(feature = "peer-api")]
+            Context::SelfNode if key == "User" => {
+                netmap.services.user_id = u64::try_from(value).unwrap_or(0);
+            }
+            #[cfg(feature = "peer-api")]
+            Context::PeerObject if key == "User" => {
+                self.pending.services.user_id = u64::try_from(value).unwrap_or(0);
+            }
+            #[cfg(feature = "peer-api")]
+            Context::PeerServiceObject if key == "Port" => {
+                self.pending.service_port = u16::try_from(value).unwrap_or(0);
+            }
             Context::PeerObject | Context::PatchObject => match key {
                 "ID" | "NodeID" => match u64::try_from(value) {
                     Ok(id) => self.pending.id = id,
@@ -1296,6 +1521,10 @@ impl State {
             Context::PeerObject | Context::PatchObject if self.key == "Online" => {
                 self.pending.online = Some(value);
             }
+            #[cfg(feature = "peer-api")]
+            Context::PeerObject if self.key == "UnsignedPeerAPIOnly" => {
+                self.pending.services.unsigned_peer_api_only = value;
+            }
             #[cfg(feature = "ssh-policy")]
             Context::PeerObject | Context::PatchObject if self.key == "Expired" => {
                 self.pending.expired = Some(value);
@@ -1316,6 +1545,8 @@ impl State {
     }
 
     fn on_null<const PEERS: usize>(&mut self, netmap: &mut Netmap<PEERS>) {
+        #[cfg(feature = "peer-api")]
+        self.note_cap_member(netmap);
         if self.context() == Context::PacketFiltersObject {
             if self.key == "*" {
                 netmap.packet_filter.clear();
@@ -1724,5 +1955,30 @@ mod peer_name_tests {
         let peer = netmap.peers.get(1).unwrap();
         assert!(peer.online());
         assert_eq!(peer.name.as_str(), "bazzite");
+    }
+}
+
+#[cfg(test)]
+mod cap_grant_tests {
+    use super::*;
+
+    /// Grants with app capabilities arrive as rules with `CapGrant` and no
+    /// `DstPorts`. They grant no network access and must not fail the map.
+    #[test]
+    fn a_grant_only_rule_is_accepted_and_grants_no_traffic() {
+        let document = r#"{"PacketFilter":[
+            {"SrcIPs":["100.64.0.2"],"CapGrant":[{"Dsts":["100.64.0.9/32"],
+              "CapMap":{"https://tailscale.com/cap/file-send":[]}}]},
+            {"SrcIPs":["100.64.0.3"],"DstPorts":[{"IP":"100.64.0.9","Ports":{"First":22,"Last":22}}]}
+        ]}"#;
+        let mut netmap = Netmap::<4>::new();
+        let mut parser = Parser::<4>::new();
+        parser.push(&mut netmap, document.as_bytes()).unwrap();
+        parser.finish(&mut netmap).unwrap();
+        let policy = &netmap.packet_filter;
+        assert_eq!(policy.rule_count(), 1);
+        let to_self = core::net::Ipv4Addr::new(100, 64, 0, 9);
+        assert!(!policy.allows(core::net::Ipv4Addr::new(100, 64, 0, 2), to_self, 6, 22));
+        assert!(policy.allows(core::net::Ipv4Addr::new(100, 64, 0, 3), to_self, 6, 22));
     }
 }

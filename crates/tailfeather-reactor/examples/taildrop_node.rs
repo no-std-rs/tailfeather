@@ -1,17 +1,27 @@
 //! A Taildrop lab node: receive files from, and send one to, stock Tailscale.
 //!
-//! `taildrop_node <control-url> <state-directory> [--send=<ip>:<port>] [--timeout-seconds=N]`
+//! `taildrop_node <control-url> <state-directory> [--send-to=<ipv4>] [--timeout-seconds=N]`
 //!
 //! The single-use enrollment key is read from `TF_TEST_AUTH_KEY` and an
-//! optional private control CA (DER) from the path in `TF_TEST_CA_DER`. The node
-//! advertises a peer API on [`PEER_API_PORT`] and prints `READY <address>`
-//! once mapped. Every received file is reported as
-//! `RECEIVED name=<name> bytes=<n> fnv=<FNV-1a 64 hex>`.
+//! optional private control CA (DER) from the path in `TF_TEST_CA_DER`. The
+//! node advertises a peer API on [`PEER_API_PORT`], prints `READY <address>`
+//! once mapped, and authorizes every sender from the netmap exactly as stock
+//! Tailscale does. Each received file is reported as
+//! `RECEIVED name=<name> bytes=<n> fnv=<FNV-1a 64 hex> from=<address>`, and
+//! each refused or failed request as `PEERAPI ...`.
 //!
-//! With `--send`, it then uploads [`SEND_BYTES`] bytes of [`pattern`] data as
-//! `from-tailfeather.bin` to that peer API (a stock node's `PeerAPIURL`) and
-//! prints `SENT ok` or `SENT err=<error>`.
-use std::{io::Write as _, net::SocketAddr, path::PathBuf, time::Duration};
+//! With `--send-to`, it finds that peer's peer API in the netmap and uploads
+//! [`SEND_BYTES`] bytes of [`pattern`] data as `from-tailfeather.bin`, the way
+//! an interrupted transfer would: the first upload breaks off after
+//! [`BREAK_AT`] bytes, a resume probe asks the receiver what it kept, and the
+//! rest follows. It prints `TARGET <peer-api>`, `RESUMED offset=<n>`, then
+//! `SENT ok bytes=<n>` or `SENT err=<error>`.
+use std::{
+    io::Write as _,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 use tailfeather_gateway::peerapi::taildrop::{self, MemorySink, Peer, Upload};
 use tailfeather_reactor::{
     native::{FileState, TokioNetwork},
@@ -22,32 +32,55 @@ use tailfeather_reactor::{
 
 const PEER_API_PORT: u16 = 5254;
 const SEND_BYTES: u64 = 300_000;
+const BREAK_AT: u64 = 150_000;
 const SEND_NAME: &str = "from-tailfeather.bin";
 
+type Queue = std::collections::VecDeque<tailfeather_reactor::tcp::Packet>;
 type Node<'a> = Runtime<'a, TokioNetwork, FileState, 4, 32>;
-type Stream<'a> = Tcp<'a, 16, 128, std::collections::VecDeque<tailfeather_reactor::tcp::Packet>>;
+type Stack<'a> = Tcp<'a, 16, 128, Queue>;
+type Stream<'r, 's> = tailfeather_reactor::tcp_async::Stream<'r, 's, 16, 128, Queue>;
 
-/// Deterministic, non-repeating-at-small-periods test data the lab script
-/// regenerates to verify what stock Tailscale stored.
+/// Deterministic test data the lab script regenerates to verify what stock
+/// Tailscale stored.
 fn pattern(offset: u64) -> u8 {
     (offset.wrapping_mul(2_654_435_761) >> 13) as u8
 }
 
+/// A seekable [`pattern`] source that fails at `break_at`, like a dropped
+/// link.
 struct Pattern {
     offset: u64,
+    break_at: Option<u64>,
 }
 
 impl embedded_io_async::ErrorType for Pattern {
-    type Error = core::convert::Infallible;
+    type Error = embedded_io_async::ErrorKind;
 }
 
 impl embedded_io_async::Read for Pattern {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        for byte in buf.iter_mut() {
+        let end = self.break_at.unwrap_or(u64::MAX);
+        if self.offset >= end {
+            return Err(embedded_io_async::ErrorKind::BrokenPipe);
+        }
+        let len = buf
+            .len()
+            .min(usize::try_from(end - self.offset).unwrap_or(usize::MAX));
+        for byte in &mut buf[..len] {
             *byte = pattern(self.offset);
             self.offset += 1;
         }
-        Ok(buf.len())
+        Ok(len)
+    }
+}
+
+impl embedded_io_async::Seek for Pattern {
+    async fn seek(&mut self, pos: embedded_io_async::SeekFrom) -> Result<u64, Self::Error> {
+        let embedded_io_async::SeekFrom::Start(offset) = pos else {
+            return Err(embedded_io_async::ErrorKind::Unsupported);
+        };
+        self.offset = offset;
+        Ok(offset)
     }
 }
 
@@ -62,11 +95,102 @@ fn say(line: core::fmt::Arguments<'_>) {
     std::io::stdout().flush().unwrap();
 }
 
+/// Wait until the netmap names `peer` a Taildrop target, and return its
+/// peer API.
+async fn target(runtime: &Node<'_>, peer: Ipv4Addr) -> SocketAddr {
+    loop {
+        let found = runtime.with_netmap(|netmap| {
+            netmap
+                .peer_by_address(IpAddr::V4(peer))
+                .and_then(|record| netmap.taildrop_target(record))
+        });
+        if let Some(found) = found {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn connect<'r, 's>(
+    runtime: &Node<'_>,
+    tcp: &'r Stack<'s>,
+    target: SocketAddr,
+    local_port: &mut u16,
+) -> Result<Stream<'r, 's>, String> {
+    let SocketAddr::V4(target) = target else {
+        return Err("this node's TCP stack is IPv4".into());
+    };
+    // The first attempts may race WireGuard handshakes.
+    for attempt in 1..=20 {
+        *local_port += 1;
+        match runtime
+            .connect(tcp, *target.ip(), target.port(), *local_port)
+            .await
+        {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                say(format_args!("CONNECT attempt={attempt} err={error}"));
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    Err(format!("no connection to {target}"))
+}
+
+async fn upload(runtime: &Node<'_>, tcp: &Stack<'_>, peer: Ipv4Addr) -> Result<(), String> {
+    let target = target(runtime, peer).await;
+    say(format_args!("TARGET {target}"));
+    let mut buffer = vec![0; 16 * 1024];
+    let mut local_port = 40_000;
+    let upload = Upload {
+        peer_api: target,
+        name: SEND_NAME,
+        size: SEND_BYTES,
+        offset: 0,
+    };
+
+    // A transfer that breaks off part way, as a dropped link would.
+    let stream = connect(runtime, tcp, target, &mut local_port).await?;
+    let mut broken = Pattern {
+        offset: 0,
+        break_at: Some(BREAK_AT),
+    };
+    let first = taildrop::send_async(&mut &stream, &upload, &mut broken, &mut buffer).await;
+    let _ = stream.shutdown();
+    drop(stream);
+    if first.is_ok() {
+        return Err("the broken upload unexpectedly completed".into());
+    }
+    // Let the receiver see the short body and keep what arrived.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut source = Pattern {
+        offset: 0,
+        break_at: None,
+    };
+    let stream = connect(runtime, tcp, target, &mut local_port).await?;
+    let offset =
+        taildrop::resume_offset_async(&mut &stream, target, SEND_NAME, &mut source, &mut buffer)
+            .await
+            .map_err(|error| format!("resume probe: {error}"))?;
+    let _ = stream.shutdown();
+    drop(stream);
+    say(format_args!("RESUMED offset={offset}"));
+
+    let stream = connect(runtime, tcp, target, &mut local_port).await?;
+    let resumed = Upload { offset, ..upload };
+    let result = taildrop::send_async(&mut &stream, &resumed, &mut source, &mut buffer)
+        .await
+        .map_err(|error| error.to_string());
+    let _ = stream.shutdown();
+    result
+}
+
 async fn serve(
     runtime: &Node<'_>,
-    tcp: &Stream<'_>,
+    tcp: &Stack<'_>,
     buffers: &mut Buffers<4>,
-    send: Option<SocketAddr>,
+    send_to: Option<Ipv4Addr>,
     timeout: Duration,
 ) {
     let ready = async {
@@ -85,12 +209,10 @@ async fn serve(
             let Some(remote) = stream.remote_endpoint() else {
                 continue;
             };
-            // The runtime already enforced WireGuard source validation and
-            // the packet filter. Stock Tailscale additionally requires the
-            // sender to be the same user; this lab's tailnet has one user.
+            let addr = IpAddr::V4(*remote.ip());
             let peer = Peer {
-                addr: (*remote.ip()).into(),
-                may_send_files: true,
+                addr,
+                may_send_files: runtime.with_netmap(|netmap| netmap.taildrop_allows_from(addr)),
             };
             let result = taildrop::serve_async(
                 &mut &stream,
@@ -118,61 +240,27 @@ async fn serve(
             }
         }
     };
-    let upload = async {
-        let Some(target) = send else {
+    let send = async {
+        let Some(peer) = send_to else {
             return core::future::pending::<()>().await;
-        };
-        let SocketAddr::V4(target) = target else {
-            panic!("--send needs an IPv4 peer API address");
         };
         runtime.ready().await.unwrap();
-        let mut buffer = vec![0; 16 * 1024];
-        // The first attempts may race WireGuard handshakes and map delivery.
-        for attempt in 1..=20u16 {
-            let stream = match runtime
-                .connect(tcp, *target.ip(), target.port(), 40_000 + attempt)
-                .await
-            {
-                Ok(stream) => stream,
-                Err(error) => {
-                    say(format_args!("CONNECT attempt={attempt} err={error}"));
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-            };
-            let upload = Upload {
-                peer_api: target.into(),
-                name: SEND_NAME,
-                size: SEND_BYTES,
-                offset: 0,
-            };
-            let result = taildrop::send_async(
-                &mut &stream,
-                &upload,
-                &mut Pattern { offset: 0 },
-                &mut buffer,
-            )
-            .await;
-            let _ = stream.shutdown();
-            match result {
-                Ok(()) => say(format_args!("SENT ok bytes={SEND_BYTES}")),
-                Err(error) => say(format_args!("SENT err={error}")),
-            }
-            return core::future::pending::<()>().await;
+        match upload(runtime, tcp, peer).await {
+            Ok(()) => say(format_args!("SENT ok bytes={SEND_BYTES}")),
+            Err(error) => say(format_args!("SENT err={error}")),
         }
-        say(format_args!("SENT err=no connection"));
         core::future::pending::<()>().await
     };
     tokio::select! {
         result = runtime.run(tcp, buffers) => panic!("runtime stopped: {result:?}"),
         _ = ready => {},
         _ = receive => {},
-        _ = upload => {},
+        _ = send => {},
         _ = tokio::time::sleep(timeout) => say(format_args!("DEADLINE")),
     }
 }
 
-fn node(control_url: &str, state: PathBuf, send: Option<SocketAddr>, timeout: Duration) {
+fn node(control_url: &str, state: PathBuf, send_to: Option<Ipv4Addr>, timeout: Duration) {
     let key = std::env::var("TF_TEST_AUTH_KEY").expect("TF_TEST_AUTH_KEY");
     let ca = std::env::var_os("TF_TEST_CA_DER")
         .map(|path| std::fs::read(path).expect("control CA"))
@@ -200,7 +288,13 @@ fn node(control_url: &str, state: PathBuf, send: Option<SocketAddr>, timeout: Du
     let runtime = Box::new(Node::new(config, &mut node, &network, &state).unwrap());
     let tcp = Box::new(Tcp::new(NetStack::new(1)));
     let mut buffers = Box::new(Buffers::new());
-    executor.block_on(Box::pin(serve(&runtime, &tcp, &mut buffers, send, timeout)));
+    executor.block_on(Box::pin(serve(
+        &runtime,
+        &tcp,
+        &mut buffers,
+        send_to,
+        timeout,
+    )));
 }
 
 fn main() {
@@ -208,10 +302,10 @@ fn main() {
     let control_url = args.next().expect("control URL");
     let state = PathBuf::from(args.next().expect("state directory"));
     let mut timeout = Duration::from_secs(120);
-    let mut send = None;
+    let mut send_to = None;
     for arg in args {
-        if let Some(target) = arg.strip_prefix("--send=") {
-            send = Some(target.parse().expect("--send=<ip>:<port>"));
+        if let Some(peer) = arg.strip_prefix("--send-to=") {
+            send_to = Some(peer.parse().expect("--send-to=<ipv4>"));
         } else if let Some(seconds) = arg.strip_prefix("--timeout-seconds=") {
             timeout = Duration::from_secs(seconds.parse().unwrap());
         } else {
@@ -220,7 +314,7 @@ fn main() {
     }
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || node(&control_url, state, send, timeout))
+        .spawn(move || node(&control_url, state, send_to, timeout))
         .unwrap()
         .join()
         .unwrap();
