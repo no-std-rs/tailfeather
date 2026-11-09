@@ -5,11 +5,14 @@ use embedded_io::{Read, Seek, SeekFrom, Write};
 use super::resume::{BLOCK_SIZE, BlockChecksum, BlockHasher, LINE_MAX, LineBuffer};
 use super::*;
 
+/// Read a message head into `buf`, whose first `carried` bytes were already
+/// received (left over after an earlier head on the same connection).
 fn read_head<IO: Read>(
     io: &mut IO,
     buf: &mut [u8],
+    carried: usize,
 ) -> Result<Option<(usize, usize)>, HeadError<IO::Error>> {
-    let mut filled = 0;
+    let mut filled = carried;
     loop {
         if let Some(head) = head_progress(buf, filled).map_err(HeadError::Http)? {
             return Ok(Some((head, filled)));
@@ -49,7 +52,7 @@ where
     IO: Read + Write,
     S: FileSink,
 {
-    let (head, filled) = match read_head(io, buf) {
+    let (head, filled) = match read_head(io, buf, 0) {
         Ok(Some(head)) => head,
         Ok(None) => return Ok(Served::Closed),
         Err(HeadError::Io(error)) => return Err(ServeError::Io(error)),
@@ -256,9 +259,20 @@ where
     let len = write_upload_head(upload, buf).map_err(SendError::Http)?;
     io.write_all(&buf[..len]).map_err(SendError::Io)?;
     io.flush().map_err(SendError::Io)?;
-    let status = response_status(io, buf)?;
-    if status != 100 {
-        return Err(SendError::Rejected(status));
+    // Only a request with a body asks for `100 Continue` (RFC 9110 §10.1.1).
+    if remaining > 0 {
+        let (status, carried) = response_status(io, buf, 0)?;
+        if status != 100 {
+            return Err(SendError::Rejected(status));
+        }
+        // A final response already behind the interim one ends the exchange
+        // before any body byte: the receiver decided without it.
+        if carried > 0 {
+            return match response_status(io, buf, carried)?.0 {
+                200 => Err(SendError::Http(http::Error::Malformed)),
+                status => Err(SendError::Rejected(status)),
+            };
+        }
     }
     while remaining > 0 {
         let want = clamp(remaining, buf.len());
@@ -270,7 +284,7 @@ where
         remaining -= read as u64;
     }
     io.flush().map_err(SendError::Io)?;
-    match response_status(io, buf)? {
+    match response_status(io, buf, 0)?.0 {
         200 => Ok(()),
         status => Err(SendError::Rejected(status)),
     }
@@ -298,12 +312,15 @@ where
     if buf.len() < MIN_CLIENT_BUFFER {
         return Err(SendError::Http(http::Error::OutputTooSmall));
     }
+    // The receiver's blocks start at the file's first byte, whatever an
+    // earlier attempt left the source at; the fallback offset is zero too.
+    source.seek(SeekFrom::Start(0)).map_err(SendError::Source)?;
     let len = write_probe_head(peer_api, name, buf).map_err(SendError::Http)?;
     io.write_all(&buf[..len]).map_err(SendError::Io)?;
     io.flush().map_err(SendError::Io)?;
 
     let (net, scratch) = buf.split_at_mut(buf.len() / 2);
-    let (head, filled) = match read_head(io, net) {
+    let (head, filled) = match read_head(io, net, 0) {
         Ok(Some(head)) => head,
         Ok(None) => return Err(SendError::Http(http::Error::UnexpectedEof)),
         Err(HeadError::Io(error)) => return Err(SendError::Io(error)),
@@ -385,13 +402,16 @@ fn same_block<R: Read + Seek, E>(
     Ok(hasher.finish() == *block)
 }
 
-/// Read one response head. A final (non-1xx) response's body is drained, so
+/// Read one response head, with `carried` bytes of it already at the front
+/// of `buf`. An interim (1xx) response returns how many bytes that followed
+/// it are now at the front of `buf`; a final response's body is drained, so
 /// the receiver can finish writing before the caller closes.
 fn response_status<IO: Read + Write, R>(
     io: &mut IO,
     buf: &mut [u8],
-) -> Result<u16, SendError<IO::Error, R>> {
-    let (head, filled) = match read_head(io, buf) {
+    carried: usize,
+) -> Result<(u16, usize), SendError<IO::Error, R>> {
+    let (head, filled) = match read_head(io, buf, carried) {
         Ok(Some(head)) => head,
         Ok(None) => return Err(SendError::Http(http::Error::UnexpectedEof)),
         Err(HeadError::Io(error)) => return Err(SendError::Io(error)),
@@ -399,7 +419,8 @@ fn response_status<IO: Read + Write, R>(
     };
     let response = http::parse_response(&buf[..head]).map_err(SendError::Http)?;
     if response.status < 200 {
-        return Ok(response.status);
+        buf.copy_within(head..filled, 0);
+        return Ok((response.status, filled - head));
     }
     let mut body = ResponseBody::new(response.framing);
     let mut pending = head..filled;
@@ -411,13 +432,13 @@ fn response_status<IO: Read + Write, R>(
             pending.start += step.consumed;
         }
         if body.is_done() {
-            return Ok(response.status);
+            return Ok((response.status, 0));
         }
         let read = io.read(buf).map_err(SendError::Io)?;
         if read == 0 {
             return body
                 .at_eof()
-                .map(|()| response.status)
+                .map(|()| (response.status, 0))
                 .map_err(SendError::Http);
         }
         pending = 0..read;

@@ -456,8 +456,9 @@ pub struct Upload<'a> {
     pub offset: u64,
 }
 
-/// Format the upload request head. It asks for `100 Continue`, so a refusal
-/// (`403`, `409`, `413`, ...) arrives before any file byte is sent.
+/// Format the upload request head. With a body to send it asks for
+/// `100 Continue`, so a refusal (`403`, `409`, `413`, ...) arrives before any
+/// file byte is sent.
 pub fn write_upload_head(upload: &Upload<'_>, out: &mut [u8]) -> Result<usize, http::Error> {
     let remaining = upload
         .size
@@ -474,7 +475,10 @@ pub fn write_upload_head(upload: &Upload<'_>, out: &mut [u8]) -> Result<usize, h
     if upload.offset != 0 {
         cursor.args(format_args!("Range: bytes={}-\r\n", upload.offset))?;
     }
-    cursor.bytes(b"Expect: 100-continue\r\nConnection: close\r\n\r\n")?;
+    if remaining != 0 {
+        cursor.bytes(b"Expect: 100-continue\r\n")?;
+    }
+    cursor.bytes(b"Connection: close\r\n\r\n")?;
     Ok(cursor.len())
 }
 

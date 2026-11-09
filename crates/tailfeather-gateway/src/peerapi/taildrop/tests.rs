@@ -892,7 +892,11 @@ fn resume_offset_matches_the_receivers_blocks() {
     for split in [1, 7, 100, response.len()] {
         let segments: Vec<&[u8]> = response.chunks(split).collect();
         let mut io = Script::new(&segments);
-        let mut source = Source::new(&data);
+        // Left mid-file by an earlier attempt: the probe must rewind it.
+        let mut source = Source {
+            pos: 12_345,
+            ..Source::new(&data)
+        };
         let offset = resume_offset(
             &mut io,
             RECEIVER,
@@ -924,17 +928,21 @@ fn resume_offset_matches_the_receivers_blocks() {
     .unwrap();
     assert_eq!(offset, 65_536);
 
-    // A receiver without resume support yields zero.
+    // A receiver without resume support yields zero, with the source there.
     let segments: &[&[u8]] = &[b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"];
+    let mut source = Source {
+        pos: 999,
+        ..Source::new(&data)
+    };
     let offset = resume_offset(
         &mut Script::new(segments),
         RECEIVER,
         "photo.jpg",
-        &mut Source::new(&data),
+        &mut source,
         &mut [0; MIN_CLIENT_BUFFER],
     )
     .unwrap();
-    assert_eq!(offset, 0);
+    assert_eq!((offset, source.pos), (0, 0));
 }
 
 #[test]
@@ -1013,7 +1021,9 @@ fn async_upload_resumes_after_a_broken_transfer() {
         assert!(served.await.unwrap().is_err());
 
         // The probe finds the kept prefix, and the rest completes the file.
-        let mut source = Source::new(data);
+        // The interrupted attempt's own source is reused, as a retrying
+        // sender would: the probe rewinds it before comparing.
+        source.fail_at = None;
         let (mut io, served) = connection(sink.clone());
         let offset = resume_offset_async(
             &mut io,
@@ -1043,4 +1053,58 @@ fn async_upload_resumes_after_a_broken_transfer() {
         assert_eq!(sink.files()[0].data, data);
         assert!(sink.partials().is_empty());
     });
+}
+
+#[test]
+fn uploads_with_nothing_left_do_not_wait_for_100_continue() {
+    // Resuming at the end of the file: no body, so no `Expect`, and the final
+    // response is the only one.
+    let segments: &[&[u8]] = &[b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n{}\n"];
+    let mut io = Script::new(segments);
+    let upload = Upload {
+        peer_api: RECEIVER,
+        name: "a",
+        size: 10,
+        offset: 10,
+    };
+    let mut body: &[u8] = b"";
+    send(&mut io, &upload, &mut body, &mut [0; MIN_CLIENT_BUFFER]).unwrap();
+    let text = core::str::from_utf8(&io.written).unwrap();
+    assert!(!text.contains("Expect:"), "{text}");
+    assert!(
+        text.contains("\r\nContent-Length: 0\r\nRange: bytes=10-\r\n"),
+        "{text}"
+    );
+
+    // Our own receiver answers it directly too.
+    let mut sink = ArraySink::default();
+    let mut io = Script::new(&[b"PUT /v0/put/a HTTP/1.1\r\nContent-Length: 0\r\n\r\n"]);
+    let served = serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap();
+    assert_eq!(
+        served,
+        Served::Received {
+            bytes: 0,
+            offset: 0
+        }
+    );
+    assert_eq!(status_of(&io.written), 200);
+}
+
+#[test]
+fn a_final_response_behind_100_continue_is_read_not_awaited() {
+    // Both heads in one read: the refusal must not be lost (and then waited
+    // for), and no body byte may follow it.
+    let segments: &[&[u8]] =
+        &[b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"];
+    let mut io = Script::new(segments);
+    let upload = Upload {
+        peer_api: RECEIVER,
+        name: "a",
+        size: 5,
+        offset: 0,
+    };
+    let mut body: &[u8] = b"hello";
+    let error = send(&mut io, &upload, &mut body, &mut [0; MIN_CLIENT_BUFFER]).unwrap_err();
+    assert_eq!(error, SendError::Rejected(403));
+    assert!(!io.written.ends_with(b"hello"));
 }
