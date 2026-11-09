@@ -269,6 +269,23 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_copy_keeps_the_capability_grants() {
+        // Staging copies the policy rule by rule; grants must come along.
+        let mut netmap = Netmap::<8>::new();
+        apply(
+            &mut netmap,
+            &tailnet(r#""Capabilities":["https://tailscale.com/cap/file-sharing"]"#),
+        );
+        let mut staged = Netmap::<8>::new();
+        staged.copy_from(&netmap);
+        assert!(!staged.packet_filter.truncated());
+        // Peer 2 may send only through its file-send grant.
+        assert!(staged.taildrop_allows_from(ip("100.64.0.2")));
+        assert!(staged.taildrop_allows_from(ip("100.64.0.1")));
+        assert!(!staged.taildrop_allows_from(ip("100.64.0.3")));
+    }
+
+    #[test]
     fn grants_follow_their_named_filter_set() {
         let mut netmap = Netmap::<8>::new();
         apply(

@@ -285,6 +285,19 @@ struct CapRule {
     caps: PeerCapability,
 }
 
+#[cfg(feature = "peer-api")]
+impl CapRule {
+    /// Clone without an infallible allocation, as `StoredRule::try_clone`.
+    fn try_clone(&self) -> Option<Self> {
+        Some(Self {
+            set: self.set,
+            sources: self.sources.try_clone()?,
+            destinations: self.destinations.try_clone()?,
+            caps: self.caps,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FilterSet {
     name: String<MAX_FILTER_SET_NAME>,
@@ -403,10 +416,19 @@ impl PacketPolicy {
         };
         self.sets = sets;
         self.v6_networks = v6_networks;
+        // Grants copy member by member: a derived `Clone` of the outer table
+        // would allocate each rule's networks infallibly. A grant that cannot
+        // be copied is dropped, which only denies, and reported.
         #[cfg(feature = "peer-api")]
-        match source.cap_rules.try_clone() {
-            Some(cap_rules) => self.cap_rules = cap_rules,
-            None => self.truncated = true,
+        {
+            let _ = self.cap_rules.try_reserve_total(source.cap_rules.len());
+            for rule in source.cap_rules.iter() {
+                let copied = rule.try_clone().map(|rule| self.cap_rules.push(rule));
+                if !matches!(copied, Some(Ok(()))) {
+                    self.truncated = true;
+                    break;
+                }
+            }
         }
         let _ = self.rules.try_reserve_total(source.rules.len());
         for rule in source.rules.iter() {
