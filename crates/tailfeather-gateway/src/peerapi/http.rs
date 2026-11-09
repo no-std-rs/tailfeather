@@ -466,13 +466,28 @@ pub fn write_response(
     extra_headers: &str,
     body: &[u8],
 ) -> Result<usize, Error> {
+    let head = write_response_head(out, status, content_type, extra_headers, body.len() as u64)?;
+    let end = head.checked_add(body.len()).ok_or(Error::OutputTooSmall)?;
+    out.get_mut(head..end)
+        .ok_or(Error::OutputTooSmall)?
+        .copy_from_slice(body);
+    Ok(end)
+}
+
+/// Format the head of a connection-closing response whose body of
+/// `content_length` bytes the caller writes separately.
+pub fn write_response_head(
+    out: &mut [u8],
+    status: u16,
+    content_type: &str,
+    extra_headers: &str,
+    content_length: u64,
+) -> Result<usize, Error> {
     let mut cursor = Cursor::new(out);
     cursor.args(format_args!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\n{extra_headers}Connection: close\r\n\r\n",
         reason(status),
-        body.len(),
     ))?;
-    cursor.bytes(body)?;
     Ok(cursor.len())
 }
 
@@ -485,6 +500,7 @@ pub fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         413 => "Content Too Large",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",

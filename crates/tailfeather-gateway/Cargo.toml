@@ -17,7 +17,7 @@ default = []
 # Taildrop file receive and send over caller-supplied byte streams, with
 # blocking (embedded-io) and async (embedded-io-async) drivers. The sans-I/O
 # HTTP framing they share, and the packet-level DNS peer API, are always built.
-taildrop = ["dep:embedded-io", "dep:embedded-io-async"]
+taildrop = ["dep:embedded-io", "dep:embedded-io-async", "dep:sha2"]
 # Heap-backed conveniences (an in-memory Taildrop sink). Allocation is
 # fallible; the default build stays allocation-free.
 alloc = []
@@ -25,10 +25,12 @@ alloc = []
 [dependencies]
 embedded-io = { version = "0.7", default-features = false, optional = true }
 embedded-io-async = { version = "0.7", default-features = false, optional = true }
+# Taildrop resume compares 64 KiB block checksums of partial files.
+sha2 = { version = "0.10", default-features = false, optional = true }
 wirefeather = { path = "../wirefeather", version = "0.0.1" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "sync"] }
 
 [package.metadata.docs.rs]
 all-features = true

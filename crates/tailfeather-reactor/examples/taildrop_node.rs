@@ -144,6 +144,7 @@ async fn serve(
                 peer_api: target.into(),
                 name: SEND_NAME,
                 size: SEND_BYTES,
+                offset: 0,
             };
             let result = taildrop::send_async(
                 &mut &stream,

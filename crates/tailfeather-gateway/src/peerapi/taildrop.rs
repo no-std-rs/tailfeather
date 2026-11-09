@@ -1,27 +1,31 @@
-//! Taildrop file transfer over the peer API, receive and send.
+//! Taildrop file transfer over the peer API: receive, send and resume.
 //!
 //! A sender `PUT`s the file to `/v0/put/<escaped name>` on the receiver's
 //! advertised peer API port (Hostinfo `Services`, `peerapi4`/`peerapi6`),
 //! inside the tunnel. This is the protocol Tailscale's `tailscale file cp`
 //! speaks, so a Tailfeather node can both receive from and send to stock
-//! clients.
+//! clients, including [`resume`] of interrupted transfers.
 //!
 //! # Authorization
 //!
 //! WireGuard authenticates the remote node; whether that node may drop files
-//! here is the caller's decision, passed as [`Peer::may_send_files`]. Stock
-//! Tailscale allows it when the sender belongs to the same user as this node
-//! (or a grant gives it the file-sharing capability) and this node has
-//! Taildrop enabled. Unauthorized peers are answered `403` before any body
-//! byte is read.
+//! here is the caller's decision, passed as [`Peer::may_send_files`] and
+//! checked before any body byte is read (`403` otherwise). Stock Tailscale
+//! decides it from the netmap: this node must hold the
+//! `https://tailscale.com/cap/file-sharing` node capability, the sender must
+//! not be an unsigned (`UnsignedPeerAPIOnly`) node, and either both nodes are
+//! untagged and owned by the same user, or packet-filter grants give the
+//! sender `https://tailscale.com/cap/file-send` toward this node.
+//! `tailfeather::netmap::Netmap::taildrop_allows_from` (with its
+//! `peer-api` feature) implements exactly that decision.
 //!
 //! # Drivers
 //!
-//! [`serve`] and [`send`] use blocking [`embedded_io`] streams;
-//! [`serve_async`] and [`send_async`] use [`embedded_io_async`]. Neither needs
-//! an executor or allocator, and both share the sans-I/O [`route`] and
-//! [`super::http`] framing. Each call handles one connection-closing
-//! exchange.
+//! [`serve`], [`send`] and [`resume_offset`] use blocking [`embedded_io`]
+//! streams; [`serve_async`], [`send_async`] and [`resume_offset_async`] use
+//! [`embedded_io_async`]. None needs an executor or allocator, and all share
+//! the sans-I/O [`route`] and [`super::http`] framing. Each call handles one
+//! connection-closing exchange.
 //!
 //! The async drivers are runtime-agnostic: wrap a Tokio or `futures` stream
 //! with the `embedded-io-adapters` crate (`FromTokio`, `FromFutures`) or a
@@ -29,19 +33,37 @@
 //! returned futures are `Send` whenever those types are, so they can be
 //! given to `tokio::spawn`.
 //!
-//! Resuming partial transfers is not supported: a resume probe (`GET` on the
-//! same path) is answered with no partial data, so senders restart from zero.
+//! # Resume
+//!
+//! A sink that keeps the partial file of an aborted upload can implement
+//! [`FileSink::read_partial`]; the receiver then answers a sender's probe
+//! with block checksums and accepts `Range: bytes=<offset>-` uploads that
+//! continue it. A sender with a seekable source calls [`resume_offset`] on
+//! one connection and then [`send`] with [`Upload::offset`] on the next.
 
 use core::net::{IpAddr, SocketAddr};
 
 use super::http::{self, BodyDecoder, Framing, Method, Request};
 
+mod blocking;
+mod nonblocking;
+pub mod resume;
+
+pub use blocking::{resume_offset, send, serve};
+pub use nonblocking::{resume_offset_async, send_async, serve_async};
+
+#[cfg(feature = "alloc")]
+mod memory;
+#[cfg(feature = "alloc")]
+pub use memory::{MemoryError, MemorySink, ReceivedFile};
+
 /// Request path prefix of the file upload endpoint.
 pub const PUT_PREFIX: &str = "/v0/put/";
 /// Longest accepted file name in bytes, matching common filesystem limits.
 pub const MAX_NAME: usize = 255;
-/// Smallest connection buffer that fits any upload head this module writes
-/// (a fully percent-escaped [`MAX_NAME`] plus fixed headers).
+/// Smallest connection buffer the client drivers accept: it fits any request
+/// head they write (a fully percent-escaped [`MAX_NAME`] plus headers), and
+/// [`resume_offset`] splits it between the response and source reads.
 pub const MIN_CLIENT_BUFFER: usize = 1024;
 const REPLY_BUFFER: usize = 256;
 
@@ -57,8 +79,9 @@ pub struct Peer {
 /// Receive-side limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    /// Larger uploads are refused with `413`, up front when the length is
-    /// declared and as soon as a chunked body exceeds it otherwise.
+    /// Larger files are refused with `413`, up front when the length is
+    /// declared and as soon as a chunked body exceeds it otherwise. A resumed
+    /// upload counts from the start of the file.
     pub max_file_size: u64,
 }
 
@@ -108,32 +131,99 @@ pub struct Incoming<'a> {
     pub from: IpAddr,
     /// Validated with [`validate_name`].
     pub name: &'a str,
-    /// The declared size; `None` for a chunked upload.
+    /// Where this upload starts in the file. Nonzero only when the sender
+    /// resumes a partial file the sink kept for it; the sink then keeps
+    /// exactly the first `offset` bytes of that partial and appends to them.
+    pub offset: u64,
+    /// The bytes this upload declares (excluding `offset`); `None` when
+    /// chunked.
     pub size: Option<u64>,
+}
+
+/// A sink's refusal to begin a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal<E> {
+    /// A finished file of this name already exists (`409 Conflict`).
+    Exists,
+    /// Anything else (`500`).
+    Failed(E),
+}
+
+impl<E> From<E> for Refusal<E> {
+    fn from(error: E) -> Self {
+        Self::Failed(error)
+    }
 }
 
 /// Blocking destination for received files, one file at a time.
 ///
 /// The driver calls [`begin`](Self::begin), any number of
 /// [`write`](Self::write)s, then exactly one of [`finish`](Self::finish) or
-/// [`abort`](Self::abort). A failed `finish` is followed by `abort`, so a sink
-/// only keeps files it finished successfully.
+/// [`abort`](Self::abort). A failed `finish` is followed by `abort`. After
+/// `abort` the sink may keep what it received as that sender's partial file,
+/// for a later resumed upload, or discard it.
 pub trait FileSink {
     type Error: core::fmt::Debug;
-    fn begin(&mut self, file: &Incoming<'_>) -> Result<(), Self::Error>;
+    fn begin(&mut self, file: &Incoming<'_>) -> Result<(), Refusal<Self::Error>>;
     fn write(&mut self, data: &[u8]) -> Result<(), Self::Error>;
     fn finish(&mut self) -> Result<(), Self::Error>;
     fn abort(&mut self);
+
+    /// Copy bytes of the partial file kept for `from` under `name`, starting
+    /// at `offset`, into `out`; `Ok(0)` at its end or when nothing is kept.
+    /// The default keeps nothing, which makes every sender start over.
+    fn read_partial(
+        &mut self,
+        from: IpAddr,
+        name: &str,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        let _ = (from, name, offset, out);
+        Ok(0)
+    }
+
+    /// Report the names of the partial files kept for `from`.
+    fn partial_names(
+        &mut self,
+        from: IpAddr,
+        each: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<(), Self::Error> {
+        let _ = (from, each);
+        Ok(())
+    }
 }
 
 /// Async counterpart of [`FileSink`], with the same call contract.
 #[allow(async_fn_in_trait)]
 pub trait AsyncFileSink {
     type Error: core::fmt::Debug;
-    async fn begin(&mut self, file: &Incoming<'_>) -> Result<(), Self::Error>;
+    async fn begin(&mut self, file: &Incoming<'_>) -> Result<(), Refusal<Self::Error>>;
     async fn write(&mut self, data: &[u8]) -> Result<(), Self::Error>;
     async fn finish(&mut self) -> Result<(), Self::Error>;
     async fn abort(&mut self);
+
+    /// See [`FileSink::read_partial`].
+    async fn read_partial(
+        &mut self,
+        from: IpAddr,
+        name: &str,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        let _ = (from, name, offset, out);
+        Ok(0)
+    }
+
+    /// See [`FileSink::partial_names`].
+    async fn partial_names(
+        &mut self,
+        from: IpAddr,
+        each: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<(), Self::Error> {
+        let _ = (from, each);
+        Ok(())
+    }
 }
 
 /// A canned response.
@@ -141,13 +231,14 @@ pub trait AsyncFileSink {
 pub enum Reply {
     /// The file was stored.
     Stored,
-    /// Answer to a resume probe: nothing partial is kept here.
-    NoPartialFile,
     BadRequest,
     InvalidName,
+    InvalidRange,
     Forbidden,
     NotFound,
     MethodNotAllowed,
+    /// A finished file of this name exists.
+    Exists,
     TooLarge,
     HeadTooLarge,
     StorageFailed,
@@ -158,11 +249,12 @@ pub enum Reply {
 impl Reply {
     pub fn status(self) -> u16 {
         match self {
-            Self::Stored | Self::NoPartialFile => 200,
-            Self::BadRequest | Self::InvalidName => 400,
+            Self::Stored => 200,
+            Self::BadRequest | Self::InvalidName | Self::InvalidRange => 400,
             Self::Forbidden => 403,
             Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
+            Self::Exists => 409,
             Self::TooLarge => 413,
             Self::HeadTooLarge => 431,
             Self::StorageFailed => 500,
@@ -174,12 +266,13 @@ impl Reply {
     fn body(self) -> &'static [u8] {
         match self {
             Self::Stored => b"{}\n",
-            Self::NoPartialFile => b"",
             Self::BadRequest => b"bad request\n",
             Self::InvalidName => b"invalid filename\n",
-            Self::Forbidden => b"Taildrop access denied\n",
+            Self::InvalidRange => b"invalid Range header\n",
+            Self::Forbidden => b"Taildrop disabled; no storage directory\n",
             Self::NotFound => b"not found\n",
-            Self::MethodNotAllowed => b"expected method PUT\n",
+            Self::MethodNotAllowed => b"expected method GET or PUT\n",
+            Self::Exists => b"file already exists\n",
             Self::TooLarge => b"file too large\n",
             Self::HeadTooLarge => b"request head too large\n",
             Self::StorageFailed => b"failed to store file\n",
@@ -200,8 +293,8 @@ impl Reply {
     /// Format the complete response into `out`.
     pub fn write(self, out: &mut [u8]) -> Result<usize, http::Error> {
         let (content_type, extra) = match self {
-            Self::Stored | Self::NoPartialFile => ("application/json", ""),
-            Self::MethodNotAllowed => ("text/plain; charset=utf-8", "Allow: PUT, GET\r\n"),
+            Self::Stored => ("application/json", ""),
+            Self::MethodNotAllowed => ("text/plain; charset=utf-8", "Allow: GET, PUT\r\n"),
             _ => ("text/plain; charset=utf-8", ""),
         };
         http::write_response(out, self.status(), content_type, extra, self.body())
@@ -216,7 +309,14 @@ pub enum Action<'n> {
         name: &'n str,
         framing: Framing,
         expect_continue: bool,
+        offset: u64,
     },
+    /// Stream block checksums of the partial file kept under this name.
+    Checksums {
+        name: &'n str,
+    },
+    /// List the partial files kept for the sender.
+    ListPartials,
     Respond(Reply),
 }
 
@@ -235,25 +335,38 @@ pub fn route<'n>(
         return Action::Respond(Reply::Forbidden);
     }
     match request.method {
-        Method::Put => {}
-        Method::Get => return Action::Respond(Reply::NoPartialFile),
+        Method::Get if segment.is_empty() => return Action::ListPartials,
+        Method::Get | Method::Put => {}
         _ => return Action::Respond(Reply::MethodNotAllowed),
     }
     let decoded = match http::unescape_segment(segment, name) {
         Some(decoded) if validate_name(decoded).is_ok() => decoded,
         _ => return Action::Respond(Reply::InvalidName),
     };
-    if request
-        .framing
-        .declared_len()
-        .is_some_and(|len| len > config.max_file_size)
-    {
+    if request.method == Method::Get {
+        return Action::Checksums { name: decoded };
+    }
+    let offset = match request.header("range") {
+        None => 0,
+        Some(value) => match resume::parse_range(value) {
+            Some(offset) => offset,
+            None => return Action::Respond(Reply::InvalidRange),
+        },
+    };
+    let too_large = match request.framing.declared_len() {
+        Some(len) => offset
+            .checked_add(len)
+            .is_none_or(|end| end > config.max_file_size),
+        None => offset > config.max_file_size,
+    };
+    if too_large {
         return Action::Respond(Reply::TooLarge);
     }
     Action::Receive {
         name: decoded,
         framing: request.framing,
         expect_continue: request.expect_continue,
+        offset,
     }
 }
 
@@ -262,10 +375,10 @@ pub fn route<'n>(
 pub enum Served {
     /// The peer closed without sending a request.
     Closed,
-    /// A non-upload request was answered with this status.
+    /// A request other than an upload was answered with this status.
     Replied(u16),
-    /// A file of this many bytes was stored and acknowledged.
-    Received { bytes: u64 },
+    /// An upload of `bytes` starting at `offset` completed the file.
+    Received { bytes: u64, offset: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,8 +387,10 @@ pub enum ServeError<E, S> {
     Io(E),
     /// The request was malformed; an error response was attempted.
     Http(http::Error),
-    /// The sink refused or failed; `500` was attempted.
+    /// The sink failed; `500` was attempted unless a response had started.
     Sink(S),
+    /// A finished file of this name exists; `409` was attempted.
+    Exists,
     /// A chunked body exceeded [`Config::max_file_size`]; `413` was attempted.
     TooLarge,
 }
@@ -286,6 +401,7 @@ impl<E: core::fmt::Debug, S: core::fmt::Debug> core::fmt::Display for ServeError
             Self::Io(error) => write!(f, "peer API stream failed: {error:?}"),
             Self::Http(error) => write!(f, "{error}"),
             Self::Sink(error) => write!(f, "Taildrop sink failed: {error:?}"),
+            Self::Exists => f.write_str("Taildrop file already exists"),
             Self::TooLarge => f.write_str("Taildrop upload exceeded the size limit"),
         }
     }
@@ -297,11 +413,13 @@ impl<E: core::fmt::Debug, S: core::fmt::Debug> core::error::Error for ServeError
 pub enum SendError<E, R> {
     /// The connection failed.
     Io(E),
-    /// Reading the file body failed.
+    /// Reading or seeking the file source failed.
     Source(R),
-    /// The body source ended before the announced size.
+    /// The source ended before the announced size.
     SourceEnded,
     InvalidName,
+    /// [`Upload::offset`] is past [`Upload::size`].
+    InvalidOffset,
     /// The buffer is smaller than [`MIN_CLIENT_BUFFER`] demands for this name,
     /// or the response was malformed.
     Http(http::Error),
@@ -316,6 +434,7 @@ impl<E: core::fmt::Debug, R: core::fmt::Debug> core::fmt::Display for SendError<
             Self::Source(error) => write!(f, "reading the file failed: {error:?}"),
             Self::SourceEnded => f.write_str("file ended before its announced size"),
             Self::InvalidName => f.write_str("invalid Taildrop file name"),
+            Self::InvalidOffset => f.write_str("resume offset past the end of the file"),
             Self::Http(error) => write!(f, "{error}"),
             Self::Rejected(status) => write!(f, "receiver rejected the file with HTTP {status}"),
         }
@@ -330,22 +449,94 @@ pub struct Upload<'a> {
     /// The receiver's tailnet address and advertised peer API port.
     pub peer_api: SocketAddr,
     pub name: &'a str,
-    /// Exact number of body bytes the source will provide.
+    /// The whole file's size.
     pub size: u64,
+    /// Resume here (from [`resume_offset`]); the source must be positioned at
+    /// this byte and provide `size - offset` more. Zero sends everything.
+    pub offset: u64,
 }
 
 /// Format the upload request head. It asks for `100 Continue`, so a refusal
-/// (`403`, `413`, ...) arrives before any file byte is sent.
+/// (`403`, `409`, `413`, ...) arrives before any file byte is sent.
 pub fn write_upload_head(upload: &Upload<'_>, out: &mut [u8]) -> Result<usize, http::Error> {
+    let remaining = upload
+        .size
+        .checked_sub(upload.offset)
+        .ok_or(http::Error::Malformed)?;
     let mut cursor = http::Cursor::new(out);
     cursor.bytes(b"PUT ")?;
     cursor.bytes(PUT_PREFIX.as_bytes())?;
     http::escape_segment(upload.name, &mut cursor)?;
     cursor.args(format_args!(
-        " HTTP/1.1\r\nHost: {}\r\nUser-Agent: tailfeather\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
-        upload.peer_api, upload.size,
+        " HTTP/1.1\r\nHost: {}\r\nUser-Agent: tailfeather\r\nContent-Length: {remaining}\r\n",
+        upload.peer_api,
+    ))?;
+    if upload.offset != 0 {
+        cursor.args(format_args!("Range: bytes={}-\r\n", upload.offset))?;
+    }
+    cursor.bytes(b"Expect: 100-continue\r\nConnection: close\r\n\r\n")?;
+    Ok(cursor.len())
+}
+
+/// Format the resume probe for `name`: a `GET` of its block checksums.
+pub fn write_probe_head(
+    peer_api: SocketAddr,
+    name: &str,
+    out: &mut [u8],
+) -> Result<usize, http::Error> {
+    let mut cursor = http::Cursor::new(out);
+    cursor.bytes(b"GET ")?;
+    cursor.bytes(PUT_PREFIX.as_bytes())?;
+    http::escape_segment(name, &mut cursor)?;
+    cursor.args(format_args!(
+        " HTTP/1.1\r\nHost: {peer_api}\r\nUser-Agent: tailfeather\r\nConnection: close\r\n\r\n",
     ))?;
     Ok(cursor.len())
+}
+
+/// Head of a checksum stream; the body runs until the connection closes.
+const CHECKSUMS_HEAD: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+
+/// Builds the partial-file listing, a JSON array of names, in a buffer.
+struct PartialList<'a> {
+    cursor: http::Cursor<'a>,
+    first: bool,
+    result: Result<(), http::Error>,
+}
+
+impl<'a> PartialList<'a> {
+    fn new(out: &'a mut [u8]) -> Self {
+        let mut cursor = http::Cursor::new(out);
+        let result = cursor.bytes(b"[");
+        Self {
+            cursor,
+            first: true,
+            result,
+        }
+    }
+
+    fn push(&mut self, name: &str) {
+        let open: &[u8] = if self.first { b"\"" } else { b",\"" };
+        self.first = false;
+        let cursor = &mut self.cursor;
+        let mut result = core::mem::replace(&mut self.result, Ok(()));
+        result = result.and_then(|()| cursor.bytes(open));
+        // JSON needs escapes only for quotes here: `validate_name` already
+        // excludes backslashes and control characters.
+        for byte in name.bytes() {
+            let escaped: &[u8] = if byte == b'"' { b"\\\"" } else { &[byte] };
+            result = result.and_then(|()| cursor.bytes(escaped));
+        }
+        self.result = result.and_then(|()| cursor.bytes(b"\""));
+    }
+
+    /// The listing's length in the buffer.
+    fn finish(mut self) -> Result<usize, http::Error> {
+        self.result?;
+        self.cursor.bytes(b"]\n")?;
+        Ok(self.cursor.len())
+    }
 }
 
 enum HeadError<E> {
@@ -353,7 +544,7 @@ enum HeadError<E> {
     Http(http::Error),
 }
 
-/// Shared tail of both drivers' head reads: `Ok(None)` while more input is
+/// Shared tail of the drivers' head reads: `Ok(None)` while more input is
 /// needed, the head length once complete.
 fn head_progress(buf: &[u8], filled: usize) -> Result<Option<usize>, http::Error> {
     if let Some(len) = http::head_len(&buf[..filled]) {
@@ -370,454 +561,24 @@ fn body_step<'a>(
     decoder: &mut BodyDecoder,
     input: &'a [u8],
     received: &mut u64,
-    config: &Config,
+    limit: u64,
 ) -> Result<http::Decoded<'a>, Reply> {
     let step = decoder.decode(input).map_err(|_| Reply::BadRequest)?;
     *received += step.data.len() as u64;
-    if *received > config.max_file_size {
+    if *received > limit {
         return Err(Reply::TooLarge);
     }
     Ok(step)
 }
 
-mod blocking {
-    use embedded_io::{Read, Write};
-
-    use super::*;
-
-    fn read_head<IO: Read>(
-        io: &mut IO,
-        buf: &mut [u8],
-    ) -> Result<Option<(usize, usize)>, HeadError<IO::Error>> {
-        let mut filled = 0;
-        loop {
-            if let Some(head) = head_progress(buf, filled).map_err(HeadError::Http)? {
-                return Ok(Some((head, filled)));
-            }
-            let read = io.read(&mut buf[filled..]).map_err(HeadError::Io)?;
-            if read == 0 {
-                return if filled == 0 {
-                    Ok(None)
-                } else {
-                    Err(HeadError::Http(http::Error::UnexpectedEof))
-                };
-            }
-            filled += read;
-        }
-    }
-
-    fn reply<IO: Write>(io: &mut IO, reply: Reply) -> Result<(), IO::Error> {
-        let mut out = [0u8; REPLY_BUFFER];
-        // Every canned reply fits the fixed buffer; covered by a unit test.
-        let len = reply.write(&mut out).unwrap_or(0);
-        io.write_all(&out[..len])?;
-        io.flush()
-    }
-
-    /// Serve one Taildrop request on a blocking stream.
-    ///
-    /// `buf` holds the request head and then body reads; 1–2 KiB is plenty,
-    /// and heads larger than it are refused with `431`.
-    pub fn serve<IO, S>(
-        io: &mut IO,
-        peer: &Peer,
-        config: &Config,
-        sink: &mut S,
-        buf: &mut [u8],
-    ) -> Result<Served, ServeError<IO::Error, S::Error>>
-    where
-        IO: Read + Write,
-        S: FileSink,
-    {
-        let (head, filled) = match read_head(io, buf) {
-            Ok(Some(head)) => head,
-            Ok(None) => return Ok(Served::Closed),
-            Err(HeadError::Io(error)) => return Err(ServeError::Io(error)),
-            Err(HeadError::Http(error)) => {
-                let _ = reply(io, Reply::for_error(error));
-                return Err(ServeError::Http(error));
-            }
-        };
-        let mut name = [0u8; MAX_NAME];
-        let action = match http::parse_request(&buf[..head]) {
-            Ok(request) => route(&request, peer, config, &mut name),
-            Err(error) => {
-                let _ = reply(io, Reply::for_error(error));
-                return Err(ServeError::Http(error));
-            }
-        };
-        let (name, framing, expect_continue) = match action {
-            Action::Respond(answer) => {
-                reply(io, answer).map_err(ServeError::Io)?;
-                return Ok(Served::Replied(answer.status()));
-            }
-            Action::Receive {
-                name,
-                framing,
-                expect_continue,
-            } => (name, framing, expect_continue),
-        };
-        let incoming = Incoming {
-            from: peer.addr,
-            name,
-            size: framing.declared_len(),
-        };
-        if let Err(error) = sink.begin(&incoming) {
-            let _ = reply(io, Reply::StorageFailed);
-            return Err(ServeError::Sink(error));
-        }
-        if expect_continue
-            && let Err(error) = io.write_all(http::CONTINUE).and_then(|()| io.flush())
-        {
-            sink.abort();
-            return Err(ServeError::Io(error));
-        }
-
-        let mut decoder = BodyDecoder::new(framing);
-        let mut received = 0;
-        let (mut start, mut end) = (head, filled);
-        while !decoder.is_done() {
-            if start == end {
-                match io.read(buf) {
-                    Ok(0) => {
-                        sink.abort();
-                        return Err(ServeError::Http(http::Error::UnexpectedEof));
-                    }
-                    Ok(read) => (start, end) = (0, read),
-                    Err(error) => {
-                        sink.abort();
-                        return Err(ServeError::Io(error));
-                    }
-                }
-            }
-            let step = match body_step(&mut decoder, &buf[start..end], &mut received, config) {
-                Ok(step) => step,
-                Err(answer) => {
-                    sink.abort();
-                    let _ = reply(io, answer);
-                    return Err(if answer == Reply::TooLarge {
-                        ServeError::TooLarge
-                    } else {
-                        ServeError::Http(http::Error::BadChunk)
-                    });
-                }
-            };
-            start += step.consumed;
-            if !step.data.is_empty()
-                && let Err(error) = sink.write(step.data)
-            {
-                sink.abort();
-                let _ = reply(io, Reply::StorageFailed);
-                return Err(ServeError::Sink(error));
-            }
-        }
-        if let Err(error) = sink.finish() {
-            sink.abort();
-            let _ = reply(io, Reply::StorageFailed);
-            return Err(ServeError::Sink(error));
-        }
-        reply(io, Reply::Stored).map_err(ServeError::Io)?;
-        Ok(Served::Received { bytes: received })
-    }
-
-    /// Send one file to a peer over a connected blocking stream.
-    ///
-    /// `buf` must hold the request head (see [`MIN_CLIENT_BUFFER`]) and is
-    /// reused to copy the body. The receiver must honour
-    /// `Expect: 100-continue`, as Go's `net/http` (stock Tailscale) and
-    /// [`serve`] do.
-    pub fn send<IO, R>(
-        io: &mut IO,
-        upload: &Upload<'_>,
-        body: &mut R,
-        buf: &mut [u8],
-    ) -> Result<(), SendError<IO::Error, R::Error>>
-    where
-        IO: Read + Write,
-        R: Read,
-    {
-        validate_name(upload.name).map_err(|_| SendError::InvalidName)?;
-        let len = write_upload_head(upload, buf).map_err(SendError::Http)?;
-        io.write_all(&buf[..len]).map_err(SendError::Io)?;
-        io.flush().map_err(SendError::Io)?;
-        let status = response_status(io, buf)?;
-        if status != 100 {
-            return Err(SendError::Rejected(status));
-        }
-
-        let mut remaining = upload.size;
-        while remaining > 0 {
-            let want = super::http_clamp(remaining, buf.len());
-            let read = body.read(&mut buf[..want]).map_err(SendError::Source)?;
-            if read == 0 {
-                return Err(SendError::SourceEnded);
-            }
-            io.write_all(&buf[..read]).map_err(SendError::Io)?;
-            remaining -= read as u64;
-        }
-        io.flush().map_err(SendError::Io)?;
-        match response_status(io, buf)? {
-            200 => Ok(()),
-            status => Err(SendError::Rejected(status)),
-        }
-    }
-
-    /// Read one response head. A final (non-1xx) response's body is drained,
-    /// so the receiver can finish writing before the caller closes.
-    fn response_status<IO: Read + Write, R>(
-        io: &mut IO,
-        buf: &mut [u8],
-    ) -> Result<u16, SendError<IO::Error, R>> {
-        let (head, filled) = match read_head(io, buf) {
-            Ok(Some(head)) => head,
-            Ok(None) => return Err(SendError::Http(http::Error::UnexpectedEof)),
-            Err(HeadError::Io(error)) => return Err(SendError::Io(error)),
-            Err(HeadError::Http(error)) => return Err(SendError::Http(error)),
-        };
-        let response = http::parse_response(&buf[..head]).map_err(SendError::Http)?;
-        if response.status < 200 {
-            return Ok(response.status);
-        }
-        let mut drain = Drain::new(response.framing);
-        let mut pending = head..filled;
-        loop {
-            drain.feed(&buf[pending]).map_err(SendError::Http)?;
-            if drain.is_done() {
-                return Ok(response.status);
-            }
-            let read = io.read(buf).map_err(SendError::Io)?;
-            if read == 0 {
-                return drain
-                    .at_eof()
-                    .map(|()| response.status)
-                    .map_err(SendError::Http);
-            }
-            pending = 0..read;
-        }
-    }
-}
-
-mod nonblocking {
-    use embedded_io_async::{Read, Write};
-
-    use super::*;
-
-    async fn read_head<IO: Read>(
-        io: &mut IO,
-        buf: &mut [u8],
-    ) -> Result<Option<(usize, usize)>, HeadError<IO::Error>> {
-        let mut filled = 0;
-        loop {
-            if let Some(head) = head_progress(buf, filled).map_err(HeadError::Http)? {
-                return Ok(Some((head, filled)));
-            }
-            let read = io.read(&mut buf[filled..]).await.map_err(HeadError::Io)?;
-            if read == 0 {
-                return if filled == 0 {
-                    Ok(None)
-                } else {
-                    Err(HeadError::Http(http::Error::UnexpectedEof))
-                };
-            }
-            filled += read;
-        }
-    }
-
-    async fn reply<IO: Write>(io: &mut IO, reply: Reply) -> Result<(), IO::Error> {
-        let mut out = [0u8; REPLY_BUFFER];
-        let len = reply.write(&mut out).unwrap_or(0);
-        io.write_all(&out[..len]).await?;
-        io.flush().await
-    }
-
-    /// Async [`serve`](super::serve): serve one Taildrop request.
-    pub async fn serve_async<IO, S>(
-        io: &mut IO,
-        peer: &Peer,
-        config: &Config,
-        sink: &mut S,
-        buf: &mut [u8],
-    ) -> Result<Served, ServeError<IO::Error, S::Error>>
-    where
-        IO: Read + Write,
-        S: AsyncFileSink,
-    {
-        let (head, filled) = match read_head(io, buf).await {
-            Ok(Some(head)) => head,
-            Ok(None) => return Ok(Served::Closed),
-            Err(HeadError::Io(error)) => return Err(ServeError::Io(error)),
-            Err(HeadError::Http(error)) => {
-                let _ = reply(io, Reply::for_error(error)).await;
-                return Err(ServeError::Http(error));
-            }
-        };
-        let mut name = [0u8; MAX_NAME];
-        let action = match http::parse_request(&buf[..head]) {
-            Ok(request) => route(&request, peer, config, &mut name),
-            Err(error) => {
-                let _ = reply(io, Reply::for_error(error)).await;
-                return Err(ServeError::Http(error));
-            }
-        };
-        let (name, framing, expect_continue) = match action {
-            Action::Respond(answer) => {
-                reply(io, answer).await.map_err(ServeError::Io)?;
-                return Ok(Served::Replied(answer.status()));
-            }
-            Action::Receive {
-                name,
-                framing,
-                expect_continue,
-            } => (name, framing, expect_continue),
-        };
-        let incoming = Incoming {
-            from: peer.addr,
-            name,
-            size: framing.declared_len(),
-        };
-        if let Err(error) = sink.begin(&incoming).await {
-            let _ = reply(io, Reply::StorageFailed).await;
-            return Err(ServeError::Sink(error));
-        }
-        if expect_continue {
-            let sent = match io.write_all(http::CONTINUE).await {
-                Ok(()) => io.flush().await,
-                Err(error) => Err(error),
-            };
-            if let Err(error) = sent {
-                sink.abort().await;
-                return Err(ServeError::Io(error));
-            }
-        }
-
-        let mut decoder = BodyDecoder::new(framing);
-        let mut received = 0;
-        let (mut start, mut end) = (head, filled);
-        while !decoder.is_done() {
-            if start == end {
-                match io.read(buf).await {
-                    Ok(0) => {
-                        sink.abort().await;
-                        return Err(ServeError::Http(http::Error::UnexpectedEof));
-                    }
-                    Ok(read) => (start, end) = (0, read),
-                    Err(error) => {
-                        sink.abort().await;
-                        return Err(ServeError::Io(error));
-                    }
-                }
-            }
-            let step = match body_step(&mut decoder, &buf[start..end], &mut received, config) {
-                Ok(step) => step,
-                Err(answer) => {
-                    sink.abort().await;
-                    let _ = reply(io, answer).await;
-                    return Err(if answer == Reply::TooLarge {
-                        ServeError::TooLarge
-                    } else {
-                        ServeError::Http(http::Error::BadChunk)
-                    });
-                }
-            };
-            start += step.consumed;
-            if !step.data.is_empty()
-                && let Err(error) = sink.write(step.data).await
-            {
-                sink.abort().await;
-                let _ = reply(io, Reply::StorageFailed).await;
-                return Err(ServeError::Sink(error));
-            }
-        }
-        if let Err(error) = sink.finish().await {
-            sink.abort().await;
-            let _ = reply(io, Reply::StorageFailed).await;
-            return Err(ServeError::Sink(error));
-        }
-        reply(io, Reply::Stored).await.map_err(ServeError::Io)?;
-        Ok(Served::Received { bytes: received })
-    }
-
-    /// Async [`send`](super::send): send one file to a peer.
-    pub async fn send_async<IO, R>(
-        io: &mut IO,
-        upload: &Upload<'_>,
-        body: &mut R,
-        buf: &mut [u8],
-    ) -> Result<(), SendError<IO::Error, R::Error>>
-    where
-        IO: Read + Write,
-        R: Read,
-    {
-        validate_name(upload.name).map_err(|_| SendError::InvalidName)?;
-        let len = write_upload_head(upload, buf).map_err(SendError::Http)?;
-        io.write_all(&buf[..len]).await.map_err(SendError::Io)?;
-        io.flush().await.map_err(SendError::Io)?;
-        let status = response_status(io, buf).await?;
-        if status != 100 {
-            return Err(SendError::Rejected(status));
-        }
-
-        let mut remaining = upload.size;
-        while remaining > 0 {
-            let want = super::http_clamp(remaining, buf.len());
-            let read = body
-                .read(&mut buf[..want])
-                .await
-                .map_err(SendError::Source)?;
-            if read == 0 {
-                return Err(SendError::SourceEnded);
-            }
-            io.write_all(&buf[..read]).await.map_err(SendError::Io)?;
-            remaining -= read as u64;
-        }
-        io.flush().await.map_err(SendError::Io)?;
-        match response_status(io, buf).await? {
-            200 => Ok(()),
-            status => Err(SendError::Rejected(status)),
-        }
-    }
-
-    async fn response_status<IO: Read + Write, R>(
-        io: &mut IO,
-        buf: &mut [u8],
-    ) -> Result<u16, SendError<IO::Error, R>> {
-        let (head, filled) = match read_head(io, buf).await {
-            Ok(Some(head)) => head,
-            Ok(None) => return Err(SendError::Http(http::Error::UnexpectedEof)),
-            Err(HeadError::Io(error)) => return Err(SendError::Io(error)),
-            Err(HeadError::Http(error)) => return Err(SendError::Http(error)),
-        };
-        let response = http::parse_response(&buf[..head]).map_err(SendError::Http)?;
-        if response.status < 200 {
-            return Ok(response.status);
-        }
-        let mut drain = Drain::new(response.framing);
-        let mut pending = head..filled;
-        loop {
-            drain.feed(&buf[pending]).map_err(SendError::Http)?;
-            if drain.is_done() {
-                return Ok(response.status);
-            }
-            let read = io.read(buf).await.map_err(SendError::Io)?;
-            if read == 0 {
-                return drain
-                    .at_eof()
-                    .map(|()| response.status)
-                    .map_err(SendError::Http);
-            }
-            pending = 0..read;
-        }
-    }
-}
-
-/// Discards a response body. A response without length framing runs to the
-/// end of the stream, which is how a `Connection: close` reply may end.
-struct Drain {
+/// A response body: framed, or running to the end of the stream, which is
+/// how a `Connection: close` reply without length framing ends.
+struct ResponseBody {
     decoder: BodyDecoder,
     until_close: bool,
 }
 
-impl Drain {
+impl ResponseBody {
     fn new(framing: Framing) -> Self {
         Self {
             decoder: BodyDecoder::new(framing),
@@ -829,14 +590,14 @@ impl Drain {
         !self.until_close && self.decoder.is_done()
     }
 
-    /// Discard the body bytes in `input`; anything after the body is ignored
-    /// because the exchange closes the connection.
-    fn feed(&mut self, mut input: &[u8]) -> Result<(), http::Error> {
-        while !self.until_close && !input.is_empty() && !self.decoder.is_done() {
-            let step = self.decoder.decode(input)?;
-            input = &input[step.consumed..];
+    fn decode<'a>(&mut self, input: &'a [u8]) -> Result<http::Decoded<'a>, http::Error> {
+        if self.until_close {
+            return Ok(http::Decoded {
+                consumed: input.len(),
+                data: input,
+            });
         }
-        Ok(())
+        self.decoder.decode(input)
     }
 
     fn at_eof(&self) -> Result<(), http::Error> {
@@ -848,17 +609,9 @@ impl Drain {
     }
 }
 
-fn http_clamp(remaining: u64, available: usize) -> usize {
+fn clamp(remaining: u64, available: usize) -> usize {
     usize::try_from(remaining).map_or(available, |remaining| remaining.min(available))
 }
-
-pub use blocking::{send, serve};
-pub use nonblocking::{send_async, serve_async};
-
-#[cfg(feature = "alloc")]
-mod memory;
-#[cfg(feature = "alloc")]
-pub use memory::{MemoryError, MemorySink, ReceivedFile};
 
 #[cfg(test)]
 mod tests;

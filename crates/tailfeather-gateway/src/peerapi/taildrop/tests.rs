@@ -105,7 +105,7 @@ struct Full;
 impl FileSink for ArraySink {
     type Error = Full;
 
-    fn begin(&mut self, file: &Incoming<'_>) -> Result<(), Full> {
+    fn begin(&mut self, file: &Incoming<'_>) -> Result<(), Refusal<Full>> {
         self.begun += 1;
         self.name[..file.name.len()].copy_from_slice(file.name.as_bytes());
         self.name_len = file.name.len();
@@ -137,7 +137,7 @@ impl FileSink for ArraySink {
 impl AsyncFileSink for ArraySink {
     type Error = Full;
 
-    async fn begin(&mut self, file: &Incoming<'_>) -> Result<(), Full> {
+    async fn begin(&mut self, file: &Incoming<'_>) -> Result<(), Refusal<Full>> {
         FileSink::begin(self, file)
     }
 
@@ -167,9 +167,10 @@ fn body_of(written: &[u8]) -> &[u8] {
 fn every_canned_reply_fits_the_reply_buffer() {
     for reply in [
         Reply::Stored,
-        Reply::NoPartialFile,
         Reply::BadRequest,
         Reply::InvalidName,
+        Reply::InvalidRange,
+        Reply::Exists,
         Reply::Forbidden,
         Reply::NotFound,
         Reply::MethodNotAllowed,
@@ -212,7 +213,7 @@ fn route_of(head: &[u8], peer: &Peer, config: &Config) -> Option<Reply> {
     let request = http::parse_request(head).unwrap();
     match route(&request, peer, config, &mut [0; MAX_NAME]) {
         Action::Respond(reply) => Some(reply),
-        Action::Receive { .. } => None,
+        Action::Receive { .. } | Action::Checksums { .. } | Action::ListPartials => None,
     }
 }
 
@@ -230,13 +231,39 @@ fn routes_before_reading_any_body() {
         route_of(b"PUT /v0/other HTTP/1.1\r\n\r\n", &PEER, &config),
         Some(Reply::NotFound)
     );
+    // Resume probes and listings are routed to their streaming handlers.
+    let request = http::parse_request(b"GET /v0/put/a%20b HTTP/1.1\r\n\r\n").unwrap();
+    assert_eq!(
+        route(&request, &PEER, &config, &mut [0; MAX_NAME]),
+        Action::Checksums { name: "a b" }
+    );
+    let request = http::parse_request(b"GET /v0/put/ HTTP/1.1\r\n\r\n").unwrap();
+    assert_eq!(
+        route(&request, &PEER, &config, &mut [0; MAX_NAME]),
+        Action::ListPartials
+    );
     assert_eq!(
         route_of(
-            b"GET /v0/put/a.txt?offset=0 HTTP/1.1\r\n\r\n",
+            b"PUT /v0/put/a.txt HTTP/1.1\r\nRange: bytes=1-2\r\n\r\n",
             &PEER,
             &config
         ),
-        Some(Reply::NoPartialFile)
+        Some(Reply::InvalidRange)
+    );
+    let resumed = b"PUT /v0/put/a.txt HTTP/1.1\r\nRange: bytes=8-\r\nContent-Length: 3\r\n\r\n";
+    assert_eq!(route_of(resumed, &PEER, &config), Some(Reply::TooLarge));
+    let request = http::parse_request(
+        b"PUT /v0/put/a.txt HTTP/1.1\r\nRange: bytes=4-\r\nContent-Length: 3\r\n\r\n",
+    )
+    .unwrap();
+    assert_eq!(
+        route(&request, &PEER, &config, &mut [0; MAX_NAME]),
+        Action::Receive {
+            name: "a.txt",
+            framing: Framing::Length(3),
+            expect_continue: false,
+            offset: 4,
+        }
     );
     assert_eq!(
         route_of(b"DELETE /v0/put/a.txt HTTP/1.1\r\n\r\n", &PEER, &config),
@@ -265,7 +292,13 @@ fn receives_a_go_style_upload_split_across_reads() {
     let mut sink = ArraySink::default();
     let mut buf = [0u8; 512];
     let served = serve(&mut io, &PEER, &Config::default(), &mut sink, &mut buf).unwrap();
-    assert_eq!(served, Served::Received { bytes: 11 });
+    assert_eq!(
+        served,
+        Served::Received {
+            bytes: 11,
+            offset: 0
+        }
+    );
     assert_eq!(sink.name(), "hello world.txt");
     assert_eq!(sink.size, Some(11));
     assert_eq!(sink.data(), b"hello world");
@@ -284,7 +317,13 @@ fn receives_chunked_uploads_after_100_continue() {
     let mut sink = ArraySink::default();
     let mut buf = [0u8; 256];
     let served = serve(&mut io, &PEER, &Config::default(), &mut sink, &mut buf).unwrap();
-    assert_eq!(served, Served::Received { bytes: 6 });
+    assert_eq!(
+        served,
+        Served::Received {
+            bytes: 6,
+            offset: 0
+        }
+    );
     assert_eq!(sink.size, None);
     assert_eq!(sink.data(), b"abcdef");
     assert!(io.written.starts_with(http::CONTINUE));
@@ -407,6 +446,7 @@ fn sends_an_upload_and_reads_the_acknowledgement() {
         peer_api: RECEIVER,
         name: "a b.txt",
         size: 5,
+        offset: 0,
     };
     let mut body: &[u8] = b"hello";
     send(&mut io, &upload, &mut body, &mut [0; MIN_CLIENT_BUFFER]).unwrap();
@@ -422,6 +462,7 @@ fn stops_before_the_body_when_refused() {
         peer_api: RECEIVER,
         name: "a",
         size: 5,
+        offset: 0,
     };
     let mut body: &[u8] = b"hello";
     let error = send(&mut io, &upload, &mut body, &mut [0; MIN_CLIENT_BUFFER]).unwrap_err();
@@ -437,6 +478,7 @@ fn rejects_short_sources_and_bad_names() {
         peer_api: RECEIVER,
         name: "a",
         size: 9,
+        offset: 0,
     };
     let mut body: &[u8] = b"short";
     let error = send(&mut io, &upload, &mut body, &mut [0; MIN_CLIENT_BUFFER]).unwrap_err();
@@ -463,6 +505,7 @@ fn the_longest_escaped_name_fits_the_minimum_client_buffer() {
         peer_api: SocketAddr::new(IpAddr::V6(core::net::Ipv6Addr::LOCALHOST), 65535),
         name: &name,
         size: u64::MAX,
+        offset: 0,
     };
     write_upload_head(&upload, &mut [0; MIN_CLIENT_BUFFER]).unwrap();
 }
@@ -533,6 +576,7 @@ fn async_drivers_round_trip_on_a_multithreaded_tokio_runtime() {
                 peer_api: RECEIVER,
                 name: "photo #1.jpg",
                 size: 26,
+                offset: 0,
             };
             let mut body: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
             send_async(&mut io, &upload, &mut body, &mut [0; MIN_CLIENT_BUFFER]).await
@@ -540,7 +584,13 @@ fn async_drivers_round_trip_on_a_multithreaded_tokio_runtime() {
 
         client.await.unwrap().unwrap();
         let (served, sink) = server.await.unwrap();
-        assert_eq!(served, Served::Received { bytes: 26 });
+        assert_eq!(
+            served,
+            Served::Received {
+                bytes: 26,
+                offset: 0
+            }
+        );
         assert_eq!(sink.name(), "photo #1.jpg");
         assert_eq!(sink.data(), b"abcdefghijklmnopqrstuvwxyz");
     });
@@ -579,6 +629,7 @@ fn async_server_refuses_like_the_blocking_one() {
                 peer_api: RECEIVER,
                 name: "a",
                 size: 3,
+                offset: 0,
             };
             let mut body: &[u8] = b"abc";
             send_async(&mut io, &upload, &mut body, &mut [0; MIN_CLIENT_BUFFER]).await
@@ -593,22 +644,403 @@ fn async_server_refuses_like_the_blocking_one() {
 #[cfg(feature = "alloc")]
 #[test]
 fn memory_sink_keeps_finished_files_within_budget() {
-    let segments: &[&[u8]] = &[b"PUT /v0/put/a.txt HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc"];
+    let upload = |name: &str| {
+        std::format!("PUT /v0/put/{name} HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc").into_bytes()
+    };
     let mut sink = MemorySink::new(5);
+    let first = upload("a.txt");
+    let segments: &[&[u8]] = &[&first];
     let mut io = Script::new(segments);
     serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap();
     assert_eq!(sink.files().len(), 1);
     assert_eq!(sink.files()[0].name, "a.txt");
     assert_eq!(sink.files()[0].data, b"abc");
 
+    // A second file of the same name conflicts, as in stock Tailscale.
+    let segments: &[&[u8]] = &[&first];
+    let mut io = Script::new(segments);
+    let error = serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap_err();
+    assert_eq!(error, ServeError::Exists);
+    assert_eq!(status_of(&io.written), 409);
+
     // Only two bytes of budget remain.
+    let second = upload("b.txt");
+    let segments: &[&[u8]] = &[&second];
     let mut io = Script::new(segments);
     let error = serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap_err();
     assert_eq!(error, ServeError::Sink(MemoryError::OverBudget));
     assert_eq!(status_of(&io.written), 500);
 
-    let files = sink.take();
-    assert_eq!(files.len(), 1);
+    assert_eq!(sink.take().len(), 1);
+    let segments: &[&[u8]] = &[&second];
     let mut io = Script::new(segments);
     serve(&mut io, &PEER, &Config::default(), &mut sink, &mut [0; 256]).unwrap();
+}
+
+/// Deterministic file content for the resume tests.
+#[cfg(feature = "alloc")]
+fn content(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 % 251) as u8).collect()
+}
+
+/// A seekable source that fails reads at `fail_at`, like a dropped link.
+struct Source<'a> {
+    data: &'a [u8],
+    pos: usize,
+    fail_at: Option<usize>,
+}
+
+impl<'a> Source<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+            fail_at: None,
+        }
+    }
+
+    fn step(&mut self, buf: &mut [u8]) -> Result<usize, embedded_io::ErrorKind> {
+        let end = self.fail_at.unwrap_or(self.data.len()).min(self.data.len());
+        if self.pos >= end && self.fail_at.is_some() {
+            return Err(embedded_io::ErrorKind::BrokenPipe);
+        }
+        let len = buf.len().min(end - self.pos);
+        buf[..len].copy_from_slice(&self.data[self.pos..self.pos + len]);
+        self.pos += len;
+        Ok(len)
+    }
+
+    fn reposition(&mut self, pos: embedded_io::SeekFrom) -> Result<u64, embedded_io::ErrorKind> {
+        let embedded_io::SeekFrom::Start(pos) = pos else {
+            return Err(embedded_io::ErrorKind::Unsupported);
+        };
+        self.pos = pos as usize;
+        Ok(pos)
+    }
+}
+
+impl embedded_io::ErrorType for Source<'_> {
+    type Error = embedded_io::ErrorKind;
+}
+
+impl embedded_io::Read for Source<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.step(buf)
+    }
+}
+
+impl embedded_io::Seek for Source<'_> {
+    fn seek(&mut self, pos: embedded_io::SeekFrom) -> Result<u64, Self::Error> {
+        self.reposition(pos)
+    }
+}
+
+impl embedded_io_async::Read for Source<'_> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.step(buf)
+    }
+}
+
+impl embedded_io_async::Seek for Source<'_> {
+    async fn seek(&mut self, pos: embedded_io::SeekFrom) -> Result<u64, Self::Error> {
+        self.reposition(pos)
+    }
+}
+
+/// A sink holding a 70,000-byte partial of `photo.jpg` from [`PEER`],
+/// left by an upload of 100,000 bytes that broke off.
+#[cfg(feature = "alloc")]
+fn sink_with_partial(data: &[u8]) -> MemorySink {
+    let mut sink = MemorySink::new(1 << 20);
+    let head = b"PUT /v0/put/photo.jpg HTTP/1.1\r\nContent-Length: 100000\r\n\r\n";
+    let segments: &[&[u8]] = &[head, &data[..70_000]];
+    let mut io = Script::new(segments);
+    let error = serve(
+        &mut io,
+        &PEER,
+        &Config::default(),
+        &mut sink,
+        &mut [0; 4096],
+    )
+    .unwrap_err();
+    assert_eq!(error, ServeError::Http(http::Error::UnexpectedEof));
+    assert_eq!(sink.partials()[0].data.len(), 70_000);
+    sink
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn streams_block_checksums_of_a_kept_partial() {
+    use sha2::{Digest, Sha256};
+
+    let data = content(100_000);
+    let mut sink = sink_with_partial(&data);
+    let mut io = Script::new(&[b"GET /v0/put/photo.jpg HTTP/1.1\r\n\r\n"]);
+    let served = serve(
+        &mut io,
+        &PEER,
+        &Config::default(),
+        &mut sink,
+        &mut [0; 1500],
+    )
+    .unwrap();
+    assert_eq!(served, Served::Replied(200));
+    let body = core::str::from_utf8(body_of(&io.written)).unwrap();
+    let hex = |bytes: &[u8]| {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| std::format!("{byte:02x}"))
+            .collect::<std::string::String>()
+    };
+    // Go's json.Encoder output for the two blocks of the 70,000-byte partial.
+    let expected = std::format!(
+        "{{\"checksum\":\"{}\",\"algo\":\"sha256\",\"size\":65536}}\n{{\"checksum\":\"{}\",\"algo\":\"sha256\",\"size\":4464}}\n",
+        hex(&data[..65_536]),
+        hex(&data[65_536..70_000]),
+    );
+    assert_eq!(body, expected);
+
+    // Another sender sees no partial file: an empty stream.
+    let stranger = Peer {
+        addr: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 99)),
+        ..PEER
+    };
+    let mut io = Script::new(&[b"GET /v0/put/photo.jpg HTTP/1.1\r\n\r\n"]);
+    serve(
+        &mut io,
+        &stranger,
+        &Config::default(),
+        &mut sink,
+        &mut [0; 1500],
+    )
+    .unwrap();
+    assert!(body_of(&io.written).is_empty());
+
+    let mut io = Script::new(&[b"GET /v0/put/ HTTP/1.1\r\n\r\n"]);
+    serve(
+        &mut io,
+        &PEER,
+        &Config::default(),
+        &mut sink,
+        &mut [0; 1500],
+    )
+    .unwrap();
+    assert_eq!(body_of(&io.written), b"[\"photo.jpg\"]\n");
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn ranged_upload_completes_the_kept_partial() {
+    let data = content(100_000);
+    let mut sink = sink_with_partial(&data);
+    let head =
+        b"PUT /v0/put/photo.jpg HTTP/1.1\r\nRange: bytes=70000-\r\nContent-Length: 30000\r\n\r\n";
+    let segments: &[&[u8]] = &[head, &data[70_000..]];
+    let mut io = Script::new(segments);
+    let served = serve(
+        &mut io,
+        &PEER,
+        &Config::default(),
+        &mut sink,
+        &mut [0; 4096],
+    )
+    .unwrap();
+    assert_eq!(
+        served,
+        Served::Received {
+            bytes: 30_000,
+            offset: 70_000
+        }
+    );
+    assert_eq!(sink.files()[0].data, data);
+    assert!(sink.partials().is_empty());
+
+    // Resuming past what was kept is refused, and the partial survives.
+    let mut sink = sink_with_partial(&data);
+    let head =
+        b"PUT /v0/put/photo.jpg HTTP/1.1\r\nRange: bytes=80000-\r\nContent-Length: 20000\r\n\r\n";
+    let segments: &[&[u8]] = &[head, &data[80_000..]];
+    let mut io = Script::new(segments);
+    let error = serve(
+        &mut io,
+        &PEER,
+        &Config::default(),
+        &mut sink,
+        &mut [0; 4096],
+    )
+    .unwrap_err();
+    assert_eq!(error, ServeError::Sink(MemoryError::BadOffset));
+    assert_eq!(sink.partials()[0].data.len(), 70_000);
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn resume_offset_matches_the_receivers_blocks() {
+    let data = content(100_000);
+    let mut sink = sink_with_partial(&data);
+    // Capture the receiver's real checksum stream, then replay it to the client.
+    let mut probe = Script::new(&[b"GET /v0/put/photo.jpg HTTP/1.1\r\n\r\n"]);
+    serve(
+        &mut probe,
+        &PEER,
+        &Config::default(),
+        &mut sink,
+        &mut [0; 1500],
+    )
+    .unwrap();
+    let response = probe.written;
+    for split in [1, 7, 100, response.len()] {
+        let segments: Vec<&[u8]> = response.chunks(split).collect();
+        let mut io = Script::new(&segments);
+        let mut source = Source::new(&data);
+        let offset = resume_offset(
+            &mut io,
+            RECEIVER,
+            "photo.jpg",
+            &mut source,
+            &mut [0; MIN_CLIENT_BUFFER],
+        )
+        .unwrap();
+        assert_eq!(offset, 70_000, "split {split}");
+        assert_eq!(source.pos, 70_000);
+        assert!(
+            io.written
+                .starts_with(b"GET /v0/put/photo.jpg HTTP/1.1\r\n")
+        );
+    }
+
+    // A changed second block resumes after the first.
+    let mut edited = data.clone();
+    edited[65_600] ^= 1;
+    let segments: &[&[u8]] = &[&response];
+    let mut source = Source::new(&edited);
+    let offset = resume_offset(
+        &mut Script::new(segments),
+        RECEIVER,
+        "photo.jpg",
+        &mut source,
+        &mut [0; MIN_CLIENT_BUFFER],
+    )
+    .unwrap();
+    assert_eq!(offset, 65_536);
+
+    // A receiver without resume support yields zero.
+    let segments: &[&[u8]] = &[b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"];
+    let offset = resume_offset(
+        &mut Script::new(segments),
+        RECEIVER,
+        "photo.jpg",
+        &mut Source::new(&data),
+        &mut [0; MIN_CLIENT_BUFFER],
+    )
+    .unwrap();
+    assert_eq!(offset, 0);
+}
+
+#[test]
+fn resumed_uploads_announce_their_range() {
+    let segments: &[&[u8]] = &[
+        b"HTTP/1.1 100 Continue\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n{}\n",
+    ];
+    let mut io = Script::new(segments);
+    let upload = Upload {
+        peer_api: RECEIVER,
+        name: "a",
+        size: 10,
+        offset: 6,
+    };
+    let mut body: &[u8] = b"WXYZ";
+    send(&mut io, &upload, &mut body, &mut [0; MIN_CLIENT_BUFFER]).unwrap();
+    let text = core::str::from_utf8(&io.written).unwrap();
+    assert!(
+        text.contains("\r\nContent-Length: 4\r\nRange: bytes=6-\r\n"),
+        "{text}"
+    );
+    assert!(text.ends_with("\r\n\r\nWXYZ"));
+    let upload = Upload {
+        offset: 11,
+        ..upload
+    };
+    let error = send(
+        &mut Script::new(&[]),
+        &upload,
+        &mut body,
+        &mut [0; MIN_CLIENT_BUFFER],
+    )
+    .unwrap_err();
+    assert_eq!(error, SendError::InvalidOffset);
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn async_upload_resumes_after_a_broken_transfer() {
+    use tokio_adapter::FromTokio;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let data: &'static [u8] = std::vec::Vec::leak(content(200_000));
+        let sink = std::sync::Arc::new(tokio::sync::Mutex::new(MemorySink::new(1 << 20)));
+        let connection = |sink: std::sync::Arc<tokio::sync::Mutex<MemorySink>>| {
+            let (client, server) = tokio::io::duplex(4096);
+            let served = tokio::spawn(async move {
+                let mut io = FromTokio(server);
+                let mut sink = sink.lock().await;
+                let mut buf = [0u8; 4096];
+                serve_async(&mut io, &PEER, &Config::default(), &mut *sink, &mut buf).await
+            });
+            (FromTokio(client), served)
+        };
+        let upload = Upload {
+            peer_api: RECEIVER,
+            name: "big.bin",
+            size: data.len() as u64,
+            offset: 0,
+        };
+
+        // The first attempt breaks off 70,000 bytes in.
+        let (mut io, served) = connection(sink.clone());
+        let mut source = Source {
+            fail_at: Some(70_000),
+            ..Source::new(data)
+        };
+        let sent = send_async(&mut io, &upload, &mut source, &mut [0; 4096]).await;
+        assert!(matches!(sent, Err(SendError::Source(_))), "{sent:?}");
+        drop(io);
+        assert!(served.await.unwrap().is_err());
+
+        // The probe finds the kept prefix, and the rest completes the file.
+        let mut source = Source::new(data);
+        let (mut io, served) = connection(sink.clone());
+        let offset = resume_offset_async(
+            &mut io,
+            RECEIVER,
+            "big.bin",
+            &mut source,
+            &mut [0; MIN_CLIENT_BUFFER],
+        )
+        .await
+        .unwrap();
+        assert_eq!(offset, 70_000);
+        assert_eq!(served.await.unwrap(), Ok(Served::Replied(200)));
+
+        let (mut io, served) = connection(sink.clone());
+        let resumed = Upload { offset, ..upload };
+        send_async(&mut io, &resumed, &mut source, &mut [0; 4096])
+            .await
+            .unwrap();
+        assert_eq!(
+            served.await.unwrap(),
+            Ok(Served::Received {
+                bytes: 130_000,
+                offset: 70_000
+            })
+        );
+        let sink = sink.lock().await;
+        assert_eq!(sink.files()[0].data, data);
+        assert!(sink.partials().is_empty());
+    });
 }
