@@ -82,7 +82,11 @@ const WG_RX_PACKETS: usize = FWD_UP_PACKETS + 1;
 /// TCP ACKs, keepalives -- exhaust a slot-per-full-packet ring long before its
 /// bytes: ten concurrent DNS queries overflowed the five-slot ring. Slots cost
 /// a few dozen bytes each, so absorb small-packet bursts with slots, not RAM.
-const WG_RX_SLOTS: usize = if WG_RX_PACKETS * 4 > 16 { WG_RX_PACKETS * 4 } else { 16 };
+const WG_RX_SLOTS: usize = if WG_RX_PACKETS * 4 > 16 {
+    WG_RX_PACKETS * 4
+} else {
+    16
+};
 const WG_TX_PACKETS: usize = 1;
 const WG_RX_BUFFER_LEN: usize = WG_RX_PACKETS * WG_DATAGRAM_LEN;
 const WG_TX_BUFFER_LEN: usize = WG_TX_PACKETS * WG_DATAGRAM_LEN;
@@ -99,15 +103,18 @@ static WG_TX_BUFFER: StaticCell<[u8; WG_TX_BUFFER_LEN]> = StaticCell::new();
 const TCP_RAW_RX_ARENA_PACKETS: usize = FWD_DOWN_PACKETS;
 const TCP_CLIENT_WINDOW_PACKETS: u16 = FWD_DOWN_PACKETS as u16;
 const TCP_RAW_RX_BUFFER_LEN: usize = TCP_RAW_RX_ARENA_PACKETS * wirefeather::budget::INNER_MTU;
-const TCP_RAW_PACKETS: usize = if FWD_DOWN_PACKETS > 24 { FWD_DOWN_PACKETS } else { 24 };
+const TCP_RAW_PACKETS: usize = if FWD_DOWN_PACKETS > 24 {
+    FWD_DOWN_PACKETS
+} else {
+    24
+};
 const CLIENT_TCP_RECEIVE_WINDOW: u16 = TCP_CLIENT_WINDOW_PACKETS * nat::MAX_MSS;
 const SERVER_TCP_RECEIVE_WINDOW: u16 = FWD_UP_PACKETS as u16 * nat::MAX_MSS;
 
 const _: () = assert!(CLIENT_TCP_RECEIVE_WINDOW as usize <= TCP_RAW_RX_BUFFER_LEN);
 const _: () = assert!(FWD_UP_PACKETS * nat::MAX_MSS as usize <= u16::MAX as usize);
 const _: () = assert!(FWD_DOWN_PACKETS * nat::MAX_MSS as usize <= u16::MAX as usize);
-const _: () =
-    assert!(SERVER_TCP_RECEIVE_WINDOW as usize <= (WG_RX_PACKETS - 1) * WG_DATAGRAM_LEN);
+const _: () = assert!(SERVER_TCP_RECEIVE_WINDOW as usize <= (WG_RX_PACKETS - 1) * WG_DATAGRAM_LEN);
 
 /// All 32 UDP mappings share this raw socket. This replaces four independently
 /// buffered datagram sockets and funds the peer API's bounded connection state.

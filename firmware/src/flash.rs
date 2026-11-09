@@ -20,7 +20,8 @@ pub const LAB_AUTH_KEY_ADDRESS: u32 = 0x3F_F000;
 #[cfg(tailfeather_emulab)]
 const LAB_AUTH_KEY_LEN: usize = 128;
 #[cfg(tailfeather_emulab)]
-static LAB_AUTH_KEY: static_cell::StaticCell<[u8; LAB_AUTH_KEY_LEN]> = static_cell::StaticCell::new();
+static LAB_AUTH_KEY: static_cell::StaticCell<[u8; LAB_AUTH_KEY_LEN]> =
+    static_cell::StaticCell::new();
 #[cfg(tailfeather_emulab)]
 static LAB_AUTH_KEY_VALUE: critical_section::Mutex<core::cell::Cell<Option<&'static str>>> =
     critical_section::Mutex::new(core::cell::Cell::new(None));
@@ -53,7 +54,6 @@ impl<'d> FlashSlots<'d> {
             critical_section::with(|cs| LAB_AUTH_KEY_VALUE.borrow(cs).set(Some(key)));
         }
     }
-
 
     pub fn new(flash: esp_hal::peripherals::FLASH<'d>) -> Self {
         Self {

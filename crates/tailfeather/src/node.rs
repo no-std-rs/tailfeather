@@ -2169,21 +2169,34 @@ mod tests {
         let identity = Identity::generate(&mut Counter(21));
         let state = PersistState::encode(&identity, 5, 1234, true, authority, None);
         let restored = Node::<1>::restore_for_authority(&state, authority).unwrap();
-        let mut in_place =
-            Node::<1>::factory_reset_for_authority(Identity::generate(&mut Counter(22)), 9, authority);
+        let mut in_place = Node::<1>::factory_reset_for_authority(
+            Identity::generate(&mut Counter(22)),
+            9,
+            authority,
+        );
         in_place.restore_in_place(&state, authority).unwrap();
-        assert_eq!(in_place.identity().node.public(), restored.identity().node.public());
+        assert_eq!(
+            in_place.identity().node.public(),
+            restored.identity().node.public()
+        );
         assert_eq!(in_place.generation, restored.generation);
         assert_eq!(in_place.trusted_time_floor(), restored.trusted_time_floor());
         assert_eq!(in_place.authority_hash(), restored.authority_hash());
         assert_eq!(in_place.registration_state(), restored.registration_state());
         assert_eq!(in_place.is_enrolled(), restored.is_enrolled());
 
-        let mut other =
-            Node::<1>::factory_reset_for_authority(Identity::generate(&mut Counter(23)), 9, authority);
+        let mut other = Node::<1>::factory_reset_for_authority(
+            Identity::generate(&mut Counter(23)),
+            9,
+            authority,
+        );
         let before = other.identity().node.public();
         assert!(other.restore_in_place(&state, [8; 16]).is_err());
-        assert_eq!(other.identity().node.public(), before, "a refused restore changes nothing");
+        assert_eq!(
+            other.identity().node.public(),
+            before,
+            "a refused restore changes nothing"
+        );
     }
 
     #[test]

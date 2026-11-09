@@ -253,20 +253,39 @@ mod tests {
         }
         // Answer slot 7 at 100 ms (a finished DNS lookup).
         let mut reply = [0; 64];
-        let len = nat::build_udp4(server, 53, [10, 0, 0, 1], nat::EXT_PORT_BASE + 7, b"a", &mut reply)
-            .unwrap();
+        let len = nat::build_udp4(
+            server,
+            53,
+            [10, 0, 0, 1],
+            nat::EXT_PORT_BASE + 7,
+            b"a",
+            &mut reply,
+        )
+        .unwrap();
         let parsed = nat::parse_udp4(&reply[..len]).unwrap();
         assert!(table.reverse_udp(&parsed, [10, 0, 0, 1], 100).is_some());
 
         // Within its answered grace nothing is reclaimable.
-        assert_eq!(table.slot_for([9; 4], 9, [8; 4], 8, 100 + nat::ANSWERED_IDLE_MS - 1), None);
+        assert_eq!(
+            table.slot_for([9; 4], 9, [8; 4], 8, 100 + nat::ANSWERED_IDLE_MS - 1),
+            None
+        );
         // After it, the finished exchange goes first, ahead of older ones.
-        assert_eq!(table.slot_for([9; 4], 9, [8; 4], 8, 100 + nat::ANSWERED_IDLE_MS), Some(7));
+        assert_eq!(
+            table.slot_for([9; 4], 9, [8; 4], 8, 100 + nat::ANSWERED_IDLE_MS),
+            Some(7)
+        );
         // A fresh tuple in a reused slot is not considered answered.
         assert!(!table.get(7).unwrap().answered);
         // Unanswered flows become reclaimable only once quiet for a while.
-        assert_eq!(table.slot_for([9; 4], 10, [8; 4], 8, nat::PRESSURE_IDLE_MS - 1), None);
-        assert_eq!(table.slot_for([9; 4], 10, [8; 4], 8, nat::PRESSURE_IDLE_MS), Some(0));
+        assert_eq!(
+            table.slot_for([9; 4], 10, [8; 4], 8, nat::PRESSURE_IDLE_MS - 1),
+            None
+        );
+        assert_eq!(
+            table.slot_for([9; 4], 10, [8; 4], 8, nat::PRESSURE_IDLE_MS),
+            Some(0)
+        );
     }
 
     #[test]
@@ -510,7 +529,15 @@ mod tests {
         let slot = outbound(&mut table, SYN, 1000, 0, 0);
         let mut inbound_buffer = [0u8; 1500];
         let mut inbound = |table: &mut nat::TcpTable, flags, seq, payload| {
-            let len = tcp_segment(server, uplink, flags, seq, 1001, payload, &mut inbound_buffer);
+            let len = tcp_segment(
+                server,
+                uplink,
+                flags,
+                seq,
+                1001,
+                payload,
+                &mut inbound_buffer,
+            );
             table.observe_inbound(slot, &nat::parse_tcp4(&inbound_buffer[..len]).unwrap(), 0);
         };
         inbound(&mut table, SYN | ACK, 5000, 0);
