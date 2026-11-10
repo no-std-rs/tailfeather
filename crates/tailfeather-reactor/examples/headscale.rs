@@ -19,6 +19,8 @@ fn config<'a>(name: &'a str, key: &'a str, ca: &'a [u8], control_url: &'a str) -
         relay_only: !std::env::args().any(|arg| arg == "--direct"),
         ephemeral: true,
         os: std::env::consts::OS,
+        peer_api_port: None,
+        peer_api_ipv6: false,
     }
 }
 

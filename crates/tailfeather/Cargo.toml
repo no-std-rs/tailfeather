@@ -25,6 +25,11 @@ accelerated-crypto = ["wirefeather/accelerated-crypto"]
 peer-names = []
 # Retain the small, fail-closed SSH accept-policy subset used by tailfeather-ssh.
 ssh-policy = []
+# Retain what peer API endpoints decide with: node owners and tags, this
+# node's capabilities, peers' advertised peer API ports, and the Taildrop
+# capability grants in packet filters. Off by default so the firmware's static
+# RAM budget is unchanged.
+peer-api = []
 # Larger bounded address lists for workstation/phone fleets; embedded defaults stay small.
 hosted-policy = []
 # Grow the peer table, per-peer path state and WireGuard peers on the heap up

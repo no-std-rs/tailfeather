@@ -1134,6 +1134,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tailfeather-gateway"
+version = "0.0.1"
+dependencies = [
+ "embedded-io",
+ "embedded-io-async",
+ "sha2",
+ "wirefeather",
+]
+
+[[package]]
 name = "tailfeather-reactor"
 version = "0.0.1"
 dependencies = [
@@ -1153,6 +1163,7 @@ dependencies = [
  "serde_json",
  "smoltcp",
  "tailfeather",
+ "tailfeather-gateway",
  "tempfile",
  "tokio",
  "tokio-rustls",

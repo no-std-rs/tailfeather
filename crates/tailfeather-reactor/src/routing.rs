@@ -1,4 +1,4 @@
-use core::net::Ipv4Addr;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tailfeather::{
     keys::NodePublic,
     netmap::{Cidr4, Peer},
@@ -41,6 +41,54 @@ pub fn route_ipv4<'a>(
     best.map(|(_, key)| key)
 }
 
+/// The peer an outbound IPv6 packet belongs to: the peer whose own tailnet
+/// IPv6 address it is. Only host addresses are kept for IPv6; there are no
+/// IPv6 subnet routes to match.
+pub fn route_ipv6<'a>(
+    peers: impl IntoIterator<Item = &'a Peer>,
+    destination: Ipv6Addr,
+) -> Option<NodePublic> {
+    peers
+        .into_iter()
+        .find(|peer| peer.ipv6_address == Some(destination))
+        .map(|peer| peer.node_key)
+}
+
+/// [`route_ipv4`] or [`route_ipv6`], by family.
+pub fn route_ip<'a>(
+    peers: impl IntoIterator<Item = &'a Peer>,
+    destination: IpAddr,
+) -> Option<NodePublic> {
+    match destination {
+        IpAddr::V4(destination) => route_ipv4(peers, destination),
+        IpAddr::V6(destination) => route_ipv6(peers, destination),
+    }
+}
+
+/// The source and destination of an IPv6 header, when `packet` is one.
+pub fn ipv6_addresses(packet: &[u8]) -> Option<(Ipv6Addr, Ipv6Addr)> {
+    if packet.len() < 40 || packet[0] >> 4 != 6 {
+        return None;
+    }
+    let source: [u8; 16] = packet[8..24].try_into().ok()?;
+    let destination: [u8; 16] = packet[24..40].try_into().ok()?;
+    Some((source.into(), destination.into()))
+}
+
+/// [`inbound_allowed`] for IPv6: addressed to this node's own IPv6 address,
+/// from the exact address of the peer that sent it.
+pub fn inbound_allowed_ipv6<'a>(
+    packet: &[u8],
+    sender: &NodePublic,
+    peers: impl IntoIterator<Item = &'a Peer>,
+    own: Ipv6Addr,
+) -> bool {
+    let Some((source, destination)) = ipv6_addresses(packet) else {
+        return false;
+    };
+    destination == own && route_ipv6(peers, source) == Some(*sender)
+}
+
 /// The source and destination of an IPv4 header, when `packet` is one.
 pub fn ipv4_addresses(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
     if packet.len() < 20 || packet[0] >> 4 != 4 {
@@ -76,6 +124,20 @@ pub fn inbound_allowed<'a>(
 /// sequence state; only an initial SYN needs the directional ACL rule.
 pub fn tcp_continuation(bytes: &[u8]) -> bool {
     use smoltcp::wire::{IpProtocol, Ipv4Packet, TcpPacket};
+    if bytes.first().is_some_and(|first| first >> 4 == 6) {
+        // A fixed IPv6 header straight into TCP; extension headers fail
+        // closed here and in the packet filter alike.
+        let length = bytes
+            .get(4..6)
+            .map(|length| 40 + usize::from(u16::from_be_bytes([length[0], length[1]])));
+        if bytes.get(6) != Some(&6) || length != Some(bytes.len()) {
+            return false;
+        }
+        let Ok(tcp) = TcpPacket::new_checked(&bytes[40..]) else {
+            return false;
+        };
+        return !tcp.syn() || tcp.ack();
+    }
     let Ok(ip) = Ipv4Packet::new_checked(bytes) else {
         return false;
     };
@@ -164,6 +226,48 @@ mod tests {
         assert!(!inbound_allowed(&packet, &exit.node_key, peers, own));
         packet[12..16].copy_from_slice(&[100, 64, 0, 3]);
         assert!(!inbound_allowed(&packet, &exit.node_key, peers, own));
+    }
+    #[test]
+    fn ipv6_routes_and_ingress_use_each_peer_s_own_address() {
+        let mut exit = peer(1, "100.64.0.1/32", "0.0.0.0/0");
+        exit.ipv6_address = Some("fd7a:115c:a1e0::1".parse().unwrap());
+        let mut direct = peer(3, "100.64.0.3/32", "100.64.0.3/32");
+        direct.ipv6_address = Some("fd7a:115c:a1e0::3".parse().unwrap());
+        let peers = [&exit, &direct];
+        assert_eq!(
+            route_ip(peers, "fd7a:115c:a1e0::3".parse().unwrap()),
+            Some(direct.node_key)
+        );
+        // No IPv6 subnet or exit routes: an unknown address goes nowhere.
+        assert_eq!(route_ip(peers, "2001:db8::1".parse().unwrap()), None);
+        let own: Ipv6Addr = "fd7a:115c:a1e0::9".parse().unwrap();
+        let mut packet = [0u8; 60];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&20u16.to_be_bytes());
+        packet[6] = 6;
+        packet[8..24].copy_from_slice(&direct.ipv6_address.unwrap().octets());
+        packet[24..40].copy_from_slice(&own.octets());
+        assert!(inbound_allowed_ipv6(&packet, &direct.node_key, peers, own));
+        // Another peer cannot claim that address, nor reach another node.
+        assert!(!inbound_allowed_ipv6(&packet, &exit.node_key, peers, own));
+        let other: Ipv6Addr = "fd7a:115c:a1e0::8".parse().unwrap();
+        assert!(!inbound_allowed_ipv6(
+            &packet,
+            &direct.node_key,
+            peers,
+            other
+        ));
+        // An initial SYN needs the ACL; anything later is a continuation.
+        packet[52] = 5 << 4;
+        packet[53] = 0x02;
+        assert!(!tcp_continuation(&packet));
+        packet[53] = 0x12;
+        assert!(tcp_continuation(&packet));
+        // Extension headers and a length mismatch fail closed.
+        packet[6] = 0;
+        assert!(!tcp_continuation(&packet));
+        packet[6] = 6;
+        assert!(!tcp_continuation(&packet[..59]));
     }
     #[test]
     fn timestamps_remain_newer_when_wall_time_rolls_back() {

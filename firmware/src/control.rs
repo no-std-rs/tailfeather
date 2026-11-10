@@ -748,6 +748,7 @@ fn write_recovery_map_body(
             routable_ips: crate::tunnel::exit_routes(),
             preferred_derp,
             peer_api_port: Some(tailfeather_gateway::peerapi::PORT),
+            peer_api_dns_proxy: true,
             ..Default::default()
         },
         stream: true,
@@ -783,6 +784,7 @@ fn write_recovery_registration_body(
             hostname: crate::TS_HOSTNAME,
             routable_ips: crate::tunnel::exit_routes(),
             peer_api_port: Some(tailfeather_gateway::peerapi::PORT),
+            peer_api_dns_proxy: true,
             ..Default::default()
         },
         ephemeral: false,
@@ -1004,6 +1006,7 @@ async fn publish_endpoints(
             routable_ips: crate::tunnel::exit_routes(),
             preferred_derp: publication.preferred_derp,
             peer_api_port: Some(tailfeather_gateway::peerapi::PORT),
+            peer_api_dns_proxy: true,
             ..Default::default()
         },
         stream: false,
@@ -1045,6 +1048,7 @@ async fn register(
             hostname: crate::TS_HOSTNAME,
             routable_ips: crate::tunnel::exit_routes(),
             peer_api_port: Some(tailfeather_gateway::peerapi::PORT),
+            peer_api_dns_proxy: true,
             ..Default::default()
         },
         ephemeral: false,

@@ -38,7 +38,10 @@
 #   TF_ESP_EXIT_STREAMS   concurrent transfers of the multi-stream runs (default 4)
 #   TF_ESP_EXIT_PAGES     browser-like page loads (default 3)
 #   TF_ESP_EXIT_CONNS     concurrent connections per page load (default 6)
-#   TF_ESP_EXIT_DNS       concurrent DNS lookups (default 10), one retry each
+#   TF_ESP_EXIT_DNS       concurrent DNS lookups (default 10)
+#   TF_ESP_EXIT_DNS_ATTEMPTS  tries per lookup, as a stub resolver retries
+#                         (default 2; 4 under TF_ESP_EXIT_CHAOS, where loss on
+#                         every hop makes a double loss routine, not a fault)
 #   TF_ESP_EXIT_DNS_PROBE extra lookup bursts with loss accounting (default 0)
 #   TF_ESP_EXIT_MIN_MBPS  fail when a single-stream direction is slower (default 0)
 #   TF_ESP_EXIT_BATCH     esp-emu --batch-size, if set
@@ -46,6 +49,13 @@
 #   TF_ESP_EXIT_PCAP_TAP  tcpdump filter for the ESP's Wi-Fi segment (tap.pcap)
 #   TF_ESP_EXIT_PCAP      tcpdump filter; captures both sides of the ESP into
 #                         inet.pcap and client.pcap (kept with TF_ESP_EXIT_KEEP)
+#   TF_ESP_EXIT_CHAOS     netem impairment for every measured hop once the exit
+#                         node is selected, as netem options, for example
+#                         "delay 20ms 15ms loss 1% duplicate 0.5% reorder 5%";
+#                         a profile name from chaos_profile below also works
+#   TF_ESP_EXIT_CHAOS_SEED  seed of netem's random draws (default: random). The
+#                         seed is logged and printed with any failure, so the
+#                         same loss, duplication and reordering replay exactly
 set -euo pipefail
 
 HEADSCALE=$1 TAILSCALE=$2 TAILSCALED=$3 ESP_EMU=$4 FLASH=$5 ELF=$6 BASE_CONFIG=$7 TLS_DIR=${8:-}
@@ -54,6 +64,7 @@ STREAMS=${TF_ESP_EXIT_STREAMS:-4}
 PAGES=${TF_ESP_EXIT_PAGES:-3}
 CONNS=${TF_ESP_EXIT_CONNS:-6}
 DNS_BURST=${TF_ESP_EXIT_DNS:-10}
+DNS_ATTEMPTS=${TF_ESP_EXIT_DNS_ATTEMPTS:-$(test -n "${TF_ESP_EXIT_CHAOS:-}" && echo 4 || echo 2)}
 MIN_MBPS=${TF_ESP_EXIT_MIN_MBPS:-0}
 PREFIX=ee
 WORK=$(mktemp -d /tmp/tf-esp-exit.XXXXXX)
@@ -61,7 +72,12 @@ PIDS=()
 NAMES=()
 
 log() { echo "esp-exit: $*"; }
-fail() { echo "esp-exit: FAIL: $*" >&2; exit 1; }
+CHAOS_RERUN=""
+fail() {
+    echo "esp-exit: FAIL: $*" >&2
+    test -z "$CHAOS_RERUN" || echo "esp-exit: reproduce with: $CHAOS_RERUN" >&2
+    exit 1
+}
 ns() { ip netns exec "$PREFIX-$1" "${@:2}"; }
 start() {
     local space=$1 name=$2
@@ -117,6 +133,36 @@ wait_for() {
 
 t0=$(date +%s)
 elapsed() { echo $(($(date +%s) - t0)); }
+
+# chaos_profile NAME: named netem settings, so CI and humans share presets.
+chaos_profile() {
+    case "$1" in
+        jitter) echo "delay 15ms 15ms" ;;
+        lossy) echo "delay 10ms 5ms loss 2% duplicate 0.5%" ;;
+        reorder) echo "delay 25ms 20ms reorder 10% 50% duplicate 1%" ;;
+        storm) echo "delay 30ms 25ms loss 3% 25% duplicate 2% reorder 10% corrupt 0.1%" ;;
+        *) echo "$1" ;;
+    esac
+}
+# apply_chaos: impair every router hop of the measured path in both
+# directions it can shape: towards the ESP (tap0), the client and the
+# internet servers, and from the client and the servers. The ESP's own
+# transmissions into tap0 are not shaped. Each qdisc gets its own seed
+# derived from the master seed, so a run replays from one number.
+apply_chaos() {
+    test -n "${TF_ESP_EXIT_CHAOS:-}" || return 0
+    local options seed index=0 hop
+    options=$(chaos_profile "$TF_ESP_EXIT_CHAOS")
+    seed=${TF_ESP_EXIT_CHAOS_SEED:-$(((RANDOM << 15) | RANDOM))}
+    CHAOS_RERUN="TF_ESP_EXIT_CHAOS='$TF_ESP_EXIT_CHAOS' TF_ESP_EXIT_CHAOS_SEED=$seed"
+    for hop in lan:tap0 "lan:$PREFIX-client-up" "lan:$PREFIX-inet-up" client:eth0 inet:eth0; do
+        # shellcheck disable=SC2086
+        ns "${hop%%:*}" tc qdisc replace dev "${hop#*:}" root netem limit 10000 $options \
+            seed $((seed + index)) || fail "netem rejected '$options' on ${hop#*:}"
+        index=$((index + 1))
+    done
+    log "chaos on: $options (seed $seed; $CHAOS_RERUN)"
+}
 
 log "building namespaces"
 add_ns lan
@@ -283,6 +329,7 @@ done
 ns client "${TS[@]}" status --json | tr -d '[:space:]' | grep -q '"ExitNode":true' ||
     fail "the ESP was not accepted as an exit node: $(cat "$WORK/exit.log")"
 log "exit node $ESP_TS selected after $(elapsed)s"
+apply_chaos
 
 if test -n "${TF_ESP_EXIT_PCAP_TAP:-}"; then
     start lan pcap-tap tcpdump -Z root -U -s 96 -nni tap0 -w "$WORK/tap.pcap" $TF_ESP_EXIT_PCAP_TAP
@@ -295,10 +342,19 @@ fi
 start inet echo socat TCP-LISTEN:7000,bind=10.79.0.2,reuseaddr,fork SYSTEM:'echo "$SOCAT_PEERADDR"'
 # Bulk endpoints, as in the NAT matrix: the sink acknowledges only after it has
 # read everything, so the uploader's clock stops on delivery, not on buffering.
-start inet sink socat TCP-LISTEN:5001,bind=10.79.0.2,reuseaddr,fork SYSTEM:'cat >/dev/null; echo done'
-start inet source socat TCP-LISTEN:5002,bind=10.79.0.2,reuseaddr,fork SYSTEM:"head -c $BULK_BYTES /dev/zero"
+# Every origin waits as long as its client (-t): socat starts a closing timer
+# at the first EOF (the client's half-close, or the generator's end) and, with
+# the 0.5 s default, a path stall then made the origin drop data it still held
+# and end the transfer short with a clean FIN.
+start inet sink socat -t 60 TCP-LISTEN:5001,bind=10.79.0.2,reuseaddr,fork SYSTEM:'cat >/dev/null; echo done'
+start inet source socat -t 60 TCP-LISTEN:5002,bind=10.79.0.2,reuseaddr,fork SYSTEM:"head -c $BULK_BYTES /dev/zero"
 # Web-like origin: each connection asks for N bytes and gets exactly N back.
-start inet web socat TCP-LISTEN:5003,bind=10.79.0.2,reuseaddr,fork,backlog=64 SYSTEM:'read n; head -c "$n" /dev/zero'
+# The client half-closes right after its request line. socat then waits its
+# -t timeout for the other direction; with the 0.5 s default, any path stall
+# longer than that while the response is still streaming (a retransmission
+# timeout, a busy emulator) made the origin itself cut the object short with a
+# clean FIN. Wait as long as the client does.
+start inet web socat -t 30 TCP-LISTEN:5003,bind=10.79.0.2,reuseaddr,fork,backlog=64 SYSTEM:'read n; head -c "$n" /dev/zero'
 # A real resolver on the internet side, as a page load's lookups would reach.
 start inet resolver dnsmasq --user=nobody --group=nobody --keep-in-foreground --log-facility=- \
     --conf-file=/dev/null --no-resolv --no-hosts --listen-address=10.79.0.2 --bind-interfaces \
@@ -381,7 +437,7 @@ fetch() {
     rm -f "$err"
 }
 export -f fetch ns
-export PREFIX WORK
+export PREFIX WORK DNS_ATTEMPTS
 # page_load N: seconds for one page load; failed objects go to $WORK/web-failed.
 page_load() {
     local start end html
@@ -401,7 +457,7 @@ dns_burst() {
     seq 1 "$1" | xargs -P "$1" -I{} bash -c '
         id=$(printf "%04x" $(({} * 257)))
         q="${id}0100000100000000000003777777036c61620000010001"
-        for attempt in 1 2; do
+        for attempt in $(seq 1 "$DNS_ATTEMPTS"); do
             got=$(printf "$(sed "s/../\\\\x&/g" <<<"$q")" |
                 ns client timeout 5 socat -T 1 - UDP:10.79.0.2:5353 2>/dev/null | wc -c)
             if test "$got" -gt 0; then echo "$attempt"; exit 0; fi

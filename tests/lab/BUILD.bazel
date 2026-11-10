@@ -9,6 +9,8 @@ exports_files([
     "esp-tls/control.pem",
     "guest-controller.sh",
     "headscale.yaml",
+    "loopback-tls/ca.der",
+    "loopback-tls/ca.pem",
     "nat-matrix.sh",
     "privileged-smolvm.sh",
 ])
@@ -37,6 +39,80 @@ sh_test(
     ],
     env = {"PATH": "/usr/bin:/bin"},
     size = "medium",
+    tags = ["no-remote"],
+)
+
+sh_test(
+    name = "taildrop_live",
+    srcs = ["//scripts:runfiles-exec.sh"],
+    args = [
+        "$(rootpath @python_3_13//:python3)",
+        "$(rootpath :taildrop-live.py)",
+        "--config=$(rootpath :headscale.yaml)",
+        "--tls-ca=$(rootpath :loopback-tls/ca.pem)",
+        "--headscale=$(rootpath @headscale_0_29_3_linux_amd64//file)",
+        "--node=$(rootpath //crates/tailfeather-reactor:taildrop_node)",
+        "--tailscale=$(rootpath @tailscale_1_94_2_linux_amd64//:tailscale)",
+        "--tailscaled=$(rootpath @tailscale_1_94_2_linux_amd64//:tailscaled)",
+    ],
+    data = [
+        "headscale.yaml",
+        "loopback-tls/ca.der",
+        "loopback-tls/ca.pem",
+        "loopback-tls/server.key",
+        "loopback-tls/server.pem",
+        "taildrop-live.py",
+        "//crates/tailfeather-reactor:taildrop_node",
+        "@python_3_13//:files",
+        "@python_3_13//:python3",
+        "@headscale_0_29_3_linux_amd64//file",
+        "@tailscale_1_94_2_linux_amd64//:tailscale",
+        "@tailscale_1_94_2_linux_amd64//:tailscaled",
+    ],
+    env = {"PATH": "/usr/bin:/bin"},
+    size = "medium",
+    tags = ["no-remote"],
+)
+
+# The Taildrop lab across an impaired network: loss, duplication, reordering,
+# jitter and corruption, all seeded so a failure replays.
+sh_test(
+    name = "taildrop_live_chaos",
+    srcs = ["//scripts:runfiles-exec.sh"],
+    args = [
+        "$(rootpath @python_3_13//:python3)",
+        "$(rootpath :taildrop-live.py)",
+        "--config=$(rootpath :headscale.yaml)",
+        "--tls-ca=$(rootpath :loopback-tls/ca.pem)",
+        "--headscale=$(rootpath @headscale_0_29_3_linux_amd64//file)",
+        "--node=$(rootpath //crates/tailfeather-reactor:taildrop_node)",
+        "--tailscale=$(rootpath @tailscale_1_94_2_linux_amd64//:tailscale)",
+        "--tailscaled=$(rootpath @tailscale_1_94_2_linux_amd64//:tailscaled)",
+    ],
+    data = [
+        "headscale.yaml",
+        "loopback-tls/ca.der",
+        "loopback-tls/ca.pem",
+        "loopback-tls/server.key",
+        "loopback-tls/server.pem",
+        "taildrop-live.py",
+        "//crates/tailfeather-reactor:taildrop_node",
+        "@python_3_13//:files",
+        "@python_3_13//:python3",
+        "@headscale_0_29_3_linux_amd64//file",
+        "@tailscale_1_94_2_linux_amd64//:tailscale",
+        "@tailscale_1_94_2_linux_amd64//:tailscaled",
+    ],
+    # Seeded netem on the test's own loopback, in a private user and network
+    # namespace (see taildrop-live.py); a failure prints its seed. Reproduce
+    # locally with --test_env=TF_LAB_CHAOS_SEED=<seed>, or try other profiles
+    # with --test_env=TF_LAB_CHAOS=<profile or netem options>.
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "TF_LAB_CHAOS": "storm",
+        "TF_LAB_CHAOS_SEED": "46",
+    },
+    size = "large",
     tags = ["no-remote"],
 )
 
@@ -197,6 +273,36 @@ sh_test(
     ],
     size = "enormous",
     tags = VM_TAGS + ["manual"],
+    timeout = "eternal",
+)
+
+# The plaintext stage across an impaired network: loss, duplication, reordering,
+# jitter and corruption on every hop, all seeded so a failure replays.
+sh_test(
+    name = "esp_exit_chaos",
+    srcs = ["privileged-smolvm.sh"],
+    args = VM_ARGS + [
+        "--stages=esp-exit",
+        "--esp-emu=$(rootpath @esp_emu_0_50_0_linux_x86_64//:esp-emu)",
+        "--esp-flash=$(rootpath //firmware:emulab_flash)",
+        "--esp-elf=$(rootpath //firmware:esp_gateway_firmware_emulab)",
+        "--esp-exit=$(rootpath :esp-exit.sh)",
+    ],
+    data = VM_DATA + [
+        "esp-exit.sh",
+        "//firmware:emulab_flash",
+        "//firmware:esp_gateway_firmware_emulab",
+        "@esp_emu_0_50_0_linux_x86_64//:esp-emu",
+    ],
+    # Seeded netem on every router hop of the measured path (see esp-exit.sh);
+    # a failure prints its seed. Only names and digits reach the VM, so the
+    # profile is named. Exclusive: a concurrent VM would add timing noise.
+    env = {
+        "TF_ESP_EXIT_CHAOS": "storm",
+        "TF_ESP_EXIT_CHAOS_SEED": "404",
+    },
+    size = "enormous",
+    tags = VM_TAGS + ["exclusive", "manual"],
     timeout = "eternal",
 )
 

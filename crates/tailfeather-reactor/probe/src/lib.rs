@@ -80,6 +80,8 @@ async fn client(stack: Stack<'static>) {
         relay_only: false,
         ephemeral: true,
         os: "probe",
+        peer_api_port: None,
+        peer_api_ipv6: false,
     };
     let node = NODE.init_with(|| runtime::restore(&config, &network, &FixtureState).unwrap());
     let runtime = Runtime::<_, _, 3, 4>::new(config, node, &network, &FixtureState).unwrap();

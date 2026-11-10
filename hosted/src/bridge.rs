@@ -196,7 +196,11 @@ mod tests {
                 remote.set_address("100.64.0.2".parse().unwrap(), 0, 2);
                 let listener = remote.listen(2222).unwrap();
                 let handle = local
-                    .connect("100.64.0.2".parse().unwrap(), 2222, 49152)
+                    .connect(
+                        "100.64.0.2".parse::<core::net::Ipv4Addr>().unwrap(),
+                        2222,
+                        49152,
+                    )
                     .unwrap();
                 for now in 0..10 {
                     for bytes in local.poll(now) {

@@ -3,7 +3,8 @@
 A shared userspace mesh client for native applications and allocation-free
 Embassy applications. `tailfeather` retains protocol state and codecs;
 `tailfeather-reactor` owns asynchronous control, DERP, direct WireGuard, and
-inner IPv4 TCP scheduling. Both adapters run the same `runtime::Runtime`.
+inner TCP scheduling: IPv4, plus IPv6 with the `ipv6` feature. Both adapters
+run the same `runtime::Runtime`.
 
 The crate is an independent Cargo workspace, like `hosted/` and `firmware/`,
 so platform dependencies do not enter the portable library's Bazel closure.
@@ -15,6 +16,7 @@ It currently requires Rust 1.91, matching smoltcp 0.13's requirement.
 | `embassy` | Embassy-net sockets, verified embedded TLS, Embassy clock |
 | `std` | Tokio sockets, verified rustls TLS, filesystem state, owned TCP storage |
 | `alloc` | Optional owned TCP buffers without selecting an executor |
+| `ipv6` | Dual-stack tailnet TCP: the node's IPv6 address, connections to peers' IPv6 addresses, and one listener for both families (`std` includes it) |
 | `fast-curve25519`, `peer-names`, `hosted-policy` | Explicit core performance/metadata/policy budgets |
 | `accelerated-crypto` | CPU-dispatched fused AEAD on supported native targets; portable fallback elsewhere |
 

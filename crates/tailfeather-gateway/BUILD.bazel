@@ -43,6 +43,23 @@ rust_test(
     deps = all_crate_deps(normal_dev = True),
 )
 
+# The opt-in Taildrop stream peer API: receive/send with both drivers, the
+# alloc sink, and the multi-threaded Tokio round trip.
+rust_test(
+    name = "peerapi_http_test",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = ["taildrop", "alloc"],
+    crate_name = "tailfeather_gateway",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    deps = all_crate_deps(normal = True, normal_dev = True) + [
+        "@tailfeather_root_deps//:embedded-io-0.7.1",
+        "@tailfeather_root_deps//:embedded-io-async-0.7.0",
+        "@tailfeather_root_deps//:sha2-0.10.9",
+    ],
+)
+
 rust_doc_test(
     name = "doc_test",
     crate = ":tailfeather_gateway",
@@ -51,5 +68,26 @@ rust_doc_test(
 rust_doc(
     name = "docs",
     crate = ":tailfeather_gateway",
+    rustdoc_flags = ["-Dwarnings"],
+)
+
+# Documents the feature-gated Taildrop API with warnings denied.
+rust_library(
+    name = "tailfeather_gateway_peerapi_http",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = ["taildrop", "alloc"],
+    crate_name = "tailfeather_gateway",
+    edition = "2024",
+    deps = all_crate_deps(normal = True) + [
+        "@tailfeather_root_deps//:embedded-io-0.7.1",
+        "@tailfeather_root_deps//:embedded-io-async-0.7.0",
+        "@tailfeather_root_deps//:sha2-0.10.9",
+    ],
+)
+
+rust_doc(
+    name = "peerapi_http_docs",
+    crate = ":tailfeather_gateway_peerapi_http",
     rustdoc_flags = ["-Dwarnings"],
 )

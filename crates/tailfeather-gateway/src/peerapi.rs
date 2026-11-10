@@ -8,6 +8,10 @@
 
 use crate::nat::{self, TcpInfo};
 
+pub mod http;
+#[cfg(feature = "taildrop")]
+pub mod taildrop;
+
 pub const PORT: u16 = 5254;
 pub const CONNECTIONS: usize = 4;
 pub const CONNECTION_STORAGE: usize = 1280;
@@ -810,53 +814,41 @@ enum Parsed {
 }
 
 fn parse_request(bytes: &[u8]) -> Result<Option<Parsed>, ()> {
-    let Some(headers_end) = find(bytes, b"\r\n\r\n").map(|at| at + 4) else {
+    let Some(headers_end) = http::head_len(bytes) else {
         return Ok(None);
     };
-    let line_end = find(bytes, b"\r\n").ok_or(())?;
-    let line = &bytes[..line_end];
-    if line == b"HEAD / HTTP/1.1" || line == b"HEAD / HTTP/1.0" {
-        return Ok(Some(Parsed::Head));
-    }
-    if let Some(rest) = line.strip_prefix(b"GET /dns-query?dns=") {
-        let encoded_len = rest
-            .iter()
-            .position(|byte| *byte == b'&' || *byte == b' ')
-            .ok_or(())?;
-        if encoded_len == 0 {
-            return Err(());
+    let request = http::parse_request(&bytes[..headers_end]).map_err(|_| ())?;
+    match (request.method, request.path()) {
+        (http::Method::Head, "/") => return Ok(Some(Parsed::Head)),
+        (http::Method::Get, "/dns-query") => {
+            let value = request
+                .query()
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("dns="))
+                .filter(|value| !value.is_empty())
+                .ok_or(())?;
+            // `value` borrows `bytes`; its offset locates the in-place decode.
+            let start = value.as_ptr() as usize - bytes.as_ptr() as usize;
+            return Ok(Some(Parsed::Dns {
+                start,
+                end: start + value.len(),
+                encoded: true,
+            }));
         }
-        let start = line.len() - rest.len();
-        return Ok(Some(Parsed::Dns {
-            start,
-            end: start + encoded_len,
-            encoded: true,
-        }));
-    }
-    if line != b"POST /dns-query HTTP/1.1" && line != b"POST /dns-query HTTP/1.0" {
-        return Err(());
+        (http::Method::Post, "/dns-query") => {}
+        _ => return Err(()),
     }
 
-    let mut content_type = false;
-    let mut content_length = None;
-    let mut cursor = line_end + 2;
-    while cursor + 2 <= headers_end {
-        let relative = find(&bytes[cursor..headers_end], b"\r\n").ok_or(())?;
-        if relative == 0 {
-            break;
-        }
-        let line = &bytes[cursor..cursor + relative];
-        if let Some(value) = header_value(line, b"content-type") {
-            content_type = ascii_eq(value, b"application/dns-message");
-        } else if let Some(value) = header_value(line, b"content-length") {
-            content_length = Some(parse_decimal(value)?);
-        }
-        cursor += relative + 2;
-    }
-    if !content_type {
+    let dns_message = request
+        .header("content-type")
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/dns-message"));
+    let http::Framing::Length(content_length) = request.framing else {
+        return Err(());
+    };
+    if !dns_message {
         return Err(());
     }
-    let content_length = content_length.ok_or(())?;
+    let content_length = usize::try_from(content_length).map_err(|_| ())?;
     let end = headers_end.checked_add(content_length).ok_or(())?;
     if end > CONNECTION_STORAGE {
         return Err(());
@@ -874,48 +866,12 @@ fn parse_request(bytes: &[u8]) -> Result<Option<Parsed>, ()> {
     }))
 }
 
-fn header_value<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let colon = line.iter().position(|byte| *byte == b':')?;
-    if !ascii_eq(&line[..colon], name) {
-        return None;
-    }
-    let mut value = &line[colon + 1..];
-    while value.first() == Some(&b' ') || value.first() == Some(&b'\t') {
-        value = &value[1..];
-    }
-    while value.last() == Some(&b' ') || value.last() == Some(&b'\t') {
-        value = &value[..value.len() - 1];
-    }
-    Some(value)
-}
-
 fn ascii_eq(left: &[u8], right: &[u8]) -> bool {
     left.len() == right.len()
         && left
             .iter()
             .zip(right)
             .all(|(left, right)| left.eq_ignore_ascii_case(right))
-}
-
-fn parse_decimal(bytes: &[u8]) -> Result<usize, ()> {
-    if bytes.is_empty() {
-        return Err(());
-    }
-    let mut value = 0usize;
-    for byte in bytes {
-        if !byte.is_ascii_digit() {
-            return Err(());
-        }
-        value = value.checked_mul(10).ok_or(())?;
-        value = value.checked_add(usize::from(*byte - b'0')).ok_or(())?;
-    }
-    Ok(value)
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn decode_base64url_in_place(buffer: &mut [u8], start: usize, end: usize) -> Option<usize> {

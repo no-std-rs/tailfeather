@@ -13,11 +13,14 @@ description = "Shared asynchronous runtime for Tailfeather nodes"
 [features]
 default = []
 alloc = ["smoltcp/alloc", "smoltcp/socket-tcp-reno"]
+# Dual-stack tailnet TCP: the node's IPv6 address, IPv6 inner packets and
+# connections to peers' IPv6 addresses.
+ipv6 = ["smoltcp/proto-ipv6", "embassy-net?/proto-ipv6"]
 fast-curve25519 = ["tailfeather/fast-curve25519"]
 peer-names = ["tailfeather/peer-names"]
 hosted-policy = ["tailfeather/hosted-policy"]
 accelerated-crypto = ["tailfeather/accelerated-crypto"]
-std = ["alloc", "dep:tokio", "dep:quinn-udp", "dep:tokio-rustls", "dep:webpki-roots", "dep:getrandom", "dep:tempfile", "critical-section/std", "embedded-io-async/std", "dep:rustix"]
+std = ["alloc", "ipv6", "dep:tokio", "dep:quinn-udp", "dep:tokio-rustls", "dep:webpki-roots", "dep:getrandom", "dep:tempfile", "critical-section/std", "embedded-io-async/std", "dep:rustix"]
 tls = ["dep:embedded-tls"]
 embassy = ["dep:embassy-time", "dep:embassy-net", "tls", "dep:rand_core"]
 
@@ -47,12 +50,19 @@ rustix = { version = "1.1", default-features = false, features = ["fs", "net"], 
 
 [dev-dependencies]
 serde_json = "1"
+tailfeather-gateway = { path = "../tailfeather-gateway", features = ["taildrop", "alloc"] }
+# The Taildrop lab node authorizes and discovers peers from the netmap.
+tailfeather = { path = "../tailfeather", default-features = false, features = ["peer-api"] }
 embassy-time = { version = "0.5", features = ["std", "generic-queue-64"] }
 critical-section = { version = "1.2", features = ["std"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
 
 [[example]]
 name = "headscale"
+required-features = ["std"]
+
+[[example]]
+name = "taildrop_node"
 required-features = ["std"]
 
 [[bench]]

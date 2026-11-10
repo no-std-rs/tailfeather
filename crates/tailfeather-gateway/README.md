@@ -30,6 +30,18 @@ reassembles packets or skips unknown headers. The packet and error contracts
 follow [RFC 8200](https://www.rfc-editor.org/rfc/rfc8200) and
 [RFC 4443](https://www.rfc-editor.org/rfc/rfc4443).
 
+## Stream peer API (opt-in)
+
+The peer API's sans-I/O HTTP/1.1 framing (`peerapi::http`) is always built;
+the DNS proxy parses with it. The `taildrop` feature adds Taildrop receive
+(`PUT /v0/put/<name>`, with resume) and send over caller-supplied streams. Each comes with a
+blocking driver over `embedded-io` and an async one over `embedded-io-async`,
+with no executor or allocator; Tokio and `futures` streams plug in through
+`embedded-io-adapters`. Authorization is the caller's decision, and received
+files go to a caller-implemented `FileSink`. The `alloc` feature adds a
+fallible, heap-backed `MemorySink`. `//tests/lab:taildrop_live` exchanges files
+in both directions with stock `tailscale file cp`/`file get`.
+
 This is experimental software. See the [Tailfeather repository](https://github.com/no-std-rs/tailfeather)
 for integration, testing, and firmware instructions.
 

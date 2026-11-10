@@ -13,7 +13,9 @@ FIRST_PARTY_RUST_TARGETS = [
     "//crates/tailfeather-reactor:tailfeather_reactor",
     "//crates/tailfeather-reactor:tailfeather_reactor_portable",
     "//crates/tailfeather-reactor:throughput",
+    "//crates/tailfeather-reactor:taildrop_node",
     "//crates/tailfeather-gateway:tailfeather_gateway",
+    "//crates/tailfeather-gateway:tailfeather_gateway_peerapi_http",
     "//crates/tailfeather-ssh:tailfeather_ssh",
     "//crates/tailfeather-ssh:footprint",
     "//crates/tailfeather-ssh:live_server",
@@ -66,6 +68,7 @@ filegroup(
     srcs = [
         "//crates/tailfeather:docs",
         "//crates/tailfeather-gateway:docs",
+        "//crates/tailfeather-gateway:peerapi_http_docs",
         "//crates/tailfeather-ssh:docs",
         "//crates/tailfeather-testkit:docs",
         "//crates/ts-conformance:docs",
@@ -78,6 +81,7 @@ test_suite(
     tests = [
         "//crates/tailfeather:unit_test",
         "//crates/tailfeather:map_lease_hosted_test",
+        "//crates/tailfeather:peer_api_test",
         "//crates/tailfeather-reactor:unit_test",
         "//crates/tailfeather-reactor:tcp_parity_test",
         "//crates/tailfeather:netmap_capture_test",
@@ -85,6 +89,7 @@ test_suite(
         "//crates/tailfeather:doc_test",
         "//crates/tailfeather-gateway:unit_test",
         "//crates/tailfeather-gateway:doc_test",
+        "//crates/tailfeather-gateway:peerapi_http_test",
         "//crates/tailfeather-ssh:unit_test",
         "//crates/tailfeather-ssh:unit_test_byte_input",
         "//crates/tailfeather-ssh:openssh_test",
@@ -105,6 +110,8 @@ test_suite(
         "//crates/wirefeather:doc_test",
         "//third_party/zssh:unit_test",
         "//tests/lab:ssh_live",
+        "//tests/lab:taildrop_live",
+        "//tests/lab:taildrop_live_chaos",
     ],
 )
 
@@ -238,6 +245,7 @@ test_suite(
     name = "esp_exit_lab",
     tests = [
         "//tests/lab:esp_exit",
+        "//tests/lab:esp_exit_chaos",
         "//tests/lab:esp_exit_tls",
     ],
 )
