@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/no-std-rs/tailfeather/compare/tailfeather-gateway-v0.2.0...tailfeather-gateway-v0.3.0) (2026-11-11)
+
+
+### Features
+
+* **gateway:** Taildrop over the peer API, with resume and netmap authorization ([#46](https://github.com/no-std-rs/tailfeather/issues/46)) ([30df408](https://github.com/no-std-rs/tailfeather/commit/30df40808bc18347968eab251d7fde3f227e71e7))
+
+### Performance Improvements
+
+* **firmware:** emulated ESP32 exit-node lab, larger forwarding windows, measured stack floor ([#42](https://github.com/no-std-rs/tailfeather/issues/42)) ([b4bab6e](https://github.com/no-std-rs/tailfeather/commit/b4bab6ebc9dc38b78364df741e3ec779fb1decba))
+
 ## [0.2.0](https://github.com/no-std-rs/tailfeather/compare/tailfeather-gateway-v0.1.0...tailfeather-gateway-v0.2.0) (2026-10-26)
 
 
