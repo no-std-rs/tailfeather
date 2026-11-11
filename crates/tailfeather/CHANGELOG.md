@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.3.1...tailfeather-v0.4.0) (2026-11-11)
+
+
+### Features
+
+* **gateway:** Taildrop over the peer API, with resume and netmap authorization ([#46](https://github.com/no-std-rs/tailfeather/issues/46)) ([30df408](https://github.com/no-std-rs/tailfeather/commit/30df40808bc18347968eab251d7fde3f227e71e7))
+* **web:** link to the GitHub sources from the browser client ([#44](https://github.com/no-std-rs/tailfeather/issues/44)) ([684818d](https://github.com/no-std-rs/tailfeather/commit/684818d7d44d473a820c6bf401c381dbc752f60d))
+
 ## [0.3.1](https://github.com/no-std-rs/tailfeather/compare/tailfeather-v0.3.0...tailfeather-v0.3.1) (2026-11-08)
 
 
