@@ -24,7 +24,10 @@ prerelease `tailfeather-main` browser download.
 
 ## Release PRs and packages
 
-On main, `.runnerless-ci.ts` runs the shared `releasePlease()` recipe. It
+On main, `.runnerless-ci.ts` declares the three tracks and runs the shared
+`releasePlease()` recipe; there is no `.ci-toolkit.yml`. Each track is
+`ReleaseTrack.directory(name, "crates/" + name)` with pre-1.0 minor bumps, plus
+the extra Tailfeather paths and the gateway bootstrap anchor. The recipe
 finalizes merged release PRs before proposing the next release for each track.
 Review and merge each release PR normally; main requires a PR for everyone.
 
